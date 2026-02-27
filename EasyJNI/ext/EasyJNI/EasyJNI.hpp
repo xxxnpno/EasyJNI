@@ -393,7 +393,7 @@ namespace EasyJNI
 		}
 
 		template<typename Type, class Caller>
-			requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
 		auto GetField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
 		{
 			try
