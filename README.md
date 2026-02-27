@@ -19,6 +19,15 @@ public:
 }
 ```
 
+I'm going to create an example based on Minecraft 1.8.9 source code.  
+the Minecraft class is the main class of the game and stores a static field with its instance.
+
+```cpp
+// you need to register the your classes
+EasyJNI::RegisterClass<Wrapper::Minecraft>("net/minecraft/client/Minecraft");
+EasyJNI::RegisterClass<Wrapper::EntityPlayerSP>("net/minecraft/client/entity/EntityPlayerSP");
+```
+
 ### Usage
 ```cpp
 // recreate the java class in cpp and derive from EasyJNI::Object
