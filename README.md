@@ -3,7 +3,7 @@
 auto EasyJNI::Init(const U8 maxEnvs = 10) -> bool
 auto EasyJNI::Shutdown() -> void
 
-// use this function before closing a thread that uses EasyJNi
+// use this function before closing a thread that uses EasyJNI
 auto EasyJNI::ExitThread() -> void
 
 class Object
@@ -63,6 +63,7 @@ public:
     {
 
     }
+
     // primitive types are not unique ptrs
     auto GetServerSprintState() -> jboolean
     {
