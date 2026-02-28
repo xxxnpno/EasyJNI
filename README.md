@@ -3,7 +3,7 @@
 auto EasyJNI::Init(const U8 maxEnvs = 10) -> bool
 auto EasyJNI::Shutdown() -> void
 
-// use this function before closing a thread that uses EasyJNi
+// use this function before closing a thread that uses EasyJNI
 auto EasyJNI::ExitThread() -> void
 
 class Object
@@ -20,10 +20,10 @@ public:
 ```
 
 I'm going to create an example based on Minecraft 1.8.9 source code.  
-the Minecraft class is the main class of the game and stores a static field with its instance.
+The Minecraft class is the main class of the game and stores a static field with its instance.
 
 ```cpp
-// you need to register the your classes
+// you need to register your classes
 EasyJNI::RegisterClass<Wrapper::Minecraft>("net/minecraft/client/Minecraft");
 EasyJNI::RegisterClass<Wrapper::EntityPlayerSP>("net/minecraft/client/entity/EntityPlayerSP");
 ```
@@ -63,6 +63,7 @@ public:
     {
 
     }
+
     // primitive types are not unique ptrs
     auto GetServerSprintState() -> jboolean
     {
