@@ -15,7 +15,15 @@ public:
 
   template<typename Type, class Caller>
   requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+  auto SetField(const std::string& fieldName, const Type& value) -> void
+
+  template<typename Type, class Caller>
+  requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
   static auto GetStaticField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
+
+  template<typename Type, class Caller>
+  requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+  auto SetStaticField(const std::string& fieldName, const Type& value) -> void
 }
 ```
 
@@ -68,6 +76,12 @@ public:
     auto GetServerSprintState() -> jboolean
     {
         return GetField<jboolean, EntityPlayerSP>("serverSprintState");
+    }
+
+    // if value is a jobject give the jobject via ->GetInstance()
+    auto SetServerSprintState(const jboolean value) -> void
+    {
+        SetField<jboolean, EntityPlayerSP>("serverSprintState", value);
     }
 };
 ```
