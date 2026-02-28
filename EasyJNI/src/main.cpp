@@ -14,6 +14,11 @@ namespace Wrapper
         auto GetServerSprintState() -> jboolean
         {
             return GetField<jboolean, EntityPlayerSP>("serverSprintState");
+        }
+
+        auto SetServerSprintState(const jboolean value) -> void
+        {
+            SetField<jboolean, EntityPlayerSP>("serverSprintState", value);
 		}
     };
 
@@ -57,12 +62,12 @@ static DWORD WINAPI ThreadEntry(const HMODULE module)
 
             const std::unique_ptr<Wrapper::Minecraft> theMinecraft{ Wrapper::Minecraft::GetMinecraft() };
 
-            std::println("theMinecraft: {}", static_cast<void*>(theMinecraft->GetInstance()));
-
             while (true)
             {
                 if (theMinecraft->GetThePlayer()->GetInstance())
                 {
+					theMinecraft->GetThePlayer()->SetServerSprintState(true);
+
                     std::println("Server Sprint State: {}", theMinecraft->GetThePlayer()->GetServerSprintState());
                 }
 

@@ -376,6 +376,104 @@ namespace EasyJNI
 		}
 	}
 
+	template<typename Type, class Caller>
+	requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+	auto SetField_(const std::string& fieldName, const Type& value, const void* classOrInstance, EasyJNI::FieldType fieldType = EasyJNI::FieldType::NotStatic) -> void
+	{
+		const jfieldID fieldID{ fieldIDs[typeid(Caller).name()].at(fieldName) };
+
+		if (fieldType == EasyJNI::FieldType::NotStatic)
+		{
+			const jobject instance{ static_cast<jobject>(const_cast<void*>(classOrInstance)) };
+
+			if constexpr (std::is_same<Type, jint>::value)
+			{
+				GetEnv()->SetIntField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jfloat>::value)
+			{
+				GetEnv()->SetFloatField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jdouble>::value)
+			{
+				GetEnv()->SetDoubleField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jlong>::value)
+			{
+				GetEnv()->SetLongField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jboolean>::value)
+			{
+				GetEnv()->SetBooleanField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jchar>::value)
+			{
+				GetEnv()->SetCharField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jshort>::value)
+			{
+				GetEnv()->SetShortField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jbyte>::value)
+			{
+				GetEnv()->SetByteField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jstring>::value)
+			{
+				GetEnv()->SetObjectField(instance, fieldID, value);
+			}
+			else if constexpr (std::is_base_of_v<Object, Type>)
+			{
+				std::make_unique<Type>(GetEnv()->SetObjectField(instance, fieldID, value));
+			}
+		}
+		else
+		{
+			const jclass clazz{ static_cast<jclass>(const_cast<void*>(classOrInstance)) };
+
+			if constexpr (std::is_same<Type, jint>::value)
+			{
+				GetEnv()->SetStaticIntField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jfloat>::value)
+			{
+				GetEnv()->SetStaticFloatField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jdouble>::value)
+			{
+				GetEnv()->SetStaticDoubleField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jlong>::value)
+			{
+				GetEnv()->SetStaticLongField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jboolean>::value)
+			{
+				GetEnv()->SetStaticBooleanField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jchar>::value)
+			{
+				GetEnv()->SetStaticCharField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jshort>::value)
+			{
+				GetEnv()->SetStaticShortField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jbyte>::value)
+			{
+				GetEnv()->SetStaticByteField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_same<Type, jstring>::value)
+			{
+				GetEnv()->SetStaticObjectField(clazz, fieldID, value);
+			}
+			else if constexpr (std::is_base_of_v<Object, Type>)
+			{
+				std::make_unique<Type>(GetEnv()->SetStaticObjectField(clazz, fieldID, value));
+			}
+		}
+	}
+
 	template<class Caller>
 	requires (std::is_base_of_v<Object, Caller>)
 	auto RegisterClass(const std::string& className) -> void
@@ -390,6 +488,14 @@ namespace EasyJNI
 			: instance{ instance ? GetEnv()->NewGlobalRef(instance) : nullptr }
 		{
 			
+		}
+
+		virtual ~Object()
+		{
+			if (this->instance)
+			{
+				GetEnv()->DeleteGlobalRef(this->instance);
+			}
 		}
 
 		template<typename Type, class Caller>
@@ -411,14 +517,14 @@ namespace EasyJNI
 
 				if constexpr (std::is_base_of_v<Object, Type>)
 				{
-					AddFieldID<Type, std::remove_reference_t<decltype(*this)>>(clazz, fieldName, typeid(Type).name(), EasyJNI::FieldType::NotStatic);
+					AddFieldID<Type, Caller>(clazz, fieldName, typeid(Type).name(), EasyJNI::FieldType::NotStatic);
 				}
 				else
 				{
-					AddFieldID<Type, std::remove_reference_t<decltype(*this)>>(clazz, fieldName, "primitiveType", EasyJNI::FieldType::NotStatic);
+					AddFieldID<Type, Caller>(clazz, fieldName, "primitiveType", EasyJNI::FieldType::NotStatic);
 				}
 
-				return GetField_<Type, std::remove_reference_t<decltype(*this)>>(fieldName, this->instance, EasyJNI::FieldType::NotStatic);
+				return GetField_<Type, Caller>(fieldName, this->instance, EasyJNI::FieldType::NotStatic);
 			}
 			catch (const std::runtime_error& e)
 			{
@@ -432,6 +538,40 @@ namespace EasyJNI
 				{
 					return Type{};
 				}
+			}
+		}
+
+		template<typename Type, class Caller>
+		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+		auto SetField(const std::string& fieldName, const Type& value) -> void
+		{
+			try
+			{
+				const jclass clazz{ GetClass(signatures.at(typeid(Caller).name()).first) };
+				if (not clazz)
+				{
+					throw std::runtime_error{ "Class not found." };
+				}
+
+				if (not this->instance)
+				{
+					throw std::runtime_error{ "Instance is null." };
+				}
+
+				if constexpr (std::is_base_of_v<Object, Type>)
+				{
+					AddFieldID<Type, Caller>(clazz, fieldName, typeid(Type).name(), EasyJNI::FieldType::NotStatic);
+				}
+				else
+				{
+					AddFieldID<Type, Caller>(clazz, fieldName, "primitiveType", EasyJNI::FieldType::NotStatic);
+				}
+
+				return SetField_<Type, Caller>(fieldName, value, this->instance, EasyJNI::FieldType::NotStatic);
+			}
+			catch (const std::runtime_error& e)
+			{
+				std::println("[ERROR] {}", e.what());
 			}
 		}
 
@@ -465,11 +605,32 @@ namespace EasyJNI
 			}
 		}
 
-		virtual ~Object()
+		template<typename Type, class Caller>
+		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+		auto SetStaticField(const std::string& fieldName, const Type& value) -> void
 		{
-			if (this->instance)
+			try
 			{
-				GetEnv()->DeleteGlobalRef(this->instance);
+				const jclass clazz{ GetClass(signatures.at(typeid(Caller).name()).first) };
+				if (not clazz)
+				{
+					throw std::runtime_error{ "Class not found." };
+				}
+
+				if constexpr (std::is_base_of_v<Object, Type>)
+				{
+					AddFieldID<Type, Caller>(clazz, fieldName, typeid(Type).name(), EasyJNI::FieldType::Static);
+				}
+				else
+				{
+					AddFieldID<Type, Caller>(clazz, fieldName, "primitiveType", EasyJNI::FieldType::Static);
+				}
+
+				return SetField_<Type, Caller>(fieldName, value, this->instance, EasyJNI::FieldType::Static);
+			}
+			catch (const std::runtime_error& e)
+			{
+				std::println("[ERROR] {}", e.what());
 			}
 		}
 
