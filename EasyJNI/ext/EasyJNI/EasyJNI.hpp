@@ -607,7 +607,7 @@ namespace EasyJNI
 
 		template<typename Type, class Caller>
 		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
-		auto SetStaticField(const std::string& fieldName, const Type& value) -> void
+		static auto SetStaticField(const std::string& fieldName, const Type& value) -> void
 		{
 			try
 			{
