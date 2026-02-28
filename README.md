@@ -86,5 +86,5 @@ public:
 };
 ```
 
-EasyJNI currently only support getters for normal classes  
+EasyJNI currently only support getters and setters for normal classes  
 See example: [main.cpp](./EasyJNI/src/main.cpp)
