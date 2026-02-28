@@ -73,15 +73,15 @@ public:
     }
 
     // primitive types are not unique ptrs
-    auto GetServerSprintState() -> jboolean
+    auto GetServerSprintState() -> bool // use cpp primitive types not the jni ones; helper in [Type.hpp](./EasyJNI/ext/Type/Type.hpp)
     {
         return GetField<jboolean, EntityPlayerSP>("serverSprintState");
     }
 
     // if the setter takes a jobject give the unique ptr to the method not the jobject example : auto RemoveTeam(const std::unique_ptr<ScorePlayerTeam>& team) -> void
-    auto SetServerSprintState(const jboolean value) -> void
+    auto SetServerSprintState(const bool value) -> void
     {
-        SetField<jboolean, EntityPlayerSP>("serverSprintState", value);
+        SetField<bool, EntityPlayerSP>("serverSprintState", value);
     }
 };
 ```
