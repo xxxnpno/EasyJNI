@@ -78,7 +78,7 @@ public:
         return GetField<jboolean, EntityPlayerSP>("serverSprintState");
     }
 
-    // if value is a jobject give the unique ptr not the jobject 
+    // if the setter takes a jobject give the unique ptr to the method not the jobject example : auto RemoveTeam(const std::unique_ptr<ScorePlayerTeam>& team) -> void
     auto SetServerSprintState(const jboolean value) -> void
     {
         SetField<jboolean, EntityPlayerSP>("serverSprintState", value);
