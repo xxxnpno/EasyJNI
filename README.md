@@ -38,7 +38,7 @@ EasyJNI::RegisterClass<Wrapper::EntityPlayerSP>("net/minecraft/client/entity/Ent
 
 ### Usage
 ```cpp
-// recreate the java class in cpp and derive from EasyJNI::Object
+// recreate the java class in cpp and derive it from EasyJNI::Object
 class Minecraft final : public EasyJNI::Object
 {
 public:
@@ -78,7 +78,7 @@ public:
         return GetField<jboolean, EntityPlayerSP>("serverSprintState");
     }
 
-    // if value is a jobject give the jobject via ->GetInstance()
+    // if value is a jobject give the unique ptr not the jobject 
     auto SetServerSprintState(const jboolean value) -> void
     {
         SetField<jboolean, EntityPlayerSP>("serverSprintState", value);

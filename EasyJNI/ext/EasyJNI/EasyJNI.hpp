@@ -567,7 +567,14 @@ namespace EasyJNI
 					AddFieldID<Type, Caller>(clazz, fieldName, "primitiveType", EasyJNI::FieldType::NotStatic);
 				}
 
-				return SetField_<Type, Caller>(fieldName, value, this->instance, EasyJNI::FieldType::NotStatic);
+				if constexpr (std::is_base_of_v<Object, Type>)
+				{
+					SetField_<Type, Caller>(fieldName, value->GetInstance(), this->instance, EasyJNI::FieldType::NotStatic);
+				}
+				else
+				{
+					SetField_<Type, Caller>(fieldName, value, this->instance, EasyJNI::FieldType::NotStatic);
+				}
 			}
 			catch (const std::runtime_error& e)
 			{
@@ -626,7 +633,15 @@ namespace EasyJNI
 					AddFieldID<Type, Caller>(clazz, fieldName, "primitiveType", EasyJNI::FieldType::Static);
 				}
 
-				return SetField_<Type, Caller>(fieldName, value, this->instance, EasyJNI::FieldType::Static);
+				if constexpr (std::is_base_of_v<Object, Type>)
+				{
+					SetField_<Type, Caller>(fieldName, value->GetInstance(), clazz, EasyJNI::FieldType::Static);
+				}
+				else
+				{
+					SetField_<Type, Caller>(fieldName, value, clazz, EasyJNI::FieldType::Static);
+				}
+				
 			}
 			catch (const std::runtime_error& e)
 			{
