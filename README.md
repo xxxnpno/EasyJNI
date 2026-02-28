@@ -32,8 +32,8 @@ The Minecraft class is the main class of the game and stores a static field with
 
 ```cpp
 // you need to register your classes
-EasyJNI::RegisterClass<Wrapper::Minecraft>("net/minecraft/client/Minecraft");
-EasyJNI::RegisterClass<Wrapper::EntityPlayerSP>("net/minecraft/client/entity/EntityPlayerSP");
+EasyJNI::RegisterClass<Minecraft>("net/minecraft/client/Minecraft");
+EasyJNI::RegisterClass<EntityPlayerSP>("net/minecraft/client/entity/EntityPlayerSP");
 ```
 
 ### Usage
