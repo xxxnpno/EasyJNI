@@ -9,7 +9,6 @@
 #include <typeinfo>
 #include <memory>
 #include <thread>
-#include <windows.h>
 
 #include <Type/Type.hpp>
 
@@ -22,6 +21,7 @@ namespace EasyJNI
 
 	auto ManageEnvs() -> void;
 	auto GetClass(std::string name) -> jclass;
+	auto InitOwnWrapper() -> void;
 
 	// the maximum amount of envs we will store before clearing the map, to prevent memory leaks
 	U8 maxStoredEnvs;
@@ -40,6 +40,9 @@ namespace EasyJNI
 
 	// associate typeid(*this).name() with the map of its fieldIDs
 	std::unordered_map<const char*, std::unordered_map<std::string, jfieldID>> fieldIDs;
+
+	// associate typeid(*this).name() with the map of its methodIDs
+	std::unordered_map<const char*, std::unordered_map<std::string, jfieldID>> methodIDs;
 
 	auto ExitThread() -> void
 	{
@@ -110,6 +113,8 @@ namespace EasyJNI
 			{
 				throw std::runtime_error{ "Failed to get JVMTI environment." };
 			}
+
+			InitOwnWrapper();
 
 			return true;
 		}
@@ -202,11 +207,73 @@ namespace EasyJNI
 	template<> struct IsJNIType<jchar> : std::true_type {};
 	template<> struct IsJNIType<jshort> : std::true_type {};
 	template<> struct IsJNIType<jbyte> : std::true_type {};
-	template <> struct IsJNIType<jstring> : std::true_type {};
+	template<> struct IsJNIType<jstring> : std::true_type {};
 	template<> struct IsJNIType<jobject> : std::true_type {};
+
+	class String final
+	{
+	public:
+		explicit String(const std::string string = "")
+			: string{ string }
+		{
+			this->jstring_ = static_cast<jstring>(GetEnv()->NewGlobalRef(GetEnv()->NewStringUTF(string.c_str())));
+		}
+
+		~String()
+		{
+			GetEnv()->DeleteGlobalRef(this->jstring_);
+		}
+
+		auto GetJString() const -> jstring
+		{
+			return this->jstring_;
+		}
+
+		auto GetString() const -> std::string
+		{
+			return this->string;
+		}
+
+	private:
+		jstring jstring_;
+
+		std::string string;
+	};
+
+	template<typename InputType, typename OutputType>
+	auto PrimitiveTypeManager(const InputType& value) -> OutputType
+	{
+		if constexpr (IsJNIType<InputType>::value)
+		{
+			if constexpr (std::is_same<InputType, jstring>::value)
+			{
+				const char* chars{ GetEnv()->GetStringUTFChars(value, nullptr) };
+				const std::string output{ chars };
+
+				GetEnv()->ReleaseStringUTFChars(value, chars);
+
+				return output;
+			}
+			else
+			{
+				return static_cast<OutputType>(value);
+			}
+		}
+		else
+		{
+			if constexpr (std::is_same<InputType, std::string>::value)
+			{
+				return String{ value };
+			}
+			else
+			{
+				return static_cast<OutputType>(value);
+			}
+		}
+	}
 	
 	template<typename Type, class Caller>
-	requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+	requires (std::is_base_of_v<Object, Caller>)
 	auto AddFieldID(const jclass clazz, const std::string& fieldName, const char* objectTypeid = "primitiveType", EasyJNI::FieldType fieldType = EasyJNI::FieldType::NotStatic) -> void
 	{
 		if (fieldIDs[typeid(Caller).name()].find(fieldName) != fieldIDs[typeid(Caller).name()].end())
@@ -221,39 +288,39 @@ namespace EasyJNI
 		}
 		else
 		{
-			if constexpr (std::is_same<Type, jint>::value)
+			if constexpr (std::is_same<Type, I32>::value)
 			{
 				signature = "I";
 			}
-			else if constexpr (std::is_same<Type, jfloat>::value)
+			else if constexpr (std::is_same<Type, F32>::value)
 			{
 				signature = "F";
 			}
-			else if constexpr (std::is_same<Type, jdouble>::value)
+			else if constexpr (std::is_same<Type, F64>::value)
 			{
 				signature = "D";
 			}
-			else if constexpr (std::is_same<Type, jlong>::value)
+			else if constexpr (std::is_same<Type, I64>::value)
 			{
 				signature = "J";
 			}
-			else if constexpr (std::is_same<Type, jboolean>::value)
+			else if constexpr (std::is_same<Type, bool>::value)
 			{
 				signature = "Z";
 			}
-			else if constexpr (std::is_same<Type, jchar>::value)
+			else if constexpr (std::is_same<Type, char>::value)
 			{
 				signature = "C";
 			}
-			else if constexpr (std::is_same<Type, jshort>::value)
+			else if constexpr (std::is_same<Type, I8>::value)
 			{
 				signature = "S";
 			}
-			else if constexpr (std::is_same<Type, jbyte>::value)
+			else if constexpr (std::is_same<Type, char>::value)
 			{
 				signature = "B";
 			}
-			else if constexpr (std::is_same<Type, jstring>::value)
+			else if constexpr (std::is_same<Type, std::string>::value)
 			{
 				signature = "Ljava/lang/String;";
 			}
@@ -269,8 +336,13 @@ namespace EasyJNI
 		}
 	}
 
+	auto AddMethodID() -> void
+	{
+
+	}
+
 	template<typename Type, class Caller>
-	requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+	requires (std::is_base_of_v<Object, Caller>)
 	auto GetField_(const std::string& fieldName, const void* classOrInstance, EasyJNI::FieldType fieldType = EasyJNI::FieldType::NotStatic) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
 	{
 		const jfieldID fieldID{ fieldIDs[typeid(Caller).name()].at(fieldName) };
@@ -279,41 +351,41 @@ namespace EasyJNI
 		{
 			const jobject instance{ static_cast<jobject>(const_cast<void*>(classOrInstance)) };
 
-			if constexpr (std::is_same<Type, jint>::value)
+			if constexpr (std::is_same<Type, I32>::value)
 			{
-				return GetEnv()->GetIntField(instance, fieldID);
+				return PrimitiveTypeManager<jint, I32>(GetEnv()->GetIntField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jfloat>::value)
+			else if constexpr (std::is_same<Type, F32>::value)
 			{
-				return GetEnv()->GetFloatField(instance, fieldID);
+				return PrimitiveTypeManager<jfloat, F32>(GetEnv()->GetFloatField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jdouble>::value)
+			else if constexpr (std::is_same<Type, F64>::value)
 			{
-				return GetEnv()->GetDoubleField(instance, fieldID);
+				return PrimitiveTypeManager<jdouble, F64>(GetEnv()->GetDoubleField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jlong>::value)
+			else if constexpr (std::is_same<Type, I64>::value)
 			{
-				return GetEnv()->GetLongField(instance, fieldID);
+				return PrimitiveTypeManager<jlong, I64>(GetEnv()->GetLongField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jboolean>::value)
+			else if constexpr (std::is_same<Type, bool>::value)
 			{
-				return GetEnv()->GetBooleanField(instance, fieldID);
+				return PrimitiveTypeManager<jboolean, bool>(GetEnv()->GetBooleanField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jchar>::value)
+			else if constexpr (std::is_same<Type, char>::value)
 			{
-				return GetEnv()->GetCharField(instance, fieldID);
+				return PrimitiveTypeManager<jchar, char>(GetEnv()->GetCharField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jshort>::value)
+			else if constexpr (std::is_same<Type, I8>::value)
 			{
-				return GetEnv()->GetShortField(instance, fieldID);
+				return PrimitiveTypeManager<jshort, I8>(GetEnv()->GetShortField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jbyte>::value)
+			else if constexpr (std::is_same<Type, char>::value)
 			{
-				return GetEnv()->GetByteField(instance, fieldID);
+				return PrimitiveTypeManager<jbyte, char>(GetEnv()->GetByteField(instance, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jstring>::value)
+			else if constexpr (std::is_same<Type, std::string>::value)
 			{
-				return GetEnv()->GetObjectField(instance, fieldID);
+				return PrimitiveTypeManager<jstring, std::string>(GetEnv()->GetObjectField(instance, fieldID));
 			}
 			else if constexpr (std::is_base_of_v<Object, Type>)
 			{
@@ -324,41 +396,41 @@ namespace EasyJNI
 		{
 			const jclass clazz{ static_cast<jclass>(const_cast<void*>(classOrInstance)) };
 
-			if constexpr (std::is_same<Type, jint>::value)
+			if constexpr (std::is_same<Type, I32>::value)
 			{
-				return GetEnv()->GetStaticIntField(clazz, fieldID);
+				return PrimitiveTypeManager<jint, I32>(GetEnv()->GetStaticIntField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jfloat>::value)
+			else if constexpr (std::is_same<Type, F32>::value)
 			{
-				return GetEnv()->GetStaticFloatField(clazz, fieldID);
+				return PrimitiveTypeManager<jfloat, F32>(GetEnv()->GetStaticFloatField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jdouble>::value)
+			else if constexpr (std::is_same<Type, F64>::value)
 			{
-				return GetEnv()->GetStaticDoubleField(clazz, fieldID);
+				return PrimitiveTypeManager<jdouble, F64>(GetEnv()->GetStaticDoubleField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jlong>::value)
+			else if constexpr (std::is_same<Type, I64>::value)
 			{
-				return GetEnv()->GetStaticLongField(clazz, fieldID);
+				return PrimitiveTypeManager<jlong, I64>(GetEnv()->GetStaticLongField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jboolean>::value)
+			else if constexpr (std::is_same<Type, bool>::value)
 			{
-				return GetEnv()->GetStaticBooleanField(clazz, fieldID);
+				return PrimitiveTypeManager<jboolean, bool>(GetEnv()->GetStaticBooleanField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jchar>::value)
+			else if constexpr (std::is_same<Type, char>::value)
 			{
-				return GetEnv()->GetStaticCharField(clazz, fieldID);
+				return PrimitiveTypeManager<jchar, char> (GetEnv()->GetStaticCharField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jshort>::value)
+			else if constexpr (std::is_same<Type, I8>::value)
 			{
-				return GetEnv()->GetStaticShortField(clazz, fieldID);
+				return PrimitiveTypeManager<jshort, I8>(GetEnv()->GetStaticShortField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jbyte>::value)
+			else if constexpr (std::is_same<Type, char>::value)
 			{
-				return GetEnv()->GetStaticByteField(clazz, fieldID);
+				return PrimitiveTypeManager<jbyte, char>(GetEnv()->GetStaticByteField(clazz, fieldID));
 			}
-			else if constexpr (std::is_same<Type, jstring>::value)
+			else if constexpr (std::is_same<Type, std::string>::value)
 			{
-				return GetEnv()->GetStaticObjectField(clazz, fieldID);
+				return PrimitiveTypeManager<jstring, std::string>(GetEnv()->GetStaticObjectField(clazz, fieldID));
 			}
 			else if constexpr (std::is_base_of_v<Object, Type>)
 			{
@@ -377,7 +449,7 @@ namespace EasyJNI
 	}
 
 	template<typename Type, class Caller>
-	requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+	requires (std::is_base_of_v<Object, Caller>)
 	auto SetField_(const std::string& fieldName, const Type& value, const void* classOrInstance, EasyJNI::FieldType fieldType = EasyJNI::FieldType::NotStatic) -> void
 	{
 		const jfieldID fieldID{ fieldIDs[typeid(Caller).name()].at(fieldName) };
@@ -484,7 +556,7 @@ namespace EasyJNI
 	class Object
 	{
 	public:
-		Object(const jobject instance = nullptr)
+		explicit Object(const jobject instance = nullptr)
 			: instance{ instance ? GetEnv()->NewGlobalRef(instance) : nullptr }
 		{
 			
@@ -499,7 +571,7 @@ namespace EasyJNI
 		}
 
 		template<typename Type, class Caller>
-		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+		requires (std::is_base_of_v<Object, Caller>)
 		auto GetField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
 		{
 			try
@@ -542,7 +614,7 @@ namespace EasyJNI
 		}
 
 		template<typename Type, class Caller>
-		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+		requires (std::is_base_of_v<Object, Caller>)
 		auto SetField(const std::string& fieldName, const Type& value) -> void
 		{
 			try
@@ -583,7 +655,7 @@ namespace EasyJNI
 		}
 
 		template<typename Type, class Caller>
-		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+		requires (std::is_base_of_v<Object, Caller>)
 		static auto GetStaticField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
 		{
 			try
@@ -613,7 +685,7 @@ namespace EasyJNI
 		}
 
 		template<typename Type, class Caller>
-		requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
+		requires (std::is_base_of_v<Object, Caller>)
 		static auto SetStaticField(const std::string& fieldName, const Type& value) -> void
 		{
 			try
@@ -649,6 +721,13 @@ namespace EasyJNI
 			}
 		}
 
+		template<typename Type, class Caller, typename... Args>
+		requires (std::is_base_of_v<Object, Caller>)
+		auto CallMethod(const std::string& methodName, Args&&... args) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
+		{
+
+		}
+
 		auto GetInstance() const -> jobject
 		{
 			return this->instance;
@@ -657,4 +736,23 @@ namespace EasyJNI
 	protected:
 		jobject instance;
 	};
+
+	namespace Wrapper
+	{
+		template<typename Type>
+		class Collection : public Object
+		{
+		public:
+			Collection(const jobject instance = nullptr)
+				: Object{ instance }
+			{
+
+			}
+		};
+	}
+
+	auto InitOwnWrapper() -> void
+	{
+		EasyJNI::RegisterClass<Wrapper::Collection<void>>("java/util/Collection");
+	}
 }
