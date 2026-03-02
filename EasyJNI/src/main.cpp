@@ -22,6 +22,11 @@ namespace Wrapper
         {
             SetField<jboolean, EntityPlayerSP>("serverSprintState", value);
         }
+
+        auto GetName() -> std::string
+        {
+			return CallMethod<std::string, EntityPlayerSP>("getName");
+		}
     };
 
     class Minecraft final : public EasyJNI::Object

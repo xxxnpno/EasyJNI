@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <type_traits>
 #include <typeinfo>
+#include <utility>
 #include <memory>
 #include <thread>
 
@@ -42,7 +43,7 @@ namespace EasyJNI
 	std::unordered_map<const char*, std::unordered_map<std::string, jfieldID>> fieldIDs;
 
 	// associate typeid(*this).name() with the map of its methodIDs
-	std::unordered_map<const char*, std::unordered_map<std::string, jfieldID>> methodIDs;
+	std::unordered_map<const char*, std::unordered_map<std::string, jmethodID>> methodIDs;
 
 	auto ExitThread() -> void
 	{
@@ -196,6 +197,12 @@ namespace EasyJNI
 		NotStatic
 	};
 
+	enum class MethodType : I8
+	{
+		Static,
+		NotStatic
+	};
+
 	template<typename T>
 	struct IsJNIType : std::false_type {};
 
@@ -221,7 +228,10 @@ namespace EasyJNI
 
 		~String()
 		{
-			GetEnv()->DeleteGlobalRef(this->jstring_);
+			if (this->jstring_)
+			{
+				GetEnv()->DeleteGlobalRef(this->jstring_);
+			}
 		}
 
 		auto GetJString() const -> jstring
@@ -336,9 +346,81 @@ namespace EasyJNI
 		}
 	}
 
-	auto AddMethodID() -> void
+	template<typename Type, class Caller, typename... Args>
+	requires (std::is_base_of_v<Object, Caller>)
+	auto AddMethodID(const jclass clazz, const std::string& methodName, const char* objectTypeid = "primitiveType", EasyJNI::MethodType methodType = EasyJNI::MethodType::NotStatic, Args&&... args) -> void
 	{
+		if (methodIDs[typeid(Caller).name()].find(methodName) != methodIDs[typeid(Caller).name()].end())
+		{
+			return;
+		}
 
+		std::string returnTypeSignature{};
+		if (std::strcmp(objectTypeid, "primitiveType"))
+		{
+			returnTypeSignature = signatures.at(objectTypeid).second;
+		}
+		else
+		{
+			if constexpr (std::is_same<Type, I32>::value)
+			{
+				returnTypeSignature = "I";
+			}
+			else if constexpr (std::is_same<Type, F32>::value)
+			{
+				returnTypeSignature = "F";
+			}
+			else if constexpr (std::is_same<Type, F64>::value)
+			{
+				returnTypeSignature = "D";
+			}
+			else if constexpr (std::is_same<Type, I64>::value)
+			{
+				returnTypeSignature = "J";
+			}
+			else if constexpr (std::is_same<Type, bool>::value)
+			{
+				returnTypeSignature = "Z";
+			}
+			else if constexpr (std::is_same<Type, char>::value)
+			{
+				returnTypeSignature = "C";
+			}
+			else if constexpr (std::is_same<Type, I8>::value)
+			{
+				returnTypeSignature = "S";
+			}
+			else if constexpr (std::is_same<Type, char>::value)
+			{
+				returnTypeSignature = "B";
+			}
+			else if constexpr (std::is_same<Type, std::string>::value)
+			{
+				returnTypeSignature = "Ljava/lang/String;";
+			}
+		}
+
+		std::string parametersSignature{};
+
+		if constexpr (sizeof...(Args) > 0)
+		{
+			(parametersSignature += ... += (signatures.at(typeid(Args).name()).second));
+		}
+		else
+		{
+			parametersSignature = "";
+		}
+
+		const std::string methodSignature{ std::format("({}){}", parametersSignature, returnTypeSignature) };
+
+		if (methodType == EasyJNI::MethodType::Static)
+		{
+			methodIDs[typeid(Caller).name()].insert({ methodName, GetEnv()->GetStaticMethodID(clazz, methodName.c_str(), methodSignature.c_str()) });
+		}
+		else
+		{
+			methodIDs[typeid(Caller).name()].insert({ methodName, GetEnv()->GetMethodID(clazz, methodName.c_str(), methodSignature.c_str()) });
+		}
 	}
 
 	template<typename Type, class Caller>
@@ -546,6 +628,13 @@ namespace EasyJNI
 		}
 	}
 
+	template<typename Type, class Caller, typename... Args>
+	requires (std::is_base_of_v<Object, Caller>)
+	auto CallMethod_(const std::string& methodName, const void* classOrInstance, EasyJNI::MethodType methodType = EasyJNI::MethodType::NotStatic, Args&&... args) -> void
+	{
+
+	}
+
 	template<class Caller>
 	requires (std::is_base_of_v<Object, Caller>)
 	auto RegisterClass(const std::string& className) -> void
@@ -725,7 +814,34 @@ namespace EasyJNI
 		requires (std::is_base_of_v<Object, Caller>)
 		auto CallMethod(const std::string& methodName, Args&&... args) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
 		{
+			try
+			{
+				const jclass clazz{ GetClass(signatures.at(typeid(Caller).name()).first) };
+				if (not clazz)
+				{
+					throw std::runtime_error{ "Class not found." };
+				}
 
+				if (not this->instance)
+				{
+					throw std::runtime_error{ "Instance is null." };
+				}
+
+				if constexpr (std::is_base_of_v<Object, Type>)
+				{
+					AddMethodID<Type, Caller>(clazz, methodName, typeid(Type).name(), EasyJNI::MethodType::NotStatic, std::forward<Args>(args)...);
+				}
+				else
+				{
+					AddMethodID<Type, Caller>(clazz, methodName, "primitiveType", EasyJNI::MethodType::NotStatic, std::forward<Args>(args)...);
+				}
+
+				CallMethod_<Type, Caller>(methodName, this->instance, EasyJNI::MethodType::NotStatic, std::forward<Args>(args)...);
+			}
+			catch (const std::runtime_error& e)
+			{
+				std::println("[ERROR] {}", e.what());
+			}
 		}
 
 		auto GetInstance() const -> jobject
