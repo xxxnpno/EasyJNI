@@ -10,19 +10,15 @@ class Object
 {
 public:
   template<typename Type, class Caller>
-  requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
   auto GetField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
 
   template<typename Type, class Caller>
-  requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
   auto SetField(const std::string& fieldName, const Type& value) -> void
 
   template<typename Type, class Caller>
-  requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
   static auto GetStaticField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
 
   template<typename Type, class Caller>
-  requires ((IsJNIType<Type>::value or std::is_base_of_v<Object, Type>) and std::is_base_of_v<Object, Caller>)
   static auto SetStaticField(const std::string& fieldName, const Type& value) -> void
 }
 ```
@@ -75,7 +71,7 @@ public:
     // primitive types are not unique ptrs
     auto GetServerSprintState() -> bool // use cpp primitive types not the jni ones; helper in [Type.hpp](./EasyJNI/ext/Type/Type.hpp)
     {
-        return GetField<jboolean, EntityPlayerSP>("serverSprintState");
+        return GetField<bool, EntityPlayerSP>("serverSprintState");
     }
 
     // if the setter takes a jobject give the unique ptr to the method not the jobject example : auto RemoveTeam(const std::unique_ptr<ScorePlayerTeam>& team) -> void
