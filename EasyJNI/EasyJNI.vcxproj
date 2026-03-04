@@ -139,7 +139,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="ext\EasyJNI\EasyJNI.hpp" />
+    <ClInclude Include="ext\easy_jni\easy_jni.hpp" />
     <ClInclude Include="ext\jni\classfile_constants.h" />
     <ClInclude Include="ext\jni\jawt.h" />
     <ClInclude Include="ext\jni\jawt_md.h" />
@@ -148,7 +148,6 @@
     <ClInclude Include="ext\jni\jni_md.h" />
     <ClInclude Include="ext\jni\jvmti.h" />
     <ClInclude Include="ext\jni\jvmticmlr.h" />
-    <ClInclude Include="ext\Type\Type.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
