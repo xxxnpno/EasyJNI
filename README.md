@@ -5,6 +5,8 @@
 
 currently working on method call
 
+compiled on visual studio 2026 insider with latest msvc
+
 ### API
 ```cpp
 // call jni::init before using EasyJNI
@@ -40,7 +42,7 @@ public:
 
     }
 
-    // even if theMinecraft is static don't make get_minecraft() static see main.cpp
+    // even if theMinecraft is static, don't make get_minecraft() static see main.cpp
     // methods never return jobject they always place them in unique ptrs
     auto get_minecraft() -> std::unique_ptr<minecraft>
     {
