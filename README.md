@@ -1,7 +1,7 @@
 ### EasyJNI
 - no env managment
 - no need for java signatures
-- using to use getters and setters
+- easy to use getters and setters
 
 currently working on method call
 
