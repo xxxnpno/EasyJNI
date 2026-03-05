@@ -23,7 +23,8 @@
 namespace jni
 {
 	class object;
-	class string;
+
+	auto manage_envs() -> void;
 
 	// global vm and jvmti
 	JavaVM* vm{ nullptr };
@@ -141,10 +142,63 @@ namespace jni
 		return load_class(name);
 	}
 
+	// handle strings
+	class string final
+	{
+	public:
+		explicit string(const std::string& std_string)
+			: std_string{ std_string }
+		{
+			const jstring local{ get_env()->NewStringUTF(std_string.c_str()) };
+
+			if (this->jni_string)
+			{
+				this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(local));
+				get_env()->DeleteLocalRef(local);
+			}
+		}
+
+		explicit string(const jstring jni_string)
+		{
+			this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(jni_string));
+
+			if (this->jni_string)
+			{
+				const char* chars{ get_env()->GetStringUTFChars(this->jni_string, nullptr) };
+
+				this->std_string = std::string(chars);
+				get_env()->ReleaseStringUTFChars(this->jni_string, chars);
+			}
+		}
+
+		~string()
+		{
+			if (this->jni_string)
+			{
+				get_env()->DeleteGlobalRef(this->jni_string);
+			}
+		}
+
+		auto get_jni_string() const -> jstring
+		{
+			return this->jni_string;
+		}
+
+		auto get_std_string() const -> std::string
+		{
+			return this->std_string;
+		}
+
+	private:
+		jstring jni_string;
+
+		std::string std_string;
+	};
+
 	using convert_function = std::function<std::any(const std::any&)>;
 
 	// associate a jni type to a cpp one
-	const std::unordered_map<std::type_index, convert_function> type_map =
+	const std::unordered_map<std::type_index, convert_function> jni_to_cpp =
 	{
 		{ typeid(jshort),   [](const std::any& v) -> std::any { return static_cast<short>(std::any_cast<jshort>(v)); } },
 		{ typeid(jint),     [](const std::any& v) -> std::any { return static_cast<int>(std::any_cast<jint>(v)); } },
@@ -154,6 +208,19 @@ namespace jni
 		{ typeid(jboolean), [](const std::any& v) -> std::any { return static_cast<bool>(std::any_cast<jboolean>(v)); } },
 		{ typeid(jchar),    [](const std::any& v) -> std::any { return static_cast<char>(std::any_cast<jchar>(v)); } },
 		{ typeid(jstring),  [](const std::any& v) -> std::any { return string(std::any_cast<jstring>(v)).get_std_string(); } },
+	};
+
+	// associate a cpp type to a jni one
+	const std::unordered_map<std::type_index, convert_function> cpp_to_jni =
+	{
+		{ typeid(short),       [](const std::any& v) -> std::any { return static_cast<jshort>(std::any_cast<short>(v)); } },
+		{ typeid(int),         [](const std::any& v) -> std::any { return static_cast<jint>(std::any_cast<int>(v)); } },
+		{ typeid(long long),   [](const std::any& v) -> std::any { return static_cast<jlong>(std::any_cast<long long>(v)); } },
+		{ typeid(float),       [](const std::any& v) -> std::any { return static_cast<jfloat>(std::any_cast<float>(v)); } },
+		{ typeid(double),      [](const std::any& v) -> std::any { return static_cast<jdouble>(std::any_cast<double>(v)); } },
+		{ typeid(bool),        [](const std::any& v) -> std::any { return static_cast<jboolean>(std::any_cast<bool>(v)); } },
+		{ typeid(char),        [](const std::any& v) -> std::any { return static_cast<jchar>(std::any_cast<char>(v)); } },
+		{ typeid(std::string), [](const std::any& v) -> std::any { return string(std::any_cast<std::string>(v)).get_jni_string(); } },
 	};
 
 	// associate a cpp type to a jni signature
@@ -209,73 +276,22 @@ namespace jni
 		requires (std::is_base_of_v<object, type>)
 	auto register_class (const std::string& class_name) -> void
 	{
-		class_map.emplace({ std::type_index{ type(Type) }, class_name });
+		class_map.insert_or_assign(std::type_index{ typeid(type) }, class_name);
 	}
 
 	template <typename type>
-		requires (is_std_type<type>::value)
+		requires (is_std_type<type>::value or std::is_base_of_v<object, type>)
 	auto get_signature() -> std::string
 	{
-		if constexpr (not is_base_of_v<object, type>)
+		if constexpr (std::is_base_of_v<object, type>)
 		{
-			signature_map.at(std::type_index{ typeid(type) });
+			return std::format("L{};", class_map.at(std::type_index{ typeid(type) }));
 		}
-
-		return std::format("L{};", class_map.at(std::type_index{ typeid(type) }));
+		else
+		{
+			return signature_map.at(std::type_index{ typeid(type) });
+		}
 	}
-
-	// handle strings
-	class string final
-	{
-	public:
-		explicit string(const std::string& std_string)
-			: std_string{ std_string }
-		{
-			const jstring local{ get_env()->NewStringUTF(std_string.c_str()) };
-
-			if (this->jni_string)
-			{
-				this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(local));
-				get_env()->DeleteLocalRef(local);
-			}
-		}
-
-		explicit string(const jstring jni_string)
-		{
-			this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(jni_string));
-
-			if (this->jni_string)
-			{
-				const char* chars{ get_env()->GetStringUTFChars(this->jni_string, nullptr) };
-
-				this->std_string = std::string(chars);
-				get_env()->ReleaseStringUTFChars(this->jni_string, chars);
-			}
-		}
-
-		~string()
-		{
-			if (this->jni_string)
-			{
-				get_env()->DeleteGlobalRef(this->std_string);
-			}
-		}
-
-		auto get_jni_string() const -> jstring
-		{
-			return this->jni_string;
-		}
-
-		auto get_std_string() const -> std::string
-		{
-			return this->std_string;
-		}
-
-	private:
-		jstring jni_string;
-
-		std::string std_string;
-	};
 
 	// associate typeid(*this).name() with the map of its fieldIDs
 	std::unordered_map<std::type_index, std::unordered_map<std::string, jfieldID>> field_ids;
@@ -293,7 +309,7 @@ namespace jni
 	class field final
 	{
 	public:
-		field(const void* class_or_instance, const std::string& name, const field_type field_type, const std::type_index index)
+		field(void* class_or_instance, const std::string& name, const field_type field_type, const std::type_index index)
 			: class_or_instance{ class_or_instance }
 			, name{ name }
 			, field_type{ field_type }
@@ -305,24 +321,25 @@ namespace jni
 		// get the field value, if the field is static, classOrInstance will be a jclass, otherwise it will be a jobject
 		auto get() const -> std::conditional_t<std::is_base_of_v<object, type>, std::unique_ptr<type>, type>
 		{
-			if constexpr (jobject local{}, std::is_base_of_v<object, type>)
+			jobject local{};
+			if constexpr (std::is_base_of_v<object, type>)
 			{
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					local = get_env()->GetObjectField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					local = get_env()->GetStaticObjectField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 
-				const std::unique_ptr<type> result{ std::make_unique<type>(local) };
+				std::unique_ptr<type> result{ std::make_unique<type>(local) };
 
 				if (local)
 				{
@@ -333,88 +350,88 @@ namespace jni
 			}
 
 			std::any result{};
-			if constexpr (std::is_same<type, I8>::value)
+			if constexpr (std::is_same<type, short>::value)
 			{
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = get_env()->GetShortField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					result = get_env()->GetStaticShortField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 			}
-			else if constexpr (std::is_same<type, I32>::value)
+			else if constexpr (std::is_same<type, int>::value)
 			{
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = get_env()->GetIntField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					result = get_env()->GetStaticIntField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 			}
-			else if constexpr (std::is_same<type, I64>::value)
+			else if constexpr (std::is_same<type, long long>::value)
 			{
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = get_env()->GetLongField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					result = get_env()->GetStaticLongField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 			}
-			else if constexpr (std::is_same<type, F32>::value)
+			else if constexpr (std::is_same<type, float>::value)
 			{
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = get_env()->GetFloatField(
 						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					result = get_env()->GetStaticFloatField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 			}
-			else if constexpr (std::is_same<type, F64>::value)
+			else if constexpr (std::is_same<type, double>::value)
 			{
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = get_env()->GetDoubleField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					result = get_env()->GetStaticDoubleField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 			}
@@ -423,15 +440,15 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = get_env()->GetBooleanField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					result = get_env()->GetStaticBooleanField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 			}
@@ -440,15 +457,15 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = get_env()->GetCharField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 				else
 				{
 					result = get_env()->GetStaticCharField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name)
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second
 					);
 				}
 			}
@@ -457,48 +474,55 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					result = string(
-						static_cast<jstring>(get_env()->GetObjectField(const_cast<jobject>(this->class_or_instance),
-							field_ids.at(this->index).find(this->name)))
+						static_cast<jstring>(get_env()->GetObjectField(
+							reinterpret_cast<jobject>(this->class_or_instance),
+							field_ids.at(this->index).find(this->name)->second))
 					).get_std_string();
 				}
 				else
 				{
 					result = string(
-						static_cast<jstring>(get_env()->GetStaticObjectField(const_cast<jclass>(this->class_or_instance),
-							field_ids.at(this->index).find(this->name)))
+						static_cast<jstring>(get_env()->GetStaticObjectField(
+							reinterpret_cast<jclass>(this->class_or_instance),
+							field_ids.at(this->index).find(this->name)->second))
 					).get_std_string();
 				}
 			}
 
-			auto it = type_map.find(jvalue.type());
-			if (it != type_map.end())
+			if constexpr (not std::is_base_of_v<object, type>)
 			{
-				const std::any cppValue{ it->second(jvalue) };
-				
-				return std::any_cast<type>(cppValue);
+				auto it = jni_to_cpp.find(result.type());
+				if (it != jni_to_cpp.end())
+				{
+					return std::any_cast<type>(it->second(result));
+				}
+				return type{};
 			}
-
-			return type{};
+			else
+			{
+				return std::make_unique<type>(nullptr);
+			}
 		}
 
 		// set the field value, if the field is static, classOrInstance will be a jclass, otherwise it will be a jobject
-		auto Set(const type& value) const -> void
+		auto set(const type& value) const -> void
 		{
 			if constexpr (std::is_base_of_v<object, type>)
 			{
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetObjectField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name), value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						value->get_instance()
 					);
 				}
 				else
 				{
 					get_env()->SetStaticObjectField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						value->get_instance()
 					);
 				}
 			}
@@ -508,17 +532,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetShortField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jshort>(value)
 					);
 				}
 				else
 				{
 					get_env()->SetStaticShortField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jshort>(value)
 					);
 				}
 			}
@@ -527,17 +551,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetIntField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jint>(value)
 					);
 				}
 				else
 				{
 					get_env()->SetStaticIntField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jint>(value)
 					);
 				}
 			}
@@ -546,17 +570,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetLongField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jlong>(value)
 					);
 				}
 				else
 				{
 					get_env()->SetStaticLongField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jlong>(value)
 					);
 				}
 			}
@@ -565,17 +589,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetFloatField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jfloat>(value)
 					);
 				}
 				else
 				{
 					get_env()->SetStaticFloatField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jfloat>(value)
 					);
 				}
 			}
@@ -584,17 +608,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetDoubleField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jdouble>(value)
 					);
 				}
 				else
 				{
 					get_env()->SetStaticDoubleField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jdouble>(value)
 					);
 				}
 			}
@@ -603,17 +627,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetBooleanField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jboolean>(value)
 					);
 				}
 				else
 				{
 					get_env()->SetStaticBooleanField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jboolean>(value)
 					);
 				}
 			}
@@ -622,17 +646,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetCharField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jchar>(value)
 					);
 				}
 				else
 				{
 					get_env()->SetStaticCharField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						static_cast<jchar>(value)
 					);
 				}
 			}
@@ -641,17 +665,17 @@ namespace jni
 				if (this->field_type == field_type::NOT_STATIC)
 				{
 					get_env()->SetObjectField(
-						const_cast<jobject>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jobject>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						string(value).get_jni_string()
 					);
 				}
 				else
 				{
 					get_env()->SetStaticObjectField(
-						const_cast<jclass>(this->class_or_instance),
-						field_ids.at(this->index).find(this->name),
-						value
+						reinterpret_cast<jclass>(this->class_or_instance),
+						field_ids.at(this->index).find(this->name)->second,
+						string(value).get_jni_string()
 					);
 				}
 			}
@@ -684,7 +708,7 @@ namespace jni
 	class method final
 	{
 	public:
-		method(const void* class_or_instance, const std::string& name, const method_type method_type, const std::type_index index)
+		method(void* class_or_instance, const std::string& name, const method_type method_type, const std::type_index index)
 			: class_or_instance{ class_or_instance }
 			, name{ name }
 			, method_type{ method_type }
@@ -694,9 +718,9 @@ namespace jni
 		}
 
 		// call the method with the given arguments, if the method is static, classOrInstance will be a jclass, otherwise it will be a jobject
-		template<typename... args>
-			requires (is_std_type<args>::value or std::is_base_of_v<object, args> and ...)
-		auto call(args&&... args) const -> std::conditional_t<std::is_base_of_v<object, type>, std::unique_ptr<type>, type>
+		template<typename... args_t>
+			requires ((is_std_type<std::remove_cvref_t<args_t>>::value or std::is_base_of_v<object, std::remove_cvref_t<args_t>>) and ...)
+		auto call(args_t&&... args) const -> std::conditional_t<std::is_base_of_v<object, return_type>, std::unique_ptr<return_type>, return_type>
 		{
 
 		}
@@ -763,7 +787,7 @@ namespace jni
 			catch (const std::runtime_error& e)
 			{
 				std::println("[ERROR] {}", e.what());
-				return std::make_unique<field<type>>(nullptr, field_name, field_type);
+				return std::make_unique<field<type>>(nullptr, field_name, field_type, std::type_index{ typeid(*this) });
 			}
 		}
 
@@ -798,7 +822,7 @@ namespace jni
 			catch (const std::runtime_error& e)
 			{
 				std::println("[ERROR] {}", e.what());
-				return std::make_unique<method<return_type>>(nullptr, method_name, method_type);
+				return std::make_unique<method<return_type>>(nullptr, method_name, method_type, std::type_index{ typeid(*this) });
 			}
 		}
 
@@ -814,7 +838,7 @@ namespace jni
 		// obtain the fieldID of a field
 		template<typename type>
 			requires (is_std_type<type>::value or std::is_base_of_v<object, type>)
-		auto regsiter_field_id(const jclass clazz, const std::string& field_name, const field_type field_type) -> void
+		auto register_field_id(const jclass clazz, const std::string& field_name, const field_type field_type) const -> void
 		{
 			if (field_ids[std::type_index{ typeid(*this) }].find(field_name) != field_ids[std::type_index{ typeid(*this) }].end())
 			{
@@ -840,7 +864,7 @@ namespace jni
 		// obtain the methodID of a method
 		template<typename return_type>
 			requires (is_std_type<return_type>::value or std::is_base_of_v<object, return_type>)
-		auto RegisterMethodID(const jclass clazz, const std::string& method_name, const method_type method_type) -> void
+		auto register_method_id(const jclass clazz, const std::string& method_name, const method_type method_type) const -> void
 		{
 			if (method_ids[std::type_index{ typeid(*this) }].find(method_name) != method_ids[std::type_index{ typeid(*this) }].end())
 			{

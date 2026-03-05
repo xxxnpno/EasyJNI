@@ -2,50 +2,48 @@
 
 #include <easy_jni/easy_jni.hpp>
 
-using namespace jni;
-
-class EntityPlayerSP final : public object
+class entity_player_sp final : public jni::object
 {
 public:
-    EntityPlayerSP(const jobject instance)
-        : object{ instance }
+    entity_player_sp(const jobject instance)
+        : jni::object{ instance }
     {
 
     }
 
-    auto GetServerSprintState() -> jboolean
+    auto get_server_sprinting_state() -> bool
     {
-        return get_field <bool>("serverSprintState")->get();
+        return get_field<bool>("serverSprintState")->get();
     }
 
-    auto SetServerSprintState(const bool value) -> void
+    auto set_server_sprinting_state(const bool value) -> void
     {
-        get_field<bool>("serverSprintState")->Set(value);
+        get_field<bool>("serverSprintState")->set(value);
     }
 
-    auto GetName() -> std::string
+    auto get_name() -> std::string
     {
 		return get_method<std::string>("getName")->call();
     }
 };
 
-class Minecraft final : public object
+class minecraft final : public jni::object
 {
 public:
-    Minecraft(const jobject instance)
-        : object{ instance }
+    minecraft(const jobject instance)
+        : jni::object{ instance }
     {
 
     }
 
-    auto GetMinecraft() -> std::unique_ptr<Minecraft>
+    auto get_minecraft() -> std::unique_ptr<minecraft>
     {
-        return get_field<Minecraft>("theMinecraft", field_type::STATIC)->get();
+        return get_field<minecraft>("theMinecraft", jni::field_type::STATIC)->get();
     }
 
-    auto GetThePlayer() -> std::unique_ptr<EntityPlayerSP>
+    auto get_the_player() -> std::unique_ptr<entity_player_sp>
     {
-		return get_field<EntityPlayerSP>("thePlayer")->get();
+		return get_field<entity_player_sp>("thePlayer")->get();
     }
 };
 
@@ -63,18 +61,18 @@ static DWORD WINAPI thread_entry(const HMODULE module)
     if (jni::init())
     {
         {
-            jni::register_class<Minecraft>("net/minecraft/client/Minecraft");
-            jni::register_class<EntityPlayerSP>("net/minecraft/client/entity/EntityPlayerSP");
+            jni::register_class<minecraft>("net/minecraft/client/Minecraft");
+            jni::register_class<entity_player_sp>("net/minecraft/client/entity/EntityPlayerSP");
 
-			const std::unique_ptr<Minecraft> theMinecraft{ std::make_unique<Minecraft>()->GetMinecraft() };
+			const std::unique_ptr<minecraft> the_minecraft{ std::make_unique<minecraft>(nullptr)->get_minecraft() };
 
             while (true)
             {
-                if (theMinecraft->GetThePlayer()->get_instance())
+                if (the_minecraft->get_the_player()->get_instance())
                 {
-					theMinecraft->GetThePlayer()->SetServerSprintState(true);
+                    the_minecraft->get_the_player()->set_server_sprinting_state(true);
 
-                    std::println("Server Sprint State: {}", theMinecraft->GetThePlayer()->GetServerSprintState());
+                    std::println("Server Sprint State: {}", the_minecraft->get_the_player()->get_server_sprinting_state());
                 }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
@@ -106,10 +104,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
     {
         DisableThreadLibraryCalls(hModule);
-        HANDLE threadHandle{ CreateThread(nullptr, 0ull, reinterpret_cast<LPTHREAD_START_ROUTINE>(thread_entry), hModule, 0ul, nullptr) };
-        if (threadHandle)
+        HANDLE thread_handle{ CreateThread(nullptr, 0ull, reinterpret_cast<LPTHREAD_START_ROUTINE>(thread_entry), hModule, 0ul, nullptr) };
+        if (thread_handle)
         {
-            CloseHandle(threadHandle);
+            CloseHandle(thread_handle);
         }
         break;
     }
