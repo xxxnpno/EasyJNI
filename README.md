@@ -1,86 +1,76 @@
 ### API
 ```cpp
-auto EasyJNI::Init(const U8 maxEnvs = 10) -> bool
-auto EasyJNI::Shutdown() -> void
+// call jni::init before using EasyJNI
+auto jni::init(const std::uint8_t maxEnvs = 10) -> bool
+// call jni::shutdown before uninjecting
+auto jni::shutdown() -> void
 
 // use this function before closing a thread that uses EasyJNI
-auto EasyJNI::ExitThread() -> void
-
-class Object
-{
-public:
-  template<typename Type, class Caller>
-  auto GetField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
-
-  template<typename Type, class Caller>
-  auto SetField(const std::string& fieldName, const Type& value) -> void
-
-  template<typename Type, class Caller>
-  static auto GetStaticField(const std::string& fieldName) -> std::conditional_t<std::is_base_of_v<Object, Type>, std::unique_ptr<Type>, Type>
-
-  template<typename Type, class Caller>
-  static auto SetStaticField(const std::string& fieldName, const Type& value) -> void
-}
+auto jni::exit_thread() -> void
 ```
 
 I'm going to create an example based on Minecraft 1.8.9 source code.  
 The Minecraft class is the main class of the game and stores a static field with its instance.
 
+EasyJNI currently only support getters and setters for normal classes  
+See example: [main.cpp](./EasyJNI/src/main.cpp)
+
 ```cpp
-// you need to register your classes
-EasyJNI::RegisterClass<Minecraft>("net/minecraft/client/Minecraft");
-EasyJNI::RegisterClass<EntityPlayerSP>("net/minecraft/client/entity/EntityPlayerSP");
+// you need to register your classes before using them
+jni::register_class<minecraft>("net/minecraft/client/Minecraft");
+jni::register_class<entity_player_sp>("net/minecraft/client/entity/EntityPlayerSP");
 ```
 
 ### Usage
 ```cpp
-// recreate the java class in cpp and derive it from EasyJNI::Object
-class Minecraft final : public EasyJNI::Object
+// recreate the java class in cpp and derive it from jni::object
+class minecraft final : public jni::object
 {
 public:
-    Minecraft(const jobject instance)
-        : EasyJNI::Object{ instance } // don't forget to give the jobject
+    // create a constructor that takes a jobject and super the jobject to jni::object
+    minecraft(const jobject instance)
+        : jni::object{ instance }
     {
 
     }
 
-    // for getters jobject are placed in unique ptrs
-    static auto GetMinecraft() -> std::unique_ptr<Minecraft>
+    // even if theMinecraft is static don't make get_minecraft() static see main.cpp
+    // methods never return jobject they always place them in unique ptrs
+    auto get_minecraft() -> std::unique_ptr<minecraft>
     {
-        // the template takes <type of the field>, <current class>
-        return GetStaticField<Minecraft, Minecraft>("theMinecraft");
+        // give to get_field the type of the field, its name and if it is static
+        // then use ->get
+        return get_field<minecraft>("theMinecraft", jni::field_type::STATIC)->get();
     }
 
-    auto GetThePlayer() -> std::unique_ptr<EntityPlayerSP>
+    // same as get_minecraft but the field is not static
+    auto get_the_player() -> std::unique_ptr<entity_player_sp>
     {
-        // the template takes <type of the field>, <current class>
-        return GetField<EntityPlayerSP, Minecraft>("thePlayer");
+        return get_field<entity_player_sp>("thePlayer")->get();
     }
 };
 ```
 ```cpp
-class EntityPlayerSP final : public EasyJNI::Object
+class entity_player_sp final : public jni::object
 {
 public:
-    EntityPlayerSP(const jobject instance)
-        : EasyJNI::Object{ instance }
+    entity_player_sp(const jobject instance)
+        : jni::object{ instance }
     {
 
     }
 
-    // primitive types are not unique ptrs
-    auto GetServerSprintState() -> bool // use cpp primitive types not the jni ones; helper in [Type.hpp](./EasyJNI/ext/Type/Type.hpp)
+    // for primitives getter use cpp types; bool istead of jbool
+    auto get_server_sprinting_state() -> bool
     {
-        return GetField<bool, EntityPlayerSP>("serverSprintState");
+        return get_field<bool>("serverSprintState")->get();
     }
 
-    // if the setter takes a jobject give the unique ptr to the method not the jobject example : auto RemoveTeam(const std::unique_ptr<ScorePlayerTeam>& team) -> void
-    auto SetServerSprintState(const bool value) -> void
+    // same as getters
+    auto set_server_sprinting_state(const bool value) -> void
     {
-        SetField<bool, EntityPlayerSP>("serverSprintState", value);
+        // no need to specify the type to ->set
+        get_field<bool>("serverSprintState")->set(value);
     }
 };
 ```
-
-EasyJNI currently only support getters and setters for normal classes  
-See example: [main.cpp](./EasyJNI/src/main.cpp)
