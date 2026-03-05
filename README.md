@@ -27,7 +27,7 @@ jni::register_class<entity_player_sp>("net/minecraft/client/entity/EntityPlayerS
 class minecraft final : public jni::object
 {
 public:
-    // create a constructor that takes a jobject and super the jobject to jni::object
+    // create a constructor that takes a jobject and supers the jobject to jni::object
     minecraft(const jobject instance)
         : jni::object{ instance }
     {
