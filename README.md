@@ -5,7 +5,7 @@
 
 currently working on method call
 
-compiled on visual studio 2026 insider with latest msvc
+compiled on windows with visual studio 2026 insider and latest msvc
 
 ### API
 ```cpp
