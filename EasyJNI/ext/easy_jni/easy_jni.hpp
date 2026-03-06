@@ -1303,6 +1303,18 @@ namespace jni
 		}
 	};
 
+	class collection : jni::object
+	{
+	public:
+		explicit collection(const jobject instance = nullptr)
+			: jni::object{ instance }
+		{
+
+		}
+
+
+	};
+
 	// initialize EasyJI, take the maximum amount of envs to store before clearing the map as an argument
 	auto init(const std::uint8_t maxEnvs = 10) 
 		-> bool
@@ -1328,6 +1340,8 @@ namespace jni
 			{
 				throw std::runtime_error{ "Failed to get JVMTI environment." };
 			}
+
+			jni::register_class<jni::collection>("java/lang/Collection");
 
 			return true;
 		}

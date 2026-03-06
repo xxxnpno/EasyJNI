@@ -2,11 +2,26 @@
 
 #include <easy_jni/easy_jni.hpp>
 
-class entity_player_sp : public jni::object
+class entity_player : public jni::object
+{
+public:
+    entity_player(jobject instance)
+        : jni::object{ instance }
+    {
+
+    }
+
+    auto get_name() -> std::string
+    {
+        return get_method<std::string>("getName")->call();
+    }
+};
+
+class entity_player_sp : public entity_player
 {
 public:
     entity_player_sp(jobject instance)
-        : jni::object{ instance }
+        : entity_player{ instance }
     {
 
     }
@@ -24,11 +39,6 @@ public:
     auto send_chat_message(const std::string& value) -> void
     {
         get_method<void, std::string>("sendChatMessage")->call(value);
-    }
-    
-    auto get_name() -> std::string
-    {
-        return get_method<std::string>("getName")->call();
     }
 };
 
