@@ -1039,6 +1039,36 @@ namespace jni
 						);
 					}
 				}
+				else if constexpr (std::is_same_v<return_type, std::string>)
+				{
+					jobject local{};
+					if (this->method_type == method_type::NOT_STATIC)
+					{
+						local = jni::get_env()->CallObjectMethodA(
+							reinterpret_cast<jobject>(this->class_or_instance),
+							method_id,
+							jargs_ptr
+						);
+					}
+					else
+					{
+						local = jni::get_env()->CallStaticObjectMethodA(
+							reinterpret_cast<jclass>(this->class_or_instance),
+							method_id,
+							jargs_ptr
+						);
+					}
+
+					if (not local)
+					{
+						return std::string{};
+					}
+
+					const jni::string str{ static_cast<jstring>(local) };
+					jni::get_env()->DeleteLocalRef(local);
+
+					return str.get_std_string();
+				}
 
 				if constexpr (not std::is_base_of_v<object, return_type> and not std::is_same_v<return_type, void>)
 				{

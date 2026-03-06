@@ -25,6 +25,11 @@ public:
     {
         get_method<void, std::string>("sendChatMessage")->call(value);
     }
+    
+    auto get_name() -> std::string
+    {
+        return get_method<std::string>("getName")->call();
+    }
 };
 
 class minecraft : public jni::object
@@ -68,16 +73,18 @@ static DWORD WINAPI thread_entry(const HMODULE module)
 
             while (true)
             {
-                if (the_minecraft->get_the_player()->get_instance())
-                {
-                    the_minecraft->get_the_player()->set_sprinting(true);
+                const std::unique_ptr<entity_player_sp> the_player{ the_minecraft->get_the_player() };
 
-                    the_minecraft->get_the_player()->send_chat_message(
-                        std::format("Sprinting state: {}", the_minecraft->get_the_player()->is_sprinting())
+                if (the_player->get_instance())
+                {
+                    the_player->set_sprinting(true);
+
+                    the_player->send_chat_message(
+                        std::format("name: {}, sprinting: {}", the_player->get_name(), the_player->is_sprinting())
                     );
                 }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
+                std::this_thread::sleep_for(std::chrono::milliseconds{ 250 });
 
                 if (GetAsyncKeyState(VK_END) bitand 0x8000)
                 {
