@@ -2,23 +2,23 @@
 
 #include <easy_jni/easy_jni.hpp>
 
-class entity_player_sp final : public jni::object
+class entity_player_sp : public jni::object
 {
 public:
-    entity_player_sp(const jobject instance)
+    entity_player_sp(jobject instance)
         : jni::object{ instance }
     {
 
     }
 
-    auto get_server_sprinting_state() -> bool
+    auto is_sprinting() -> bool
     {
-        return get_field<bool>("serverSprintState")->get();
+        return get_method<bool>("isSprinting")->call();
     }
 
-    auto set_server_sprinting_state(const bool value) -> void
+    auto set_sprinting(const bool value) -> void
     {
-        get_field<bool>("serverSprintState")->set(value);
+        get_method<void, bool>("setSprinting")->call(value);
     }
 
     auto get_name() -> std::string
@@ -27,10 +27,10 @@ public:
     }
 };
 
-class minecraft final : public jni::object
+class minecraft : public jni::object
 {
 public:
-    minecraft(const jobject instance)
+    minecraft(jobject instance)
         : jni::object{ instance }
     {
 
@@ -70,9 +70,9 @@ static DWORD WINAPI thread_entry(const HMODULE module)
             {
                 if (the_minecraft->get_the_player()->get_instance())
                 {
-                    the_minecraft->get_the_player()->set_server_sprinting_state(true);
+                    the_minecraft->get_the_player()->set_sprinting(true);
 
-                    std::println("Server Sprint State: {}", the_minecraft->get_the_player()->get_server_sprinting_state());
+                    std::println("Sprint State: {}", the_minecraft->get_the_player()->is_sprinting());
                 }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
