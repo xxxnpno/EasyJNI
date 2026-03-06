@@ -75,6 +75,7 @@ public:
     {
 
     }
+
     // always use cpp primitives types instead of jni ones
     // for instance use std::string instead of jstring
     // there is void, short, int, long long, float
