@@ -3,8 +3,9 @@
 - no need for java signatures
 - easy to use getter and setter for fields
 - easy to use call for methods
+- cpp polymorphism works
 
-currently working on polymorphism and java data structures 
+currently working on java data structures and constructores
 
 cpp23
 
