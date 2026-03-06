@@ -293,6 +293,13 @@ namespace jni
 	template<> struct is_jni_type<jstring> : public std::true_type {};
 	template<> struct is_jni_type<jobject> : public std::true_type {};
 
+	template<typename T>
+	struct is_object_ptr : std::false_type {};
+
+	template<typename T>
+		requires (std::is_base_of_v<object, T>)
+	struct is_object_ptr<std::unique_ptr<T>> : std::true_type {};
+
 	// associate the type index of a cpp type to the signature of the corresponding java type, used to get the signature of a method or a field from the cpp type
 	std::unordered_map< std::type_index, std::string> class_map;
 
@@ -788,7 +795,11 @@ namespace jni
 		// call the method with the given arguments, if the method is static, class_or_instance will be a jclass, otherwise it will be a jobject
 		template<typename... args_t>
 			requires (
-				(is_std_type<std::remove_cvref_t<args_t>>::value or std::is_base_of_v<object, std::remove_cvref_t<args_t>>) and ...
+				(
+					is_std_type<std::remove_cvref_t<args_t>>::value
+					or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
+					or is_object_ptr<std::remove_cvref_t<args_t>>::value
+				) and ...
 			)
 		auto call(args_t&&... args) const 
 			-> std::conditional_t<std::is_base_of_v<object, return_type>, std::unique_ptr<return_type>, return_type>
@@ -802,23 +813,26 @@ namespace jni
 					throw std::runtime_error{ "Failed to get method id." };
 				}
 
-				auto convert_arg = [](auto&& arg)
-					-> jvalue
+				auto convert_arg = [](auto&& arg) -> jvalue
+				{
+					using raw = std::remove_cvref_t<decltype(arg)>;
+
+					std::any jni_val{};
+					if constexpr (std::is_base_of_v<object, raw>)
 					{
-						using raw = std::remove_cvref_t<decltype(arg)>;
+						jni_val = arg.get_instance();
+					}
+					else if constexpr (is_object_ptr<raw>::value)
+					{
+						jni_val = arg->get_instance();
+					}
+					else
+					{
+						jni_val = cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
+					}
 
-						std::any jni_val{};
-						if constexpr (std::is_base_of_v<object, raw>)
-						{
-							jni_val = arg.get_instance();
-						}
-						else
-						{
-							jni_val = cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
-						}
-
-						return jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
-					};
+					return jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
+				};
 
 				const jvalue* jargs_ptr{ nullptr };
 				std::vector<jvalue> jargs{};
