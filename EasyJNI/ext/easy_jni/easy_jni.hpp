@@ -817,7 +817,10 @@ namespace jni
 					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
 				}
 
-				auto convert_arg = [](auto&& arg) -> jvalue
+				std::vector<jni::string> string_keeper{};
+				string_keeper.reserve(sizeof...(args_t));
+
+				auto convert_arg = [&string_keeper](auto&& arg) -> jvalue
 				{
 					using raw = std::remove_cvref_t<decltype(arg)>;
 
@@ -829,6 +832,11 @@ namespace jni
 					else if constexpr (is_object_ptr<raw>::value)
 					{
 						jni_val = arg->get_instance();
+					}
+					else if constexpr (std::is_same_v<raw, std::string>)
+					{
+						string_keeper.emplace_back(arg);
+						jni_val = string_keeper.back().get_jni_string();
 					}
 					else
 					{
