@@ -83,6 +83,7 @@ public:
     auto set_sprinting(const bool value) -> void
     {
         // setSprinting returns void and takes a bool
+        // if a method takes a jobject, pass the unique ptr not the jobject
         get_method<void, bool>("setSprinting")->call(value);
     }
 };
