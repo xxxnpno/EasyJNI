@@ -39,7 +39,7 @@ class minecraft final : public jni::object
 {
 public:
     // create a constructor that takes a jobject and supers the jobject to jni::object
-    minecraft(const jobject instance)
+    explicit minecraft(const jobject instance)
         : jni::object{ instance }
     {
 
@@ -65,7 +65,7 @@ public:
 class entity_player_sp final : public jni::object
 {
 public:
-    entity_player_sp(const jobject instance)
+    explicit entity_player_sp(const jobject instance)
         : jni::object{ instance }
     {
 
