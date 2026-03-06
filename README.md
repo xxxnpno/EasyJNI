@@ -5,7 +5,7 @@
 - easy to use call for methods
 - cpp polymorphism works
 
-currently working on java data structures and constructores
+currently working on java data structures and constructors
 
 cpp23
 
