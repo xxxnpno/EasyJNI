@@ -11,7 +11,8 @@ public:
 
     }
 
-    auto get_name() -> std::string
+    auto get_name() 
+        -> std::string
     {
         return get_method<std::string>("getName")->call();
     }
@@ -26,19 +27,38 @@ public:
 
     }
 
-    auto is_sprinting() -> bool
+    auto is_sprinting() 
+        -> bool
     {
         return get_method<bool>("isSprinting")->call();
     }
 
-    auto set_sprinting(const bool value) -> void
+    auto set_sprinting(const bool value) 
+        -> void
     {
         get_method<void, bool>("setSprinting")->call(value);
     }
 
-    auto send_chat_message(const std::string& value) -> void
+    auto send_chat_message(const std::string& value) 
+        -> void
     {
         get_method<void, std::string>("sendChatMessage")->call(value);
+    }
+};
+
+class world_client : public jni::object
+{
+public:
+    world_client(jobject instance)
+        : jni::object{ instance }
+    {
+
+    }
+
+    auto get_player_entities()
+        -> std::vector<std::unique_ptr<entity_player>>
+    {
+        return get_field<jni::list>("playerEntities")->get()->to_vector<entity_player>();
     }
 };
 
@@ -51,14 +71,22 @@ public:
 
     }
 
-    auto get_minecraft() -> std::unique_ptr<minecraft>
+    auto get_minecraft() 
+        -> std::unique_ptr<minecraft>
     {
         return get_field<minecraft>("theMinecraft", jni::field_type::STATIC)->get();
     }
 
-    auto get_the_player() -> std::unique_ptr<entity_player_sp>
+    auto get_the_player() 
+        -> std::unique_ptr<entity_player_sp>
     {
 		return get_field<entity_player_sp>("thePlayer")->get();
+    }
+
+    auto get_the_world()
+        -> std::unique_ptr<world_client>
+    {
+        return get_field<world_client>("theWorld")->get();
     }
 };
 
@@ -77,21 +105,29 @@ static DWORD WINAPI thread_entry(const HMODULE module)
     {
         {
             jni::register_class<minecraft>("net/minecraft/client/Minecraft");
+
+            jni::register_class<entity_player>("net/minecraft/entity/EntityPlayer");
             jni::register_class<entity_player_sp>("net/minecraft/client/entity/EntityPlayerSP");
+
+            jni::register_class<world_client>("net/minecraft/client/multiplayer/WorldClient");
 
 			const std::unique_ptr<minecraft> the_minecraft{ std::make_unique<minecraft>(nullptr)->get_minecraft() };
 
             while (true)
             {
                 const std::unique_ptr<entity_player_sp> the_player{ the_minecraft->get_the_player() };
+                const std::unique_ptr<world_client> the_world{ the_minecraft->get_the_world() };
 
-                if (the_player->get_instance())
+                std::println("name: {}", the_player->get_name());
+
+                if (the_player->get_instance() and the_world->get_instance())
                 {
-                    the_player->set_sprinting(true);
-
-                    the_player->send_chat_message(
-                        std::format("name: {}, sprinting: {}", the_player->get_name(), the_player->is_sprinting())
-                    );
+                    for (const std::unique_ptr<entity_player>& player : the_world->get_player_entities())
+                    {
+                        the_player->send_chat_message(
+                            std::format("name : {}", player->get_name())
+                        );
+                    }
                 }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds{ 250 });
