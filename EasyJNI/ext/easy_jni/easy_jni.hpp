@@ -152,11 +152,12 @@ namespace jni
 	{
 	public:
 		explicit string(const std::string& std_string = "")
-			: std_string{ std_string }
+			: jni_string{ nullptr }
+			, std_string{ std_string }
 		{
 			const jstring local{ get_env()->NewStringUTF(std_string.c_str()) };
 
-			if (this->jni_string)
+			if (local)
 			{
 				this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(local));
 				get_env()->DeleteLocalRef(local);
@@ -164,14 +165,14 @@ namespace jni
 		}
 
 		explicit string(const jstring jni_string = nullptr)
+			: jni_string{ nullptr }
 		{
-			this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(jni_string));
-
-			if (this->jni_string)
+			if (jni_string)
 			{
-				const char* chars{ get_env()->GetStringUTFChars(this->jni_string, nullptr) };
+				this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(jni_string));
 
-				this->std_string = std::string(chars);
+				const char* chars{ get_env()->GetStringUTFChars(this->jni_string, nullptr) };
+				this->std_string = std::string{ chars };
 				get_env()->ReleaseStringUTFChars(this->jni_string, chars);
 			}
 		}
@@ -184,12 +185,14 @@ namespace jni
 			}
 		}
 
-		auto get_jni_string() const -> jstring
+		auto get_jni_string() const
+			-> jstring
 		{
 			return this->jni_string;
 		}
 
-		auto get_std_string() const -> std::string
+		auto get_std_string() const
+			-> std::string
 		{
 			return this->std_string;
 		}

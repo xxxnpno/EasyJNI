@@ -21,9 +21,9 @@ public:
         get_method<void, bool>("setSprinting")->call(value);
     }
 
-    auto get_name() -> std::string
+    auto send_chat_message(const std::string& value) -> void
     {
-		return get_method<std::string>("getName")->call();
+        get_method<void, std::string>("sendChatMessage")->call(value);
     }
 };
 
@@ -72,7 +72,9 @@ static DWORD WINAPI thread_entry(const HMODULE module)
                 {
                     the_minecraft->get_the_player()->set_sprinting(true);
 
-                    std::println("Sprint State: {}", the_minecraft->get_the_player()->is_sprinting());
+                    the_minecraft->get_the_player()->send_chat_message(
+                        std::format("Sprinting state: {}", the_minecraft->get_the_player()->is_sprinting())
+                    );
                 }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
