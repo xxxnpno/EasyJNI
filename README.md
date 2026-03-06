@@ -1,9 +1,10 @@
 ### EasyJNI
 - no env managment
 - no need for java signatures
-- easy to use getters and setters
+- easy to use getter and setter for fields
+- easy to use call for methods
 
-currently working on method call
+currently working on polymorphism and java data structures 
 
 cpp23
 
@@ -11,6 +12,7 @@ cpp23
 ```cpp
 // call jni::init before using EasyJNI
 auto jni::init(const std::uint8_t maxEnvs = 10) -> bool
+
 // call jni::shutdown before uninjecting
 auto jni::shutdown() -> void
 
@@ -68,17 +70,20 @@ public:
 
     }
 
-    // for primitives getter use cpp types; bool istead of jbool
-    auto get_server_sprinting_state() -> bool
+    // always use cpp primitives types instead of jni ones
+    // for instance use bool instead of jbool
+    // there is void, short, int, long long, float
+    // double, char, bool, void, std::string
+    auto is_sprinting() -> bool
     {
-        return get_field<bool>("serverSprintState")->get();
+        // get method template takes <return type, args...>
+        return get_method<bool>("isSprinting")->call();
     }
 
-    // same as getters
-    auto set_server_sprinting_state(const bool value) -> void
+    auto set_sprinting(const bool value) -> void
     {
-        // no need to specify the type to ->set
-        get_field<bool>("serverSprintState")->set(value);
+        // setSprinting returns void and takes a bool
+        get_method<void, bool>("setSprinting")->call(value);
     }
 };
 ```
