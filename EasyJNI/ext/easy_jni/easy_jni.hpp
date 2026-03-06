@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <format>
 #include <print>
 #include <stdexcept>
 #include <string>
@@ -40,9 +41,9 @@ namespace jni
 	auto get_env() 
 		-> JNIEnv*
 	{
-		manage_envs();
+		jni::manage_envs();
 
-		return envs.at(std::this_thread::get_id());
+		return jni::envs.at(std::this_thread::get_id());
 	}
 
 	// manage the envs of the threads, if the current thread is not in the map, 
@@ -52,28 +53,28 @@ namespace jni
 	{
 		try
 		{
-			if (envs.size() >= max_stored_envs)
+			if (jni::envs.size() >= jni::max_stored_envs)
 			{
-				envs.clear();
+				jni::envs.clear();
 			}
 
 			const std::thread::id id{ std::this_thread::get_id() };
-			const auto it{ envs.find(id) };
+			const auto it{ jni::envs.find(id) };
 
-			if (it == envs.end())
+			if (it == jni::envs.end())
 			{
 				JNIEnv* env{ nullptr };
-				const jint result{ vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) };
+				const jint result{ jni::vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) };
 
 				if (result == JNI_EDETACHED)
 				{
-					if (vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
+					if (jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
 					{
 						throw std::runtime_error{ "Failed to attach current thread to JVM." };
 					}
 				}
 
-				envs.insert({ id, env });
+				jni::envs.insert({ id, env });
 			}
 		}
 		catch (const std::runtime_error& e)
@@ -86,9 +87,9 @@ namespace jni
 	auto exit_thread() 
 		-> void
 	{
-		vm->DetachCurrentThread();
+		jni::vm->DetachCurrentThread();
 
-		envs.erase(std::this_thread::get_id());
+		jni::envs.erase(std::this_thread::get_id());
 	}
 
 	// associate the class name with the global reference of the class
@@ -100,12 +101,12 @@ namespace jni
 	{
 		try
 		{
-			const jclass clazz{ get_env()->FindClass("java/lang/Class") };
-			const jmethodID get_name_id{ get_env()->GetMethodID(clazz, "getName", "()Ljava/lang/String;") };
+			const jclass clazz{ jni::get_env()->FindClass("java/lang/Class") };
+			const jmethodID get_name_id{ jni::get_env()->GetMethodID(clazz, "getName", "()Ljava/lang/String;") };
 
 			jint amount{};
 			jclass* classes_ptr{};
-			if (jvmti->GetLoadedClasses(&amount, &classes_ptr) != JVMTI_ERROR_NONE)
+			if (jni::jvmti->GetLoadedClasses(&amount, &classes_ptr) != JVMTI_ERROR_NONE)
 			{
 				throw std::runtime_error{ "Failed to get loaded classes." };
 			}
@@ -114,13 +115,13 @@ namespace jni
 			{
 				const jclass current_class{ classes_ptr[i] };
 
-				const jstring class_name{ static_cast<jstring>(get_env()->CallObjectMethod(current_class, get_name_id)) };
-				const char* const class_nams_c_str{ get_env()->GetStringUTFChars(class_name, nullptr) };
+				const jstring class_name{ static_cast<jstring>(jni::get_env()->CallObjectMethod(current_class, get_name_id)) };
+				const char* const class_nams_c_str{ jni::get_env()->GetStringUTFChars(class_name, nullptr) };
 
 				if (not std::strcmp(class_nams_c_str, name.c_str()))
 				{
-					classes.insert({ name, static_cast<jclass>(get_env()->NewGlobalRef(current_class)) });
-					return classes.at(name);
+					jni::classes.insert({ name, static_cast<jclass>(get_env()->NewGlobalRef(current_class)) });
+					return jni::classes.at(name);
 				}
 			}
 
@@ -139,12 +140,12 @@ namespace jni
 	{
 		std::replace(name.begin(), name.end(), '/', '.');
 
-		if (const auto it{ classes.find(name) }; it != classes.end())
+		if (const auto it{ jni::classes.find(name) }; it != jni::classes.end())
 		{
 			return it->second;
 		}
 
-		return load_class(name);
+		return jni::load_class(name);
 	}
 
 	// handle strings
@@ -155,12 +156,12 @@ namespace jni
 			: jni_string{ nullptr }
 			, std_string{ std_string }
 		{
-			const jstring local{ get_env()->NewStringUTF(std_string.c_str()) };
+			const jstring local{ jni::get_env()->NewStringUTF(std_string.c_str()) };
 
 			if (local)
 			{
-				this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(local));
-				get_env()->DeleteLocalRef(local);
+				this->jni_string = static_cast<jstring>(jni::get_env()->NewGlobalRef(local));
+				jni::get_env()->DeleteLocalRef(local);
 			}
 		}
 
@@ -169,11 +170,11 @@ namespace jni
 		{
 			if (jni_string)
 			{
-				this->jni_string = static_cast<jstring>(get_env()->NewGlobalRef(jni_string));
+				this->jni_string = static_cast<jstring>(jni::get_env()->NewGlobalRef(jni_string));
 
-				const char* chars{ get_env()->GetStringUTFChars(this->jni_string, nullptr) };
+				const char* chars{ jni::get_env()->GetStringUTFChars(this->jni_string, nullptr) };
 				this->std_string = std::string{ chars };
-				get_env()->ReleaseStringUTFChars(this->jni_string, chars);
+				jni::get_env()->ReleaseStringUTFChars(this->jni_string, chars);
 			}
 		}
 
@@ -181,7 +182,7 @@ namespace jni
 		{
 			if (this->jni_string)
 			{
-				get_env()->DeleteGlobalRef(this->jni_string);
+				jni::get_env()->DeleteGlobalRef(this->jni_string);
 			}
 		}
 
@@ -312,7 +313,7 @@ namespace jni
 	auto register_class (const std::string& class_name) 
 		-> void
 	{
-		class_map.insert_or_assign(std::type_index{ typeid(type) }, class_name);
+		jni::class_map.insert_or_assign(std::type_index{ typeid(type) }, class_name);
 	}
 
 	template <typename type>
@@ -322,11 +323,11 @@ namespace jni
 	{
 		if constexpr (std::is_base_of_v<object, type>)
 		{
-			return std::format("L{};", class_map.at(std::type_index{ typeid(type) }));
+			return std::format("L{};", jni::class_map.at(std::type_index{ typeid(type) }));
 		}
 		else
 		{
-			return signature_map.at(std::type_index{ typeid(type) });
+			return jni::signature_map.at(std::type_index{ typeid(type) });
 		}
 	}
 
@@ -361,11 +362,11 @@ namespace jni
 		{
 			try
 			{
-				const jfieldID field_id{ field_ids.at(this->index).find(this->name)->second };
+				const jfieldID field_id{ jni::field_ids.at(this->index).find(this->name)->second };
 
 				if (not field_id)
 				{
-					throw std::runtime_error{ "Failed to get method id." };
+					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
 				}
 
 				jobject local{};
@@ -373,14 +374,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						local = get_env()->GetObjectField(
+						local = jni::get_env()->GetObjectField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						local = get_env()->GetStaticObjectField(
+						local = jni::get_env()->GetStaticObjectField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -390,7 +391,7 @@ namespace jni
 
 					if (local)
 					{
-						get_env()->DeleteLocalRef(local);
+						jni::get_env()->DeleteLocalRef(local);
 					}
 
 					return result;
@@ -401,14 +402,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = get_env()->GetShortField(
+						result = jni::get_env()->GetShortField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						result = get_env()->GetStaticShortField(
+						result = jni::get_env()->GetStaticShortField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -418,14 +419,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = get_env()->GetIntField(
+						result = jni::get_env()->GetIntField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						result = get_env()->GetStaticIntField(
+						result = jni::get_env()->GetStaticIntField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -435,14 +436,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = get_env()->GetLongField(
+						result = jni::get_env()->GetLongField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						result = get_env()->GetStaticLongField(
+						result = jni::get_env()->GetStaticLongField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -452,14 +453,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = get_env()->GetFloatField(
+						result = jni::get_env()->GetFloatField(
 							const_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						result = get_env()->GetStaticFloatField(
+						result = jni::get_env()->GetStaticFloatField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -469,14 +470,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = get_env()->GetDoubleField(
+						result = jni::get_env()->GetDoubleField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						result = get_env()->GetStaticDoubleField(
+						result = jni::get_env()->GetStaticDoubleField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -486,14 +487,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = get_env()->GetBooleanField(
+						result = jni::get_env()->GetBooleanField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						result = get_env()->GetStaticBooleanField(
+						result = jni::get_env()->GetStaticBooleanField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -503,14 +504,14 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = get_env()->GetCharField(
+						result = jni::get_env()->GetCharField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id
 						);
 					}
 					else
 					{
-						result = get_env()->GetStaticCharField(
+						result = jni::get_env()->GetStaticCharField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id
 						);
@@ -520,8 +521,8 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						result = string(
-							static_cast<jstring>(get_env()->GetObjectField(
+						result = jni::string(
+							static_cast<jstring>(jni::get_env()->GetObjectField(
 								reinterpret_cast<jobject>(this->class_or_instance),
 								field_id)
 								)
@@ -529,8 +530,8 @@ namespace jni
 					}
 					else
 					{
-						result = string(
-							static_cast<jstring>(get_env()->GetStaticObjectField(
+						result = jni::string(
+							static_cast<jstring>(jni::get_env()->GetStaticObjectField(
 								reinterpret_cast<jclass>(this->class_or_instance),
 								field_id)
 								)
@@ -540,8 +541,8 @@ namespace jni
 
 				if constexpr (not std::is_base_of_v<object, type>)
 				{
-					auto it = jni_to_cpp.find(result.type());
-					if (it != jni_to_cpp.end())
+					auto it = jni::jni_to_cpp.find(result.type());
+					if (it != jni::jni_to_cpp.end())
 					{
 						return std::any_cast<type>(it->second(result));
 					}
@@ -573,18 +574,18 @@ namespace jni
 		{
 			try
 			{
-				const jfieldID field_id{ field_ids.at(this->index).find(this->name)->second };
+				const jfieldID field_id{ jni::field_ids.at(this->index).find(this->name)->second };
 
 				if (not field_id)
 				{
-					throw std::runtime_error{ "Failed to get method id." };
+					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
 				}
 
 				if constexpr (std::is_base_of_v<object, type>)
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetObjectField(
+						jni::get_env()->SetObjectField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							value->get_instance()
@@ -592,7 +593,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticObjectField(
+						jni::get_env()->SetStaticObjectField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							value->get_instance()
@@ -604,7 +605,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetShortField(
+						jni::get_env()->SetShortField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							static_cast<jshort>(value)
@@ -612,7 +613,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticShortField(
+						jni::get_env()->SetStaticShortField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							static_cast<jshort>(value)
@@ -623,7 +624,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetIntField(
+						jni::get_env()->SetIntField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							static_cast<jint>(value)
@@ -631,7 +632,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticIntField(
+						jni::get_env()->SetStaticIntField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							static_cast<jint>(value)
@@ -642,7 +643,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetLongField(
+						jni::get_env()->SetLongField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							static_cast<jlong>(value)
@@ -650,7 +651,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticLongField(
+						jni::get_env()->SetStaticLongField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							static_cast<jlong>(value)
@@ -661,7 +662,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetFloatField(
+						jni::get_env()->SetFloatField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							static_cast<jfloat>(value)
@@ -669,7 +670,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticFloatField(
+						jni::get_env()->SetStaticFloatField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							static_cast<jfloat>(value)
@@ -680,7 +681,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetDoubleField(
+						jni::get_env()->SetDoubleField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							static_cast<jdouble>(value)
@@ -688,7 +689,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticDoubleField(
+						jni::get_env()->SetStaticDoubleField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							static_cast<jdouble>(value)
@@ -699,7 +700,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetBooleanField(
+						jni::get_env()->SetBooleanField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							static_cast<jboolean>(value)
@@ -707,7 +708,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticBooleanField(
+						jni::get_env()->SetStaticBooleanField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							static_cast<jboolean>(value)
@@ -718,7 +719,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetCharField(
+						jni::get_env()->SetCharField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							static_cast<jchar>(value)
@@ -726,7 +727,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticCharField(
+						jni::get_env()->SetStaticCharField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							static_cast<jchar>(value)
@@ -737,7 +738,7 @@ namespace jni
 				{
 					if (this->field_type == field_type::NOT_STATIC)
 					{
-						get_env()->SetObjectField(
+						jni::get_env()->SetObjectField(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							field_id,
 							string(value).get_jni_string()
@@ -745,7 +746,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->SetStaticObjectField(
+						jni::get_env()->SetStaticObjectField(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							field_id,
 							string(value).get_jni_string()
@@ -809,11 +810,11 @@ namespace jni
 		{
 			try
 			{
-				const jmethodID method_id{ method_ids.at(this->index).find(this->name)->second };
+				const jmethodID method_id{ jni::method_ids.at(this->index).find(this->name)->second };
 
 				if (not method_id)
 				{
-					throw std::runtime_error{ "Failed to get method id." };
+					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
 				}
 
 				auto convert_arg = [](auto&& arg) -> jvalue
@@ -831,10 +832,10 @@ namespace jni
 					}
 					else
 					{
-						jni_val = cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
+						jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
 					}
 
-					return jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
+					return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
 				};
 
 				const jvalue* jargs_ptr{ nullptr };
@@ -851,7 +852,7 @@ namespace jni
 					jobject local{};
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						local = get_env()->CallObjectMethodA(
+						local = jni::get_env()->CallObjectMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -859,7 +860,7 @@ namespace jni
 					}
 					else
 					{
-						local = get_env()->CallStaticObjectMethodA(
+						local = jni::get_env()->CallStaticObjectMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -870,7 +871,7 @@ namespace jni
 
 					if (local)
 					{
-						get_env()->DeleteLocalRef(local);
+						jni::get_env()->DeleteLocalRef(local);
 					}
 
 					return result;
@@ -881,7 +882,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						get_env()->CallVoidMethodA(
+						jni::get_env()->CallVoidMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -889,7 +890,7 @@ namespace jni
 					}
 					else
 					{
-						get_env()->CallStaticVoidMethodA(
+						jni::get_env()->CallStaticVoidMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -901,7 +902,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						result = get_env()->CallShortMethodA(
+						result = jni::get_env()->CallShortMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -909,7 +910,7 @@ namespace jni
 					}
 					else
 					{
-						result = get_env()->CallStaticShortMethodA(
+						result = jni::get_env()->CallStaticShortMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -920,7 +921,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						result = get_env()->CallIntMethodA(
+						result = jni::get_env()->CallIntMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -928,7 +929,7 @@ namespace jni
 					}
 					else
 					{
-						result = get_env()->CallStaticIntMethodA(
+						result = jni::get_env()->CallStaticIntMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -939,7 +940,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						result = get_env()->CallLongMethodA(
+						result = jni::get_env()->CallLongMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -947,7 +948,7 @@ namespace jni
 					}
 					else
 					{
-						result = get_env()->CallStaticLongMethodA(
+						result = jni::get_env()->CallStaticLongMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -958,7 +959,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						result = get_env()->CallFloatMethodA(
+						result = jni::get_env()->CallFloatMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -966,7 +967,7 @@ namespace jni
 					}
 					else
 					{
-						result = get_env()->CallStaticFloatMethodA(
+						result = jni::get_env()->CallStaticFloatMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -977,7 +978,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						result = get_env()->CallDoubleMethodA(
+						result = jni::get_env()->CallDoubleMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -985,7 +986,7 @@ namespace jni
 					}
 					else
 					{
-						result = get_env()->CallStaticDoubleMethodA(
+						result = jni::get_env()->CallStaticDoubleMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -996,7 +997,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						result = get_env()->CallBooleanMethodA(
+						result = jni::get_env()->CallBooleanMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -1004,7 +1005,7 @@ namespace jni
 					}
 					else
 					{
-						result = get_env()->CallStaticBooleanMethodA(
+						result = jni::get_env()->CallStaticBooleanMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -1015,7 +1016,7 @@ namespace jni
 				{
 					if (this->method_type == method_type::NOT_STATIC)
 					{
-						result = get_env()->CallCharMethodA(
+						result = jni::get_env()->CallCharMethodA(
 							reinterpret_cast<jobject>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -1023,7 +1024,7 @@ namespace jni
 					}
 					else
 					{
-						result = get_env()->CallStaticCharMethodA(
+						result = jni::get_env()->CallStaticCharMethodA(
 							reinterpret_cast<jclass>(this->class_or_instance),
 							method_id,
 							jargs_ptr
@@ -1033,8 +1034,8 @@ namespace jni
 
 				if constexpr (not std::is_base_of_v<object, return_type> and not std::is_same_v<return_type, void>)
 				{
-					auto it = jni_to_cpp.find(result.type());
-					if (it != jni_to_cpp.end())
+					auto it = jni::jni_to_cpp.find(result.type());
+					if (it != jni::jni_to_cpp.end())
 					{
 						return std::any_cast<return_type>(it->second(result));
 					}
@@ -1078,7 +1079,7 @@ namespace jni
 	{
 	public:
 		explicit object(const jobject instance = nullptr)
-			: instance{ instance ? get_env()->NewGlobalRef(instance) : nullptr }
+			: instance{ instance ? jni::get_env()->NewGlobalRef(instance) : nullptr }
 		{
 
 		}
@@ -1087,7 +1088,7 @@ namespace jni
 		{
 			if (this->instance)
 			{
-				get_env()->DeleteGlobalRef(this->instance);
+				jni::get_env()->DeleteGlobalRef(this->instance);
 			}
 		}
 
@@ -1099,16 +1100,16 @@ namespace jni
 		{
 			try
 			{
-				const jclass clazz{ get_class(class_map.at(std::type_index{ typeid(*this) })) };
+				const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
 
 				if (not clazz)
 				{
-					throw std::runtime_error{ "Class not found." };
+					throw std::runtime_error{ std::format("Class not found for {}.", field_name) };
 				}
 
 				if (not this->instance and field_type == field_type::NOT_STATIC)
 				{
-					throw std::runtime_error{ "Instance is null." };
+					throw std::runtime_error{ std::format("Instance is null for {}.", field_name) };
 				}
 
 				this->register_field_id<type>(clazz, field_name, field_type);
@@ -1139,16 +1140,16 @@ namespace jni
 		{
 			try
 			{
-				const jclass clazz{ get_class(class_map.at(std::type_index{ typeid(*this) })) };
+				const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
 
 				if (not clazz)
 				{
-					throw std::runtime_error{ "Class not found." };
+					throw std::runtime_error{ std::format("Class not found for {}.", method_name) };
 				}
 
 				if (not this->instance and method_type == method_type::NOT_STATIC)
 				{
-					throw std::runtime_error{ "Instance is null." };
+					throw std::runtime_error{ std::format("Instance is null for {}.", method_name) };
 				}
 
 				this->register_method_id<return_type, args_t...>(clazz, method_name, method_type);
@@ -1184,29 +1185,29 @@ namespace jni
 		{
 			try
 			{
-				if (field_ids[std::type_index{ typeid(*this) }].find(field_name) != field_ids[std::type_index{ typeid(*this) }].end())
+				if (jni::field_ids[std::type_index{ typeid(*this) }].find(field_name) != jni::field_ids[std::type_index{ typeid(*this) }].end())
 				{
 					return;
 				}
 
-				const std::string& signature{ get_signature<type>() };
+				const std::string& signature{ jni::get_signature<type>() };
 
 				jfieldID field_id{};
 				if (field_type == field_type::NOT_STATIC)
 				{
-					field_id = get_env()->GetFieldID(clazz, field_name.c_str(), signature.c_str());
+					field_id = jni::get_env()->GetFieldID(clazz, field_name.c_str(), signature.c_str());
 				}
 				else
 				{
-					field_id = get_env()->GetStaticFieldID(clazz, field_name.c_str(), signature.c_str());
+					field_id = jni::get_env()->GetStaticFieldID(clazz, field_name.c_str(), signature.c_str());
 				}
 
 				if (not field_id)
 				{
-					throw std::runtime_error{ "Failed to get field id." };
+					throw std::runtime_error{ std::format("Failed to get field id for {}.", field_name) };
 				}
 
-				field_ids[std::type_index{ typeid(*this) }].insert(
+				jni::field_ids[std::type_index{ typeid(*this) }].insert(
 					{ field_name, field_id }
 				);
 			}
@@ -1228,32 +1229,32 @@ namespace jni
 		{
 			try
 			{
-				if (method_ids[std::type_index{ typeid(*this) }].find(method_name) != method_ids[std::type_index{ typeid(*this) }].end())
+				if (jni::method_ids[std::type_index{ typeid(*this) }].find(method_name) != jni::method_ids[std::type_index{ typeid(*this) }].end())
 				{
 					return;
 				}
 
 				std::string params_sig{};
-				((params_sig += get_signature<std::remove_cvref_t<args_t>>()), ...);
+				((params_sig += jni::get_signature<std::remove_cvref_t<args_t>>()), ...);
 
-				const std::string signature{ std::format("({}){}", params_sig, get_signature<return_type>()) };
+				const std::string signature{ std::format("({}){}", params_sig, jni::get_signature<return_type>()) };
 
 				jmethodID method_id{};
 				if (method_type == method_type::NOT_STATIC)
 				{
-					method_id = get_env()->GetMethodID(clazz, method_name.c_str(), signature.c_str());
+					method_id = jni::get_env()->GetMethodID(clazz, method_name.c_str(), signature.c_str());
 				}
 				else
 				{
-					method_id = get_env()->GetStaticMethodID(clazz, method_name.c_str(), signature.c_str());
+					method_id = jni::get_env()->GetStaticMethodID(clazz, method_name.c_str(), signature.c_str());
 				}
 
 				if (not method_id)
 				{
-					throw std::runtime_error{ "Failed to get method id." };
+					throw std::runtime_error{ std::format("Failed to get method id for {}.", method_name) };
 				}
 
-				method_ids[std::type_index{ typeid(*this) }].insert(
+				jni::method_ids[std::type_index{ typeid(*this) }].insert(
 					{ method_name, method_id }
 				);
 			}
@@ -1268,24 +1269,24 @@ namespace jni
 	auto init(const std::uint8_t maxEnvs = 10) 
 		-> bool
 	{
-		max_stored_envs = maxEnvs;
+		jni::max_stored_envs = maxEnvs;
 
 		try
 		{
 			jsize count{};
-			if (JNI_GetCreatedJavaVMs(&vm, 1, &count) != JNI_OK)
+			if (JNI_GetCreatedJavaVMs(&jni::vm, 1, &count) != JNI_OK)
 			{
 				throw std::runtime_error{ "Failed to get created Java VMs." };
 			}
 
-			if (not vm)
+			if (not jni::vm)
 			{
 				throw std::runtime_error{ "No Java VM found." };
 			}
 
 			manage_envs();
 
-			if (vm->GetEnv(reinterpret_cast<void**>(&jvmti), JVMTI_VERSION_1_2) != JNI_OK)
+			if (jni::vm->GetEnv(reinterpret_cast<void**>(&jni::jvmti), JVMTI_VERSION_1_2) != JNI_OK)
 			{
 				throw std::runtime_error{ "Failed to get JVMTI environment." };
 			}
@@ -1305,14 +1306,14 @@ namespace jni
 	{
 		std::println("[INFO] Shutdown");
 
-		for (const auto& [_, clazz] : classes)
+		for (const auto& [_, clazz] : jni::classes)
 		{
 			if (clazz)
 			{
-				get_env()->DeleteGlobalRef(clazz);
+				jni::get_env()->DeleteGlobalRef(clazz);
 			}
 		}
 
-		exit_thread();
+		jni::exit_thread();
 	}
 }
