@@ -1,3 +1,12 @@
+### EasyJNI
+- no env managment
+- no need for java signatures
+- easy to use getters and setters
+
+currently working on method call
+
+cpp23
+
 ### API
 ```cpp
 // call jni::init before using EasyJNI
@@ -12,7 +21,6 @@ auto jni::exit_thread() -> void
 I'm going to create an example based on Minecraft 1.8.9 source code.  
 The Minecraft class is the main class of the game and stores a static field with its instance.
 
-EasyJNI currently only support getters and setters for normal classes  
 See example: [main.cpp](./EasyJNI/src/main.cpp)
 
 ```cpp
@@ -34,7 +42,7 @@ public:
 
     }
 
-    // even if theMinecraft is static don't make get_minecraft() static see main.cpp
+    // even if theMinecraft is static, don't make get_minecraft() static see main.cpp
     // methods never return jobject they always place them in unique ptrs
     auto get_minecraft() -> std::unique_ptr<minecraft>
     {
