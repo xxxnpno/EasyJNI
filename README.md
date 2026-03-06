@@ -12,7 +12,7 @@ cpp23
 ### API
 ```cpp
 // call jni::init before using EasyJNI
-auto jni::init(const std::uint8_t maxEnvs = 10)
+auto jni::init(const std::uint8_t max_envs = 10)
     -> bool
 
 // call jni::shutdown before uninjecting
