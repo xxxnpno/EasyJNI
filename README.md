@@ -126,6 +126,7 @@ public:
 
     }
 
+    // to_vector returns a vector of unique ptrs
     auto get_player_entities() const
         -> std::vector<std::unique_ptr<entity_player>>
     {
