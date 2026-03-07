@@ -106,7 +106,7 @@ static DWORD WINAPI thread_entry(const HMODULE module)
         {
             jni::register_class<minecraft>("net/minecraft/client/Minecraft");
 
-            jni::register_class<entity_player>("net/minecraft/entity/EntityPlayer");
+            jni::register_class<entity_player>("net/minecraft/entity/player/EntityPlayer");
             jni::register_class<entity_player_sp>("net/minecraft/client/entity/EntityPlayerSP");
 
             jni::register_class<world_client>("net/minecraft/client/multiplayer/WorldClient");
@@ -118,15 +118,11 @@ static DWORD WINAPI thread_entry(const HMODULE module)
                 const std::unique_ptr<entity_player_sp> the_player{ the_minecraft->get_the_player() };
                 const std::unique_ptr<world_client> the_world{ the_minecraft->get_the_world() };
 
-                std::println("name: {}", the_player->get_name());
-
                 if (the_player->get_instance() and the_world->get_instance())
                 {
                     for (const std::unique_ptr<entity_player>& player : the_world->get_player_entities())
                     {
-                        the_player->send_chat_message(
-                            std::format("name : {}", player->get_name())
-                        );
+                        std::println("name {}", player->get_name());
                     }
                 }
 

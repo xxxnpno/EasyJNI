@@ -153,7 +153,23 @@ namespace jni
 			return it->second;
 		}
 
-		return jni::load_class(name);
+		jclass found{ jni::load_class(name) };
+
+		if (not found)
+		{
+			std::string slash_name{ name };
+			std::replace(slash_name.begin(), slash_name.end(), '.', '/');
+
+			const jclass local{ jni::get_env()->FindClass(slash_name.c_str()) };
+			if (local)
+			{
+				found = static_cast<jclass>(jni::get_env()->NewGlobalRef(local));
+				jni::get_env()->DeleteLocalRef(local);
+				jni::classes.insert({ name, found });
+			}
+		}
+
+		return found;
 	}
 
 	// handle strings
