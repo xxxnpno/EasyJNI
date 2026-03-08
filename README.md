@@ -62,13 +62,13 @@ public:
     {
     }
 
-    // Wrap a method — use C++ types, never JNI types directly
+    // Wrap a method, use C++ types, never JNI types directly
     auto get_name() -> std::string
     {
         return get_method<std::string>("getName")->call();
     }
 
-    // Method with an argument — specify the argument type in the template, pass the value to call()
+    // Method with an argument, specify the argument type in the template, pass the value to call()
     auto add_chat_message(const std::unique_ptr<i_chat_component> value) -> void
     {
         get_method<void, i_chat_component>("addChatMessage")->call(value);
@@ -100,7 +100,7 @@ auto get_the_player() -> std::unique_ptr<entity_player_sp>
     return get_field<entity_player_sp>("thePlayer")->get();
 }
 
-// Static field — pass jni::field_type::STATIC
+// Static field,  pass jni::field_type::STATIC
 auto get_minecraft() -> std::unique_ptr<minecraft>
 {
     return get_field<minecraft>("theMinecraft", jni::field_type::STATIC)->get();
@@ -118,7 +118,7 @@ get_field<int>("someField")->set(42);
 // No arguments
 get_method<std::string>("getName")->call();
 
-// With arguments — list arg types in the template, pass values to call()
+// With arguments, list arg types in the template, pass values to call()
 get_method<void, i_chat_component>("addChatMessage")->call(my_component);
 
 // Static method
