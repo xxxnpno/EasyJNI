@@ -28,6 +28,8 @@ namespace jni
 
 	auto manage_envs() -> void;
 
+	auto shutdown_hooks() -> void;
+
 	/*
 	
 	*/
@@ -44,7 +46,7 @@ namespace jni
 	std::unordered_map<std::thread::id, JNIEnv*> envs;
 
 	// get the env of the current thread, if the env is not found, attach the thread to the JVM and store the env in the map
-	auto get_env() 
+	static auto get_env() 
 		-> JNIEnv*
 	{
 		// every time you want an env their is a bit of overhead
@@ -56,7 +58,7 @@ namespace jni
 
 	// manage the envs of the threads, if the current thread is not in the map, 
 	// attach it to the JVM and store the env in the map, if the map is full, clear it to prevent memory leaks
-	auto manage_envs() 
+	static auto manage_envs() 
 		-> void
 	{
 		try
@@ -108,7 +110,7 @@ namespace jni
 	std::unordered_map<std::string, jclass> classes;
 
 	// take a class name a create a global reference to the class
-	auto load_class(const std::string& name)
+	static auto load_class(const std::string& name)
 		-> jclass
 	{
 		try
@@ -168,7 +170,7 @@ namespace jni
 	}
 
 	// get the global reference of a class from its name, if the class is not found, return nullptr
-	auto get_class(std::string name) 
+	static auto get_class(std::string name) 
 		-> jclass
 	{
 		// I prefer using my/Class instead of my.Class
@@ -385,7 +387,7 @@ namespace jni
 	// associate your cpp class to a java class
 	template <typename type>
 		requires (std::is_base_of_v<object, type>)
-	auto register_class(const std::string& class_name)
+	static auto register_class(const std::string& class_name)
 		-> void
 	{
 		jni::class_map.insert_or_assign(std::type_index{ typeid(type) }, class_name);
@@ -394,7 +396,7 @@ namespace jni
 	// return the signature of a type primitive or not
 	template <typename type>
 		requires (is_std_type<type>::value or std::is_base_of_v<object, type> or std::is_same_v<type, jobjectArray>)
-	auto get_signature()
+	static auto get_signature()
 		-> std::string
 	{
 		try
@@ -1647,6 +1649,8 @@ namespace jni
 	{
 		std::println("[INFO] shutdown() Shutdown");
 
+		jni::shutdown_hooks();
+
 		for (const auto& [_, clazz] : jni::classes)
 		{
 			if (clazz)
@@ -1656,5 +1660,656 @@ namespace jni
 		}
 
 		jni::exit_thread();
+	}
+}
+
+// this part will handle method hooking with the HotSpot
+namespace jni
+{
+	namespace hotspot
+	{
+		// https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/vmStructs.hpp
+		typedef struct VMTypeEntry
+		{
+			const char* typeName;
+			const char* superclassName;
+
+			std::int32_t isOopType;
+			std::int32_t isIntegerType;
+			std::int32_t isUnsigned;
+
+			std::uint64_t size;
+		} VMTypeEntry_t, * VMTypeEntry_ptr_t;
+
+		// https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/vmStructs.hpp
+		typedef struct VMStructEntry
+		{
+			const char* typeName;
+			const char* fieldName;
+			const char* typeString;
+
+			std::int32_t isStatic;
+
+			std::uint64_t offset;
+
+			void* address;
+		} VMStructEntry_t, * VMStructEntry_ptr_t;
+
+		extern "C" JNIIMPORT VMTypeEntry_ptr_t gHotSpotVMTypes;
+		extern "C" JNIIMPORT VMStructEntry_ptr_t gHotSpotVMStructs;
+
+		// find offsets based on the jvm
+		static VMStructEntry_ptr_t find_VMStructEntry(const char* typeName, const char* fieldName)
+		{
+			for (VMStructEntry_ptr_t entry{ gHotSpotVMStructs }; entry->typeName; ++entry)
+			{
+				if (std::strcmp(entry->typeName, typeName)) continue;
+				if (std::strcmp(entry->fieldName, fieldName)) continue;
+				return entry;
+			}
+
+			return nullptr;
+		}
+
+		class symbol final
+		{
+		public:
+			std::string to_string()
+			{
+				static VMStructEntry_ptr_t length_entry{ find_VMStructEntry("Symbol", "_length") };
+				static VMStructEntry_ptr_t body_entry{ find_VMStructEntry("Symbol", "_body") };
+				if (not length_entry or not body_entry) return "";
+
+				const std::uint16_t length{ *(std::uint16_t*)((std::uint8_t*)this + length_entry->offset) };
+				const char* body{ (const char*)((std::uint8_t*)this + body_entry->offset) };
+
+				return std::string{ body, length };
+			}
+		};
+
+		class constant_pool final
+		{
+		public:
+			void** get_base()
+			{
+				static VMTypeEntry_ptr_t entry = []() -> VMTypeEntry_ptr_t 
+				{
+					for (VMTypeEntry_ptr_t _entry{ gHotSpotVMTypes }; _entry->typeName; ++_entry)
+					{
+						if (not std::strcmp(_entry->typeName, "ConstantPool"))
+						{
+							return _entry;
+						}
+					}
+
+					return nullptr;
+				}();
+
+				if (not entry)
+				{
+					return nullptr;
+				}
+
+				return (void**)((std::uint8_t*)this + entry->size);
+			}
+		};
+
+		class const_method final
+		{
+		public:
+			constant_pool* get_constants()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_constants") };
+				if (not entry) return nullptr;
+
+				return *(constant_pool**)((std::uint8_t*)this + entry->offset);
+			}
+
+			symbol* get_name()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_name_index") };
+				if (not entry) return nullptr;
+
+				const std::uint16_t index = *(std::uint16_t*)((std::uint8_t*)this + entry->offset);
+				return (symbol*)get_constants()->get_base()[index];
+			}
+
+			symbol* get_signature()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_signature_index") };
+				if (not entry) return nullptr;
+
+				const std::uint16_t index{ *(std::uint16_t*)((std::uint8_t*)this + entry->offset) };
+				return (symbol*)get_constants()->get_base()[index];
+			}
+		};
+
+		class method final
+		{
+		public:
+			void* get_i2i_entry()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_i2i_entry") };
+				if (not entry) return nullptr;
+
+				return *(void**)((std::uint8_t*)this + entry->offset);
+			}
+
+			void* get_from_interpreted_entry()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_from_interpreted_entry") };
+				if (not entry) return nullptr;
+
+				return *(void**)((std::uint8_t*)this + entry->offset);
+			}
+
+			std::uint32_t* get_access_flags()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_access_flags") };
+				if (not entry) return nullptr;
+
+				return (uint32_t*)((std::uint8_t*)this + entry->offset);
+			}
+
+			std::uint16_t* get_flags()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_flags") };
+				if (not entry) return nullptr;
+
+				return (std::uint16_t*)((std::uint8_t*)this + entry->offset);
+			}
+
+			const_method* get_const_method()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_constMethod") };
+				if (not entry) return nullptr;
+
+				return *(const_method**)((std::uint8_t*)this + entry->offset);
+			}
+
+			std::string get_name()
+			{
+				const_method* const_method{ get_const_method() };
+				if (not const_method) return "";
+
+				symbol* symbol{ const_method->get_name() };
+				if (not symbol) return "";
+
+				return symbol->to_string();
+			}
+
+			std::string get_signature()
+			{
+				const_method* const_method{ get_const_method() };
+				if (not const_method) return "";
+
+				symbol* symbol{ const_method->get_signature() };
+				if (not symbol) return "";
+
+				return symbol->to_string();
+			}
+		};
+
+		enum java_thread_state : std::int32_t
+		{
+			_thread_uninitialized = 0,
+			_thread_new = 2,
+			_thread_new_trans = 3,
+			_thread_in_native = 4,
+			_thread_in_native_trans = 5,
+			_thread_in_vm = 6,
+			_thread_in_vm_trans = 7,
+			_thread_in_Java = 8,
+			_thread_in_Java_trans = 9,
+			_thread_blocked = 10,
+			_thread_blocked_trans = 11,
+			_thread_max_state = 12
+		};
+
+		class java_thread final
+		{
+		public:
+			JNIEnv* get_env()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_anchor") };
+				if (not entry) return nullptr;
+
+				// _anchor is a  JavaFrameAnchor, JNIEnv* is at +32
+				return (JNIEnv*)((std::uint8_t*)this + entry->offset + 32);
+			}
+
+			java_thread_state get_thread_state()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
+				if (not entry) return _thread_uninitialized;
+
+				return *(java_thread_state*)((std::uint8_t*)this + entry->offset);
+			}
+
+			void set_thread_state(const java_thread_state state)
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
+				if (not entry) return;
+
+				*(java_thread_state*)((std::uint8_t*)this + entry->offset) = state;
+			}
+
+			std::uint32_t get_suspend_flags()
+			{
+				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_suspend_flags") };
+				if (not entry) return 0;
+
+				return *(std::uint32_t*)((std::uint8_t*)this + entry->offset);
+			}
+		};
+
+		// 0x00 is the wildcard
+		static bool match_pattern(const std::uint8_t* addr, const std::uint8_t* pattern, const std::size_t size)
+		{
+			for (std::size_t i{ 0 }; i < size; ++i)
+			{
+				if (pattern[i] == 0x00)
+				{
+					continue; // wildcard
+				}
+
+				if (addr[i] not_eq pattern[i])
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		static std::uint8_t* scan(const std::uint8_t* start, const std::size_t range, const std::uint8_t* pattern, const std::size_t size)
+		{
+			for (std::size_t i{ 0 }; i < range; ++i)
+			{
+				if (match_pattern(start + i, pattern, size))
+				{
+					return (std::uint8_t*)(start + i);
+				}
+			}
+			return nullptr;
+		}
+
+		// default value for java 8
+		inline static std::int8_t locals_offset = -48;
+
+		static void* find_hook_location(void* i2i_entry)
+		{
+			// 0x00 = wildcard
+			const std::uint8_t pattern[] =
+			{
+				0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00,
+				0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00,
+				0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00,
+				0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00,
+				0x41, 0xC6, 0x87, 0x00, 0x00, 0x00, 0x00, 0x00
+			};
+
+			// mov r14, QWORD PTR [rbp + ??] ; ret
+			const std::uint8_t locals_pattern[] =
+			{
+				0x4C, 0x8B, 0x75, 0x00, 0xC3
+			};
+
+			std::uint8_t* curr{ (std::uint8_t*)i2i_entry };
+
+			// we scan the first 0x400 bytes from i2i_entry
+			std::uint8_t* hook_location{ scan(curr, 0x400, pattern, sizeof(pattern)) };
+
+			if (not hook_location)
+			{
+				std::println("[ERROR] find_hook_location: pattern not found\n");
+				return nullptr;
+			}
+
+			// go up from hook_location to find locals_pattern
+			// we check the last 100 bytes
+			for (std::uint8_t* p = hook_location; p > hook_location - 100; --p)
+			{
+				if (match_pattern(p, locals_pattern, sizeof(locals_pattern)))
+				{
+					// p[3] is the ?? > meaning the local offset
+					locals_offset = (std::int8_t)p[3];
+					break;
+				}
+			}
+
+			// the hook is 8 bytes before the end of the pattern
+			// sizeof(pattern) - 8 is the position of mov BYTE PTR [r15+...], 0x0
+			return hook_location + sizeof(pattern) - 8;
+		}
+
+		class frame final
+		{
+		public:
+			method* get_method()
+			{
+				return *(method**)((std::uint8_t*)this - 24);
+			}
+
+			void** get_locals()
+			{
+				return *(void***)((std::uint8_t*)this + locals_offset);
+			}
+		};
+		
+		/*
+		
+			push rax         ; save all registers
+			push rcx
+			push rdx
+			push r8
+			push r9
+			push r10
+			push r11
+			push rbp
+			push 0x0         ; place for the custom return value
+			
+			mov rcx, rbp     ; first argument > frame* (rbp holds current frame)
+			mov rdx, r15     ; second argument > thread* (r15 = JavaThread*)
+			lea r8, [rsp]    ; third argument > bool* cancel (holds the 0x0 that we pushed)
+			
+			mov rbp, rsp     ; align the stack
+			and rsp, 0xFFFFFFFFFFFFFFF0
+			sub rsp, 0x20    ; shadow space windows x64
+			
+			call [rip+data]  ; our cpp detour
+			
+			mov rsp, rbp     ; restore the stack
+			pop rax          ; rax = custom return value
+			cmp rax, 0x0     ; cancel == true ?
+			pop rbp
+			pop r11          ; restore registers
+			pop r10
+			pop r9
+			pop r8
+			pop rdx
+			pop rcx
+			pop rax
+			je 0x????????    ; if cancel -> returns the custom value
+			                 ; else do the normal code
+
+		*/
+
+		static std::uint8_t* allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect)
+		{
+			for (std::int64_t i{ 65536 }; i < 0x7FFFFFFF; i += 65536)
+			{
+				std::uint8_t* allocated = { (std::uint8_t*)VirtualAlloc(
+					nearby_addr + i, size, MEM_COMMIT | MEM_RESERVE, protect
+				) };
+				if (allocated)
+				{
+					return allocated;
+				}
+
+				allocated = (std::uint8_t*)VirtualAlloc(
+					nearby_addr - i, size, MEM_COMMIT | MEM_RESERVE, protect
+				);
+				if (allocated)
+				{
+					return allocated;
+				}
+			}
+
+			return nullptr;
+		}
+
+		using detour_t = void(*)(frame*, java_thread*, bool*);
+
+		class midi2i_hook final
+		{
+		public:
+			midi2i_hook(std::uint8_t* target, detour_t detour)
+				: target{ target }
+				, allocated{ nullptr }
+				, error{ true }
+			{
+				constexpr std::int32_t HOOK_SIZE = 8;
+				constexpr std::int32_t JMP_SIZE = 5;
+				constexpr std::int32_t JE_OFFSET = 0x3d;
+				constexpr std::int32_t JE_SIZE = 6;
+				constexpr std::int32_t DETOUR_ADDRESS_OFFSET = 0x56;
+
+				std::uint8_t assembly[] =
+				{
+					0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x55,
+					0x6A, 0x00,
+					0x48, 0x89, 0xE9,
+					0x4C, 0x89, 0xFA,
+					0x4C, 0x8D, 0x04, 0x24,
+					0x48, 0x89, 0xE5,
+					0x48, 0x83, 0xE4, 0xF0,
+					0x48, 0x83, 0xEC, 0x20,
+					0xFF, 0x15, 0x2D, 0x00, 0x00, 0x00,
+					0x48, 0x89, 0xEC,
+					0x58,
+					0x48, 0x83, 0xF8, 0x00,
+					0x5D,
+					0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,
+					0x5A, 0x59, 0x58,
+					0x0F, 0x84, 0x00, 0x00, 0x00, 0x00, // je - offset to patch
+					0x66, 0x48, 0x0F, 0x6E, 0xC0,
+					0x48, 0x8B, 0x5D, 0xF8,
+					0x48, 0x89, 0xEC,
+					0x5D, 0x5E,
+					0x48, 0x89, 0xDC,
+					0xFF, 0xE6,
+					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // detour address
+				};
+
+				this->allocated = allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
+				if (not this->allocated)
+				{
+					std::println("[ERROR] midi2i_hook: failed to allocate memory");
+					return;
+				}
+
+				// patch the je to return to the original code after the hook
+				const std::int32_t je_delta{ (std::int32_t)(target + HOOK_SIZE - (this->allocated + HOOK_SIZE + JE_OFFSET + JE_SIZE)) };
+				*(std::int32_t*)(assembly + JE_OFFSET + 2) = je_delta;
+
+				// write at the detour adress in the stub
+				*(detour_t*)(assembly + DETOUR_ADDRESS_OFFSET) = detour;
+
+				// copy the original bytes then the stub
+				std::memcpy(this->allocated, target, HOOK_SIZE);
+				std::memcpy(this->allocated + HOOK_SIZE, assembly, sizeof(assembly));
+
+				// make the stub only executable
+				DWORD old_protect{};
+				VirtualProtect(this->allocated, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READ, &old_protect);
+
+				// path the target with the jmp to the stub
+				VirtualProtect(target, JMP_SIZE, PAGE_EXECUTE_READWRITE, &old_protect);
+				target[0] = 0xE9;
+
+				const std::int32_t jmp_delta{ (std::int32_t)(this->allocated - (target + JMP_SIZE)) };
+				*(std::int32_t*)(target + 1) = jmp_delta;
+				VirtualProtect(target, JMP_SIZE, old_protect, &old_protect);
+
+				this->error = false;
+			}
+
+			~midi2i_hook()
+			{
+				if (this->error) return;
+
+				// restore original bytes
+				DWORD old_protect{};
+				if (this->target[0] == 0xE9 and VirtualProtect(this->target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
+				{
+					std::memcpy(this->target, this->allocated, 5);
+					VirtualProtect(this->target, 5, old_protect, &old_protect);
+				}
+
+				VirtualFree(this->allocated, 0, MEM_RELEASE);
+			}
+
+			bool has_error() const 
+			{ 
+				return this->error; 
+			}
+
+		private:
+			std::uint8_t* target;
+			std::uint8_t* allocated;
+			bool error;
+		};
+
+		struct hooked_method
+		{
+			method* m = nullptr;
+			detour_t detour = nullptr;
+		};
+
+		struct i2i_hook_data
+		{
+			void* i2i_entry = nullptr;
+			midi2i_hook* hook = nullptr;
+		};
+
+		std::vector<hooked_method> hooked_methods;
+		std::vector<i2i_hook_data> hooked_i2i_entries;
+
+		static void common_detour(frame* f, java_thread* thread, bool* cancel)
+		{
+			if (not thread) return;
+			if (not thread->get_env()) return;
+			if (thread->get_thread_state() not_eq _thread_in_Java) return;
+
+			method* current_method{ f->get_method() };
+
+			for (hooked_method& hk : hooked_methods)
+			{
+				if (hk.m == current_method)
+				{
+					hk.detour(f, thread, cancel);
+
+					thread->set_thread_state(_thread_in_Java);
+					return;
+				}
+			}
+		}
+
+		// flags to desactivate jit compilation on hooked method
+		static constexpr std::int32_t NO_COMPILE =
+			0x02000000 bitor // JVM_ACC_NOT_C2_COMPILABLE
+			0x04000000 bitor // JVM_ACC_NOT_C1_COMPILABLE
+			0x08000000 bitor // JVM_ACC_NOT_C2_OSR_COMPILABLE
+			0x01000000;  // JVM_ACC_QUEUED
+
+		static void set_dont_inline(method* m, bool enabled)
+		{
+			std::uint16_t* flags = m->get_flags();
+			if (not flags)
+			{
+				return;
+			}
+
+			if (enabled)
+			{
+				*flags |= (1 << 2); // _dont_inline
+			}
+			else
+			{
+				*flags &= ~(1 << 2);
+			}
+		}
+	}
+
+	bool hook(jmethodID method_id, hotspot::detour_t detour)
+	{
+		if (not method_id or not detour)
+		{
+			return false;
+		}
+
+		hotspot::method* m{ *(hotspot::method**)method_id };
+
+		for (hotspot::hooked_method& hk : hotspot::hooked_methods)
+		{
+			if (hk.m == m) return true;
+		}
+
+		hotspot::set_dont_inline(m, true);
+
+		std::uint32_t* flags{ m->get_access_flags() };
+		*flags |= hotspot::NO_COMPILE;
+
+		jclass owner{};
+		jni::jvmti->GetMethodDeclaringClass(method_id, &owner);
+		jni::jvmti->RetransformClasses(1, &owner);
+		jni::get_env()->DeleteLocalRef(owner);
+
+		m = *(hotspot::method**)method_id;
+
+		hotspot::set_dont_inline(m, true);
+
+		flags = m->get_access_flags();
+		*flags |= hotspot::NO_COMPILE;
+
+		hotspot::hooked_methods.push_back({ m, detour });
+
+		void* i2i = m->get_i2i_entry();
+		bool hook_new_i2i = true;
+
+		for (hotspot::i2i_hook_data& hk : hotspot::hooked_i2i_entries)
+		{
+			if (hk.i2i_entry == i2i)
+			{
+				hook_new_i2i = false;
+				break;
+			}
+		}
+
+		if (not hook_new_i2i)
+		{
+			return true;
+		}
+
+		std::uint8_t* target{ (std::uint8_t*)hotspot::find_hook_location(i2i) };
+		if (not target)
+		{
+			std::println("[ERROR] hook: failed to find hook location");
+			return false;
+		}
+
+		hotspot::midi2i_hook* hook_instance{ new hotspot::midi2i_hook(target, hotspot::common_detour) };
+		if (hook_instance->has_error())
+		{
+			delete hook_instance;
+			return false;
+		}
+
+		hotspot::hooked_i2i_entries.push_back({ i2i, hook_instance });
+		return true;
+	}
+
+	template<typename T>
+	void set_return_value(bool* cancel, T value)
+	{
+		*(T*)((void**)cancel + 8) = value;
+	}
+
+	void shutdown_hooks()
+	{
+		for (hotspot::i2i_hook_data& hk : hotspot::hooked_i2i_entries)
+		{
+			delete hk.hook;
+		}
+
+		for (hotspot::hooked_method& hm : hotspot::hooked_methods)
+		{
+			hotspot::set_dont_inline(hm.m, false);
+			std::uint32_t* flags{ hm.m->get_access_flags() };
+			*flags &= ~hotspot::NO_COMPILE;
+		}
+
+		hotspot::hooked_methods.clear();
+		hotspot::hooked_i2i_entries.clear();
 	}
 }

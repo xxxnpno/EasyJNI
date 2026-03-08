@@ -72,6 +72,12 @@ public:
     {
 
     }
+
+    auto send_chat_message(const std::string& value)
+        -> void
+    {
+        get_method<void, std::string>("sendChatMessage")->call(value);
+    }
 };
 
 class world_client : public jni::object
@@ -197,6 +203,92 @@ static DWORD WINAPI thread_entry(const HMODULE module)
     /*
 
     */
+
+    FreeConsole();
+    FreeLibraryAndExitThread(module, 0ul);
+
+    return 0l;
+}
+
+namespace jni
+{
+    class entity_player_sp : public jni::object
+    {
+    public:
+        entity_player_sp(jobject instance)
+            : jni::object{ instance }
+        {
+
+        }
+
+        auto send_chat_message(const std::string& value)
+            -> void
+        {
+            get_method<void, std::string>("sendChatMessage")->call(value);
+        }
+    };
+
+    class minecraft : public jni::object
+    {
+    public:
+        minecraft(jobject instance)
+            : jni::object{ instance }
+        {
+
+        }
+
+        auto get_minecraft()
+            -> std::unique_ptr<minecraft>
+        {
+            return get_field<minecraft>("theMinecraft", jni::field_type::STATIC)->get();
+        }
+
+        auto get_the_player()
+            -> std::unique_ptr<entity_player_sp>
+        {
+            return get_field<entity_player_sp>("thePlayer")->get();
+        }
+    };
+}
+
+static DWORD WINAPI thread_entry_test(const HMODULE module)
+{
+    FILE* outputBuffer{ nullptr };
+
+    AllocConsole();
+    freopen_s(&outputBuffer, "CONOUT$", "w", stdout);
+
+    if (jni::init())
+    {
+        {
+            jni::register_class<jni::minecraft>("net/minecraft/client/Minecraft");
+            jni::register_class<jni::entity_player_sp>("net/minecraft/client/entity/EntityPlayerSP");
+
+            const std::unique_ptr<jni::minecraft> the_minecraft{ std::make_unique<jni::minecraft>(nullptr)->get_minecraft() };
+
+            const jclass clazz{ jni::get_class("net/minecraft/client/entity/EntityPlayerSP") };
+            const jmethodID method_id{ jni::get_env()->GetMethodID(clazz, "sendChatMessage", "(Ljava/lang/String;)V") };
+
+            auto sendChatMessage_hook = [](jni::hotspot::frame* f, jni::hotspot::java_thread* thread, bool* cancel)
+                {
+                    
+                };
+
+            jni::hook(method_id, sendChatMessage_hook);
+
+            while (true)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds{ 250 });
+
+                if (GetAsyncKeyState(VK_END) bitand 0x8000)
+                {
+                    break;
+                }
+            }
+        }
+
+        jni::shutdown();
+    }
 
     FreeConsole();
     FreeLibraryAndExitThread(module, 0ul);
