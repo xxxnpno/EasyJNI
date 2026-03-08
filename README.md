@@ -167,6 +167,6 @@ if (the_player->get_instance() && the_world->get_instance())
 
 ## Full Example
 
-A complete working example using the Minecraft 1.8.9 deobfuscated source — covering static fields, instance fields, method calls, collections, and constructors:
+A complete working example using the Minecraft 1.8.9 deobfuscated source, covering static fields, instance fields, method calls, collections, and constructors:
 
 → [main.cpp](./EasyJNI/src/main.cpp)
