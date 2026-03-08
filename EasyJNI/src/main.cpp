@@ -2,6 +2,26 @@
 
 #include <easy_jni/easy_jni.hpp>
 
+class i_chat_component : public jni::object
+{
+public:
+    i_chat_component(jobject instance)
+        : jni::object{ instance }
+    {
+
+    }
+};
+
+class chat_component_text : public i_chat_component
+{
+public:
+    chat_component_text(jobject instance)
+        : i_chat_component{ instance }
+    {
+
+    }
+};
+
 class entity_player : public jni::object
 {
 public:
@@ -16,6 +36,12 @@ public:
     {
         return get_method<std::string>("getName")->call();
     }
+
+    auto add_chat_message(const std::unique_ptr<i_chat_component> value)
+        -> void
+    {
+        get_method<void, i_chat_component>("addChatMessage")->call(value);
+    }
 };
 
 class entity_player_sp : public entity_player
@@ -25,18 +51,6 @@ public:
         : entity_player{ instance }
     {
 
-    }
-
-    auto is_sprinting() 
-        -> bool
-    {
-        return get_method<bool>("isSprinting")->call();
-    }
-
-    auto set_sprinting(const bool value) 
-        -> void
-    {
-        get_method<void, bool>("setSprinting")->call(value);
     }
 
     auto send_chat_message(const std::string& value) 
@@ -111,6 +125,9 @@ static DWORD WINAPI thread_entry(const HMODULE module)
 
             jni::register_class<world_client>("net/minecraft/client/multiplayer/WorldClient");
 
+            jni::register_class<i_chat_component>("net/minecraft/util/IChatComponent");
+            jni::register_class<chat_component_text>("net/minecraft/util/ChatComponentText");
+
 			const std::unique_ptr<minecraft> the_minecraft{ std::make_unique<minecraft>(nullptr)->get_minecraft() };
 
             while (true)
@@ -120,6 +137,8 @@ static DWORD WINAPI thread_entry(const HMODULE module)
 
                 if (the_player->get_instance() and the_world->get_instance())
                 {
+                    the_player->add_chat_message(jni::make_unique<chat_component_text, std::string>("Hello World"));
+
                     for (const std::unique_ptr<entity_player>& player : the_world->get_player_entities())
                     {
                         std::println("name {}", player->get_name());

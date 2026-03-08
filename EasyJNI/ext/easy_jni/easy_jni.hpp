@@ -1224,7 +1224,7 @@ namespace jni
 					throw std::runtime_error{ std::format("Instance is null for {}.", field_name) };
 				}
 
-				this->register_field_id<type>(clazz, field_name, field_type);
+				this->register_field_id<type>(clazz, field_name, field_type, std::type_index{ typeid(*this) });
 
 				return std::make_unique<field<type>>(
 					field_type == field_type::NOT_STATIC ? static_cast<void*>(this->instance) : static_cast<void*>(clazz),
@@ -1264,7 +1264,7 @@ namespace jni
 					throw std::runtime_error{ std::format("Instance is null for {}.", method_name) };
 				}
 
-				this->register_method_id<return_type, args_t...>(clazz, method_name, method_type);
+				this->register_method_id<return_type, args_t...>(clazz, method_name, method_type, std::type_index{ typeid(*this) });
 
 				return std::make_unique<method<return_type>>(
 					method_type == jni::method_type::NOT_STATIC ? static_cast<void*>(this->instance) : static_cast<void*>(clazz),
@@ -1292,13 +1292,13 @@ namespace jni
 		// obtain the fieldID of a field
 		template<typename type>
 			requires (is_std_type<type>::value or std::is_base_of_v<object, type>)
-		auto register_field_id(const jclass clazz, const std::string& field_name, const jni::field_type field_type) const
+		auto register_field_id(const jclass clazz, const std::string& field_name, const jni::field_type field_type, const std::type_index index) const
 			-> void
 		{
 			try
 			{
-				if (jni::field_ids[std::type_index{ typeid(*this) }].find(field_name) 
-					not_eq jni::field_ids[std::type_index{ typeid(*this) }].end())
+				if (jni::field_ids[std::type_index{ index }].find(field_name) 
+					not_eq jni::field_ids[std::type_index{ index }].end())
 				{
 					return;
 				}
@@ -1325,7 +1325,7 @@ namespace jni
 					throw std::runtime_error{ std::format("Failed to get field id for {}.", field_name) };
 				}
 
-				jni::field_ids[std::type_index{ typeid(*this) }].insert(
+				jni::field_ids[std::type_index{ index }].insert(
 					{ field_name, field_id }
 				);
 			}
@@ -1342,13 +1342,13 @@ namespace jni
 				and
 				((is_std_type<std::remove_cvref_t<args_t>>::value or std::is_base_of_v<object, std::remove_cvref_t<args_t>>) and ...)
 			)
-			auto register_method_id(const jclass clazz, const std::string& method_name, const jni::method_type method_type) const
+			auto register_method_id(const jclass clazz, const std::string& method_name, const jni::method_type method_type, const std::type_index index = typeid(*this)) const
 			-> void
 		{
 			try
 			{
-				if (jni::method_ids[std::type_index{ typeid(*this) }].find(method_name) 
-					not_eq jni::method_ids[std::type_index{ typeid(*this) }].end())
+				if (jni::method_ids[std::type_index{ index }].find(method_name) 
+					not_eq jni::method_ids[std::type_index{ index }].end())
 				{
 					return;
 				}
@@ -1378,7 +1378,7 @@ namespace jni
 					throw std::runtime_error{ std::format("Failed to get method id for {}.", method_name) };
 				}
 
-				jni::method_ids[std::type_index{ typeid(*this) }].insert(
+				jni::method_ids[std::type_index{ index }].insert(
 					{ method_name, method_id }
 				);
 			}
@@ -1387,6 +1387,18 @@ namespace jni
 				std::println("[ERROR] {}", e.what());
 			}
 		}
+
+		template<typename type, typename... args_t>
+			requires (
+				std::is_base_of_v<object, type> and
+				((
+					is_std_type<std::remove_cvref_t<args_t>>::value
+					or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
+					or is_object_ptr<std::remove_cvref_t<args_t>>::value
+				) and ...)
+			)
+		friend auto make_unique(args_t&&... args)
+			-> std::unique_ptr<type>;
 	};
 
 	class collection : public jni::object
@@ -1436,6 +1448,85 @@ namespace jni
 
 		}
 	};
+
+	template<typename type, typename... args_t>
+		requires (
+			std::is_base_of_v<object, type> and
+			((
+				is_std_type<std::remove_cvref_t<args_t>>::value
+				or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
+				or is_object_ptr<std::remove_cvref_t<args_t>>::value
+			) and ...)
+		)
+	auto make_unique(args_t&&... args)
+		-> std::unique_ptr<type>
+	{
+		try
+		{
+			const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(type) })) };
+
+			if (not clazz)
+			{
+				throw std::runtime_error{ std::format("Class not found for constructor.") };
+			}
+
+			jni::object temp{ nullptr };
+			temp.register_method_id<void, args_t...>(clazz, "<init>", jni::method_type::NOT_STATIC, std::type_index{ typeid(type) });
+
+			const jmethodID constructor_id{ jni::method_ids.at(typeid(type)).at("<init>") };
+
+			std::vector<jni::string> string_keeper{};
+			string_keeper.reserve(sizeof...(args_t));
+
+			auto convert_arg = [&string_keeper](auto&& arg) -> jvalue
+			{
+				using raw = std::remove_cvref_t<decltype(arg)>;
+
+				std::any jni_val{};
+				if constexpr (std::is_base_of_v<object, raw>)
+				{
+					jni_val = arg.get_instance();
+				}
+				else if constexpr (is_object_ptr<raw>::value)
+				{
+					jni_val = arg->get_instance();
+				}
+				else if constexpr (std::is_same_v<raw, std::string>)
+				{
+					string_keeper.emplace_back(arg);
+					jni_val = string_keeper.back().get_jni_string();
+				}
+				else
+				{
+					jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
+				}
+
+				return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
+			};
+
+			const jvalue* jargs_ptr{ nullptr };
+			std::vector<jvalue> jargs{};
+
+			if constexpr (sizeof...(args_t) > 0)
+			{
+				jargs = { convert_arg(std::forward<args_t>(args))... };
+				jargs_ptr = jargs.data();
+			}
+
+			const jobject local{ jni::get_env()->NewObjectA(clazz, constructor_id, jargs_ptr) };
+
+			std::unique_ptr<type> result{ std::make_unique<type>(local) };
+			jni::get_env()->DeleteLocalRef(local);
+
+			return result;
+		}
+		catch (const std::runtime_error& e)
+		{
+			std::println("[ERROR] {}", e.what());
+
+			return std::make_unique<type>(nullptr);
+		}
+	}
 
 	// initialize EasyJI, take the maximum amount of envs to store before clearing the map as an argument
 	auto init(const std::uint8_t maxEnvs = 10) 
