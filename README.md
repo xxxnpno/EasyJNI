@@ -4,13 +4,13 @@ A C++23 header-only library that wraps the JNI API to make interacting with a ru
 
 ## Features
 
-- **No env management** threads are attached to the JVM automatically
-- **No Java signatures** types are inferred from your C++ template parameters
-- **Simple field access** get and set fields with a single call
-- **Simple method calls** call Java methods as if they were C++ methods
-- **C++ polymorphism** inheritance works the way you'd expect
-- **Java data structure support** built-in wrappers for `Collection` and `List`
-- **Constructor support** create Java objects with `jni::make_unique`
+- **No env management**, threads are attached to the JVM automatically
+- **No Java signatures**, types are inferred from your C++ template parameters
+- **Simple field access**, get and set fields with a single call
+- **Simple method calls**, call Java methods as if they were C++ methods
+- **C++ polymorphism**, inheritance works the way you'd expect
+- **Java data structure support**, built-in wrappers for `Collection` and `List`
+- **Constructor support**, create Java objects with `jni::make_unique`
 
 > Requires **C++23**. Currently expanding Java data structure.
 
