@@ -12,7 +12,7 @@ A C++23 header-only library that wraps the JNI API to make interacting with a ru
 - **Java data structure support** — built-in wrappers for `Collection` and `List`
 - **Constructor support** — create Java objects with `jni::make_unique`
 
-> Requires **C++23**. Currently expanding Java data structure and constructor support.
+> Requires **C++23**. Currently expanding Java data structure.
 
 ---
 
