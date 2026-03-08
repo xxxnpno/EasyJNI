@@ -100,7 +100,7 @@ auto get_the_player() -> std::unique_ptr<entity_player_sp>
     return get_field<entity_player_sp>("thePlayer")->get();
 }
 
-// Static field,  pass jni::field_type::STATIC
+// Static field, pass jni::field_type::STATIC
 auto get_minecraft() -> std::unique_ptr<minecraft>
 {
     return get_field<minecraft>("theMinecraft", jni::field_type::STATIC)->get();
