@@ -1,16 +1,16 @@
 # EasyJNI
 
-A C++23 header-only library that wraps the JNI API to make interacting with a running JVM clean and simple — no manual env management, no Java signatures, no boilerplate.
+A C++23 header-only library that wraps the JNI API to make interacting with a running JVM clean and simple, no manual env management, no Java signatures, no boilerplate.
 
 ## Features
 
-- **No env management** — threads are attached to the JVM automatically
-- **No Java signatures** — types are inferred from your C++ template parameters
-- **Simple field access** — get and set fields with a single call
-- **Simple method calls** — call Java methods as if they were C++ methods
-- **C++ polymorphism** — inheritance works the way you'd expect
-- **Java data structure support** — built-in wrappers for `Collection` and `List`
-- **Constructor support** — create Java objects with `jni::make_unique`
+- **No env management** threads are attached to the JVM automatically
+- **No Java signatures** types are inferred from your C++ template parameters
+- **Simple field access** get and set fields with a single call
+- **Simple method calls** call Java methods as if they were C++ methods
+- **C++ polymorphism** inheritance works the way you'd expect
+- **Java data structure support** built-in wrappers for `Collection` and `List`
+- **Constructor support** create Java objects with `jni::make_unique`
 
 > Requires **C++23**. Currently expanding Java data structure.
 
@@ -76,7 +76,7 @@ public:
 };
 ```
 
-**Inheritance** works naturally — just inherit from your wrapper class instead of `jni::object`:
+**Inheritance** works naturally, just inherit from your wrapper class instead of `jni::object`:
 
 ```cpp
 class entity_player_sp : public entity_player
@@ -147,15 +147,14 @@ auto get_player_entities() -> std::vector<std::unique_ptr<entity_player>>
 Use `jni::make_unique` (not `std::make_unique`) to construct Java objects from C++:
 
 ```cpp
-auto component = jni::make_unique<chat_component_text, std::string>("Hello World");
-player->add_chat_message(std::move(component));
+player->add_chat_message(jni::make_unique<chat_component_text, std::string>("Hello World"));
 ```
 
 ---
 
 ## Checking for Null
 
-`std::unique_ptr` wrappers are **never null** themselves — but the underlying Java instance might be. Always check `get_instance()`:
+`std::unique_ptr` wrappers are **never null** themselves, but the underlying Java instance might be. Always check `get_instance()`:
 
 ```cpp
 if (the_player->get_instance() && the_world->get_instance())
