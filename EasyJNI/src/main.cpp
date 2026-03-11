@@ -97,11 +97,11 @@ static DWORD WINAPI thread_entry_test(const HMODULE module)
         };
 
         auto addChatMessage_hook = [](jni::hotspot::frame* frame, jni::hotspot::java_thread* thread, bool* cancel)
-            {
-                auto [self, chat_component] = frame->get_arguments<jni::entity_player_sp, jni::i_chat_component>();
+        {
+            auto [self, chat_component] = frame->get_arguments<jni::entity_player_sp, jni::i_chat_component>();
 
-                std::println("[HOOK] addChatMessage called, message: {}", chat_component->get_unformatted_text());
-            };
+            std::println("[HOOK] addChatMessage called, message: {}", chat_component->get_unformatted_text());
+        };
 
         jni::hook<jni::entity_player_sp>("sendChatMessage", sendChatMessage_hook);
         jni::hook<jni::entity_player_sp>("addChatMessage", addChatMessage_hook);
