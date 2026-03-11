@@ -13,7 +13,8 @@ namespace jni
 
         }
 
-        auto get_unformatted_text() -> std::string
+        auto get_unformatted_text() 
+            -> std::string
         {
             return get_method<std::string>("getUnformattedText")->call();
         }
@@ -38,7 +39,8 @@ namespace jni
 
         }
 
-        auto send_chat_message(const std::string& value) -> void
+        auto send_chat_message(const std::string& value) 
+            -> void
         {
             get_method<void, std::string>("sendChatMessage")->call(value);
         }
