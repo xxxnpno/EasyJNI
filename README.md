@@ -149,7 +149,7 @@ get_method<std::unique_ptr<minecraft>>("getInstance", jni::method_type::STATIC)-
 
 Use `jni::hook` to intercept calls to any Java method. The hook receives the current stack frame, the calling Java thread, and a cancellation flag.
 
-Use `frame->get_arguments<...>()` to unpack the method's arguments as C++ types — the first type is always `self` (the instance the method was called on).
+Use `frame->get_arguments<...>()` to unpack the method's arguments as C++ types, the first type is always `self` (the instance the method was called on).
 
 ```cpp
 auto sendChatMessage_hook = [](jni::hotspot::frame* frame, jni::hotspot::java_thread* thread, bool* cancel)
@@ -218,7 +218,6 @@ if (the_player->get_instance() && the_world->get_instance())
 
 ## Full Example
 
-A complete working example using the Minecraft 1.8.9 deobfuscated source, covering static fields, instance fields, method calls, collections, constructors, and method hooks:
+A complete working example using the Minecraft 1.8.9 deobfuscated source, covering method hooks:
 
 → [main.cpp](./EasyJNI/src/main.cpp)
-```
