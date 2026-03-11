@@ -1,5 +1,3 @@
-Voici le README mis à jour avec la section **Method Hooking** ajoutée :
-
 # EasyJNI
 
 A C++23 header-only library that wraps the JNI API to make interacting with a running JVM clean and simple, no manual env management, no Java signatures, no boilerplate.
@@ -14,8 +12,6 @@ A C++23 header-only library that wraps the JNI API to make interacting with a ru
 - **Java data structure support**, built-in wrappers for `Collection` and `List`
 - **Constructor support**, create Java objects with `jni::make_unique`
 - **Method hooking**, intercept Java method calls with C++ lambdas
-
-> Requires **C++23**.
 
 ---
 
