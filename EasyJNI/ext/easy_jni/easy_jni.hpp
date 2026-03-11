@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <tuple>
 #include <algorithm>
 #include <type_traits>
 #include <typeinfo>
@@ -1699,7 +1700,8 @@ namespace jni
 		extern "C" JNIIMPORT VMStructEntry_ptr_t gHotSpotVMStructs;
 
 		// find offsets based on the jvm
-		static VMStructEntry_ptr_t find_VMStructEntry(const char* typeName, const char* fieldName)
+		static auto find_VMStructEntry(const char* typeName, const char* fieldName)
+			-> VMStructEntry_ptr_t
 		{
 			for (VMStructEntry_ptr_t entry{ gHotSpotVMStructs }; entry->typeName; ++entry)
 			{
@@ -1714,7 +1716,8 @@ namespace jni
 		class symbol final
 		{
 		public:
-			std::string to_string()
+			auto to_string()
+				-> std::string
 			{
 				static VMStructEntry_ptr_t length_entry{ find_VMStructEntry("Symbol", "_length") };
 				static VMStructEntry_ptr_t body_entry{ find_VMStructEntry("Symbol", "_body") };
@@ -1730,7 +1733,8 @@ namespace jni
 		class constant_pool final
 		{
 		public:
-			void** get_base()
+			auto get_base()
+				-> void**
 			{
 				static VMTypeEntry_ptr_t entry = []() -> VMTypeEntry_ptr_t 
 				{
@@ -1757,7 +1761,8 @@ namespace jni
 		class const_method final
 		{
 		public:
-			constant_pool* get_constants()
+			auto get_constants()
+				-> constant_pool*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_constants") };
 				if (not entry) return nullptr;
@@ -1765,7 +1770,8 @@ namespace jni
 				return *(constant_pool**)((std::uint8_t*)this + entry->offset);
 			}
 
-			symbol* get_name()
+			auto get_name()
+				-> symbol*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_name_index") };
 				if (not entry) return nullptr;
@@ -1774,7 +1780,8 @@ namespace jni
 				return (symbol*)get_constants()->get_base()[index];
 			}
 
-			symbol* get_signature()
+			auto get_signature()
+				-> symbol*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_signature_index") };
 				if (not entry) return nullptr;
@@ -1787,7 +1794,8 @@ namespace jni
 		class method final
 		{
 		public:
-			void* get_i2i_entry()
+			auto get_i2i_entry()
+				-> void*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_i2i_entry") };
 				if (not entry) return nullptr;
@@ -1795,7 +1803,8 @@ namespace jni
 				return *(void**)((std::uint8_t*)this + entry->offset);
 			}
 
-			void* get_from_interpreted_entry()
+			auto get_from_interpreted_entry()
+				-> void*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_from_interpreted_entry") };
 				if (not entry) return nullptr;
@@ -1803,7 +1812,8 @@ namespace jni
 				return *(void**)((std::uint8_t*)this + entry->offset);
 			}
 
-			std::uint32_t* get_access_flags()
+			auto get_access_flags()
+				-> std::uint32_t*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_access_flags") };
 				if (not entry) return nullptr;
@@ -1811,7 +1821,8 @@ namespace jni
 				return (uint32_t*)((std::uint8_t*)this + entry->offset);
 			}
 
-			std::uint16_t* get_flags()
+			auto get_flags()
+				-> std::uint16_t*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_flags") };
 				if (not entry) return nullptr;
@@ -1819,7 +1830,8 @@ namespace jni
 				return (std::uint16_t*)((std::uint8_t*)this + entry->offset);
 			}
 
-			const_method* get_const_method()
+			auto get_const_method()
+				-> const_method*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_constMethod") };
 				if (not entry) return nullptr;
@@ -1827,7 +1839,8 @@ namespace jni
 				return *(const_method**)((std::uint8_t*)this + entry->offset);
 			}
 
-			std::string get_name()
+			auto get_name()
+				-> std::string
 			{
 				const_method* const_method{ get_const_method() };
 				if (not const_method) return "";
@@ -1838,7 +1851,8 @@ namespace jni
 				return symbol->to_string();
 			}
 
-			std::string get_signature()
+			auto get_signature()
+				-> std::string
 			{
 				const_method* const_method{ get_const_method() };
 				if (not const_method) return "";
@@ -1869,7 +1883,8 @@ namespace jni
 		class java_thread final
 		{
 		public:
-			JNIEnv* get_env()
+			auto get_env()
+				-> JNIEnv*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_anchor") };
 				if (not entry) return nullptr;
@@ -1878,7 +1893,8 @@ namespace jni
 				return (JNIEnv*)((std::uint8_t*)this + entry->offset + 32);
 			}
 
-			java_thread_state get_thread_state()
+			auto get_thread_state()
+				-> java_thread_state
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
 				if (not entry) return _thread_uninitialized;
@@ -1886,7 +1902,8 @@ namespace jni
 				return *(java_thread_state*)((std::uint8_t*)this + entry->offset);
 			}
 
-			void set_thread_state(const java_thread_state state)
+			auto set_thread_state(const java_thread_state state)
+				-> void
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
 				if (not entry) return;
@@ -1894,7 +1911,8 @@ namespace jni
 				*(java_thread_state*)((std::uint8_t*)this + entry->offset) = state;
 			}
 
-			std::uint32_t get_suspend_flags()
+			auto get_suspend_flags()
+				-> std::uint32_t
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_suspend_flags") };
 				if (not entry) return 0;
@@ -1904,7 +1922,8 @@ namespace jni
 		};
 
 		// 0x00 is the wildcard
-		static bool match_pattern(const std::uint8_t* addr, const std::uint8_t* pattern, const std::size_t size)
+		static auto match_pattern(const std::uint8_t* addr, const std::uint8_t* pattern, const std::size_t size)
+			-> bool
 		{
 			for (std::size_t i{ 0 }; i < size; ++i)
 			{
@@ -1921,7 +1940,8 @@ namespace jni
 			return true;
 		}
 
-		static std::uint8_t* scan(const std::uint8_t* start, const std::size_t range, const std::uint8_t* pattern, const std::size_t size)
+		static auto scan(const std::uint8_t* start, const std::size_t range, const std::uint8_t* pattern, const std::size_t size)
+			-> std::uint8_t*
 		{
 			for (std::size_t i{ 0 }; i < range; ++i)
 			{
@@ -1933,10 +1953,11 @@ namespace jni
 			return nullptr;
 		}
 
-		// default value for java 8
-		inline static std::int8_t locals_offset = -48;
+		// default value for latest java
+		inline static std::int8_t locals_offset{ -56 };
 
-		static void* find_hook_location(void* i2i_entry)
+		static auto find_hook_location(void* i2i_entry)
+			-> void*
 		{
 			// 0x00 = wildcard
 			const std::uint8_t pattern[] =
@@ -1982,17 +2003,93 @@ namespace jni
 			return hook_location + sizeof(pattern) - 8;
 		}
 
+		template<typename type>
+		using argument_return_t = std::conditional_t<std::is_base_of_v<jni::object, type>, std::unique_ptr<type>, type>;
+
 		class frame final
 		{
 		public:
-			method* get_method()
+			auto get_method() const
+				-> method*
 			{
 				return *(method**)((std::uint8_t*)this - 24);
 			}
 
-			void** get_locals()
+			auto get_locals() const
+				-> void**
 			{
 				return *(void***)((std::uint8_t*)this + locals_offset);
+			}
+
+			template<typename... types>
+			auto get_arguments() const 
+				-> std::tuple<argument_return_t<types>...>
+			{
+				std::int32_t index{ 0 };
+				return std::tuple<argument_return_t<types>...>
+				{
+					this->get_argument<types>(index++)...
+				};
+			}
+
+		private:
+			template<typename type>
+			auto get_argument(const std::int32_t index) const
+				-> std::conditional_t<std::is_base_of_v<jni::object, type>, std::unique_ptr<type>, type>
+			{
+				using return_type = std::conditional_t<std::is_base_of_v<jni::object, type>, std::unique_ptr<type>, type>;
+
+				void** locals{ this->get_locals() };
+				if (not locals)
+				{
+					return return_type{};
+				}
+
+				void* raw{ locals[-index] };
+
+				if constexpr (std::is_same_v<type, std::string>)
+				{
+					if (not raw)
+					{
+						return std::string{};
+					}
+
+					std::uint8_t* char_array{ (std::uint8_t*)raw + 0x18 };
+
+					std::int32_t length{};
+					std::memcpy(&length, char_array + 12, sizeof(std::int32_t));
+
+					if (length <= 0 or length > 512)
+					{
+						return std::string{};
+					}
+
+					std::string result(static_cast<std::size_t>(length), '\0');
+					std::memcpy(result.data(), char_array + 16, static_cast<std::size_t>(length));
+
+					return result;
+				}
+				else if constexpr (std::is_base_of_v<jni::object, type>)
+				{
+					if (not raw)
+					{
+						return return_type{};
+					}
+
+					jobject obj{ jni::get_env()->NewLocalRef(reinterpret_cast<jobject>(&raw)) };
+
+					return return_type{ std::make_unique<type>(obj) };
+				}
+				else if constexpr (sizeof(type) <= sizeof(void*))
+				{
+					type result{};
+					std::memcpy(&result, &raw, sizeof(type));
+					return result;
+				}
+				else
+				{
+					return return_type{};
+				}
 			}
 		};
 		
@@ -2034,7 +2131,8 @@ namespace jni
 
 		*/
 
-		static std::uint8_t* allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect)
+		static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect)
+			-> std::uint8_t*
 		{
 			for (std::int64_t i{ 65536 }; i < 0x7FFFFFFF; i += 65536)
 			{
@@ -2221,10 +2319,44 @@ namespace jni
 		}
 	}
 
-	bool hook(jmethodID method_id, hotspot::detour_t detour)
+	template <typename type>
+		requires (std::is_base_of_v<jni::object, type>)
+	auto hook(const std::string& method_name, hotspot::detour_t detour) 
+		-> bool
 	{
-		if (not method_id or not detour)
+		if (not detour) return false;
+
+		const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(type) })) };
+		if (not clazz)
 		{
+			std::println("[ERROR] hook: class not found");
+			return false;
+		}
+
+		jint method_count{};
+		jmethodID* methods{};
+		if (jni::jvmti->GetClassMethods(clazz, &method_count, &methods) not_eq JVMTI_ERROR_NONE)
+		{
+			std::println("[ERROR] hook: GetClassMethods failed");
+			return false;
+		}
+
+		jmethodID method_id{ nullptr };
+		for (jint i{ 0 }; i < method_count; ++i)
+		{
+			hotspot::method* m{ *(hotspot::method**)methods[i] };
+			if (m and m->get_name() == method_name)
+			{
+				method_id = methods[i];
+				break;
+			}
+		}
+
+		jni::jvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
+
+		if (not method_id)
+		{
+			std::println("[ERROR] hook: method '{}' not found", method_name);
 			return false;
 		}
 
@@ -2290,12 +2422,15 @@ namespace jni
 	}
 
 	template<typename T>
-	void set_return_value(bool* cancel, T value)
+	auto set_return_value(bool* cancel, T value)
+		-> void
 	{
 		*(T*)((void**)cancel + 8) = value;
+		*cancel = true;
 	}
 
-	void shutdown_hooks()
+	auto shutdown_hooks()
+		-> void
 	{
 		for (hotspot::i2i_hook_data& hk : hotspot::hooked_i2i_entries)
 		{
