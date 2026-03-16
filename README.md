@@ -113,12 +113,6 @@ auto get_max_retries() -> int
     return get_field<int>("maxRetries")->get();
 }
 
-// Static field (read)
-auto get_default_timeout() -> int
-{
-    return get_field<int>("DEFAULT_TIMEOUT", jni::field_type::STATIC)->get();
-}
-
 // Object field (read)
 auto get_inner_client() -> std::unique_ptr<http_client>
 {
@@ -136,6 +130,39 @@ auto set_config_path(const std::string& path) -> void
 {
     get_field<std::string>("configPath")->set(path);
 }
+```
+
+### Static fields
+
+There is no special C++ static method involved. Just add a regular method that passes `jni::field_type::STATIC`, and call it on a null instance when you need it from outside the class:
+
+```cpp
+class config_manager : public jni::object
+{
+public:
+    explicit config_manager(jobject instance)
+        : jni::object{ instance }
+    {
+    }
+
+    // Reading a static field: same as an instance field, just pass field_type::STATIC.
+    auto get_default_timeout() -> int
+    {
+        return get_field<int>("DEFAULT_TIMEOUT", jni::field_type::STATIC)->get();
+    }
+
+    // Writing a static field works the same way.
+    auto set_default_timeout(int value) -> void
+    {
+        get_field<int>("DEFAULT_TIMEOUT", jni::field_type::STATIC)->set(value);
+    }
+};
+```
+
+To call a static field accessor from outside the class, construct a temporary null instance:
+
+```cpp
+int timeout = config_manager{ nullptr }.get_default_timeout();
 ```
 
 ## Methods
@@ -160,13 +187,40 @@ auto execute_query(const std::unique_ptr<sql_query>& query) -> std::unique_ptr<r
 {
     return get_method<result_set, sql_query>("executeQuery")->call(query);
 }
+```
 
-// Static method
-static auto get_instance() -> std::unique_ptr<database_connection>
+### Static methods
+
+Same pattern as static fields: a regular method with `method_type::STATIC`, called on a null instance from outside the class.
+
+```cpp
+class session_manager : public jni::object
 {
-    database_connection temp{ nullptr };
-    return temp.get_method<database_connection>("getInstance", jni::method_type::STATIC)->call();
-}
+public:
+    explicit session_manager(jobject instance)
+        : jni::object{ instance }
+    {
+    }
+
+    // Reading a static field that returns the singleton instance.
+    auto get_instance() -> std::unique_ptr<session_manager>
+    {
+        return get_field<session_manager>("instance", jni::field_type::STATIC)->get();
+    }
+
+    // Calling a static method.
+    auto create_session(const std::string& user_id) -> std::unique_ptr<session_manager>
+    {
+        return get_method<session_manager, std::string>("createSession", jni::method_type::STATIC)->call(user_id);
+    }
+};
+```
+
+To use from outside the class:
+
+```cpp
+auto session = session_manager{ nullptr }.get_instance();
+auto new_session = session_manager{ nullptr }.create_session("user-42");
 ```
 
 ### Supported types
@@ -222,7 +276,7 @@ auto get_user_names() -> std::vector<std::string>
 `std::unique_ptr` wrappers are never null themselves, but the underlying Java object might be. Always check `get_instance()` before using a wrapped object:
 
 ```cpp
-auto connection = database_connection::get_instance();
+auto connection = database_connection{ nullptr }.get_instance();
 
 if (not connection->get_instance())
 {
