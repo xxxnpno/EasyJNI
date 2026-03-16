@@ -68,6 +68,10 @@ namespace jni
 			// if the map become to big it gets cleared
 			if (jni::envs.size() >= jni::max_stored_envs)
 			{
+				std::println("[WARN] manage_envs() env map full ({} entries), clearing. "
+					"Consider calling jni::exit_thread() on threads that exit, "
+					"or increase max_envs in jni::init().", jni::envs.size());
+
 				jni::envs.clear();
 			}
 
@@ -390,9 +394,18 @@ namespace jni
 	template <typename type>
 		requires (std::is_base_of_v<object, type>)
 	static auto register_class(const std::string& class_name)
-		-> void
+		-> bool
 	{
 		jni::class_map.insert_or_assign(std::type_index{ typeid(type) }, class_name);
+
+		if (not jni::get_class(class_name))
+		{
+			std::println("[ERROR] register_class() class not found in JVM: {}", class_name);
+			jni::class_map.erase(std::type_index{ typeid(type) });
+			return false;
+		}
+
+		return true;
 	}
 
 	// return the signature of a type primitive or not
