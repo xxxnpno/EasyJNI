@@ -1460,7 +1460,7 @@ namespace jni
 		template<typename type, typename... args_t>
 			requires (
 		std::is_base_of_v<object, type> and
-			((std::is_same_v<std::remove_cvref_t<args_t>, std::string>
+			((std::is_convertible_v<std::remove_cvref_t<args_t>, std::string>
 				or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
 				or is_object_ptr<std::remove_cvref_t<args_t>>::value) and ...)
 			)
@@ -1478,39 +1478,79 @@ namespace jni
 
 		}
 
-		// helper method for collections
 		template<typename type>
-			requires (std::is_base_of_v<object, type>)
+			requires (std::is_base_of_v<object, type> or std::is_same_v<type, std::string>)
 		auto to_vector() const
-			-> std::vector<std::unique_ptr<type>>
+			-> std::conditional_t<std::is_same_v<type, std::string>, std::vector<std::string>, std::vector<std::unique_ptr<type>>>
 		{
-			std::vector<std::unique_ptr<type>> result{};
+			using result_t = std::conditional_t<std::is_same_v<type, std::string>, std::vector<std::string>, std::vector<std::unique_ptr<type>>>;
 
-			const jobjectArray array{ this->get_method<jobjectArray>("toArray")->call() };
-
-			const jsize length{ jni::get_env()->GetArrayLength(array) };
-			result.reserve(static_cast<std::size_t>(length));
-
-			for (jsize i{ 0 }; i < length; ++i)
+			try
 			{
-				const jobject element{ jni::get_env()->GetObjectArrayElement(array, i) };
-				result.emplace_back(std::make_unique<type>(element));
-
-				if (element)
+				if (not this->instance)
 				{
-					jni::get_env()->DeleteLocalRef(element);
+					return result_t{};
 				}
+
+				const jobjectArray array{ this->get_method<jobjectArray>("toArray")->call() };
+
+				if (not array)
+				{
+					return result_t{};
+				}
+
+				const jsize length{ jni::get_env()->GetArrayLength(array) };
+
+				if (length <= 0)
+				{
+					jni::get_env()->DeleteLocalRef(array);
+					return result_t{};
+				}
+
+				result_t result{};
+				result.reserve(static_cast<std::size_t>(length));
+
+				for (jsize i{ 0 }; i < length; ++i)
+				{
+					const jobject element{ jni::get_env()->GetObjectArrayElement(array, i) };
+
+					if constexpr (std::is_same_v<type, std::string>)
+					{
+						if (element)
+						{
+							result.emplace_back(jni::string(static_cast<jstring>(element)).get_std_string());
+							jni::get_env()->DeleteLocalRef(element);
+						}
+						else
+						{
+							result.emplace_back(std::string{});
+						}
+					}
+					else
+					{
+						result.emplace_back(std::make_unique<type>(element));
+
+						if (element)
+						{
+							jni::get_env()->DeleteLocalRef(element);
+						}
+					}
+				}
+
+				jni::get_env()->DeleteLocalRef(array);
+
+				return result;
 			}
-
-			jni::get_env()->DeleteLocalRef(array);
-
-			return result;
+			catch (...)
+			{
+				return result_t{};
+			}
 		}
 	};
 
 	// wrapper for java List, inherite to_vector
 	// same as collection but no new methods for now
-	class list : public jni::collection
+	class list final : public jni::collection
 	{
 	public:
 		explicit list(const jobject instance = nullptr)
@@ -1520,12 +1560,35 @@ namespace jni
 		}
 	};
 
+	class uuid final : public jni::object
+	{
+	public:
+		explicit uuid(const jobject instance = nullptr)
+			: jni::object{ instance }
+		{
+
+		}
+
+		auto version() const
+			-> int
+		{
+			return get_method<int>("version")->call();
+		}
+	};
+
+	template<typename T>
+	struct unwrap_object_ptr { using type = T; };
+
+	template<typename T>
+		requires (std::is_base_of_v<object, T>)
+	struct unwrap_object_ptr<std::unique_ptr<T>> { using type = T; };
+
 	// friend function of jni::object 
 	// allows you to create jobject using java constructors
 	template<typename type, typename... args_t>
 		requires (
 	std::is_base_of_v<object, type> and
-		((std::is_same_v<std::remove_cvref_t<args_t>, std::string>
+		((std::is_convertible_v<std::remove_cvref_t<args_t>, std::string>
 			or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
 			or is_object_ptr<std::remove_cvref_t<args_t>>::value) and ...)
 		)
@@ -1542,7 +1605,9 @@ namespace jni
 			}
 
 			jni::object temp{ nullptr };
-			temp.register_method_id<void, args_t...>(clazz, "<init>", jni::method_type::NOT_STATIC, std::type_index{ typeid(type) });
+			temp.register_method_id<void, typename unwrap_object_ptr<std::remove_cvref_t<args_t>>::type...>(
+				clazz, "<init>", jni::method_type::NOT_STATIC, std::type_index{ typeid(type) }
+			);
 
 			const jmethodID constructor_id{ jni::method_ids.at(typeid(type)).at("<init>") };
 
@@ -1629,8 +1694,9 @@ namespace jni
 			}
 
 			// already register some java datastructures that have helper methods
-			jni::register_class<jni::collection>("java/lang/Collection");
+			jni::register_class<jni::collection>("java/util/Collection");
 			jni::register_class<jni::list>("java/util/List");
+			jni::register_class<jni::uuid>("java/util/UUID");
 
 			return true;
 		}
