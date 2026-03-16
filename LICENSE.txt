@@ -1,21 +1,65 @@
-MIT License
+PolyForm Noncommercial License 1.0.0
 
-Copyright (c) [year] [fullname]
+Copyright (c) 2026 Arno LE GRIN
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Licensed under the PolyForm Noncommercial License 1.0.0.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Acceptance
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+In order to get any license under these terms, you must agree to them as both strict obligations and conditions to all your licenses.
+
+Copyright License
+
+The licensor grants you a copyright license for the software to do everything you might do with the software that would otherwise infringe the licensor's copyright in it for any permitted purpose.
+
+However, you may only distribute the software according to the Distribution License and make changes or new works based on the software according to the Changes and New Works License.
+
+Distribution License
+
+The licensor grants you an additional copyright license to distribute copies of the software.
+
+Your license to distribute covers distributing the software with changes and new works permitted by the Changes and New Works License.
+
+Notices
+
+You must ensure that anyone who gets a copy of any part of the software from you also gets a copy of these terms or the URL for them.
+
+Required Notice: Copyright (c) 2026 Arno LE GRIN
+
+Changes and New Works License
+
+The licensor grants you an additional copyright license to make changes and new works based on the software for any permitted purpose.
+
+Patent License
+
+The licensor grants you a patent license for the software that covers patent claims the licensor can license that you would infringe by using the software.
+
+Noncommercial Purposes
+
+Any noncommercial purpose is a permitted purpose.
+
+Personal Uses
+
+Personal use for research, experiment, testing, personal study, hobby projects, or private entertainment without commercial intent is permitted.
+
+Noncommercial Organizations
+
+Use by charities, educational institutions, public research organizations, and government institutions is considered noncommercial use.
+
+Fair Use
+
+You may still have fair use rights under the law.
+
+Violations
+
+If you violate the license and are notified, you have 32 days to fix the violation. Otherwise your license ends.
+
+No Liability
+
+The software is provided “as is” without warranty of any kind. The author is not liable for damages arising from the use of the software.
+
+Definitions
+
+Licensor: the person or entity offering the software.
+Software: the code released under this license.
+You: the individual or entity using the software.
