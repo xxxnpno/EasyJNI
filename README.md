@@ -235,6 +235,7 @@ auto new_session = session_manager{ nullptr }.create_session("user-42");
 | `double`          | `double`  |
 | `bool`            | `boolean` |
 | `char`            | `char`    |
+| `std::byte`       | `jbyte`    |
 | `std::string`     | `String`  |
 | `T : jni::object` | any class |
 
