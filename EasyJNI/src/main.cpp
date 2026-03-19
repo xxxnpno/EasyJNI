@@ -193,23 +193,6 @@ namespace jni
         {
             return get_field<world_client>("theWorld")->get();
         }
-
-        // Returns the current game version string ("1.8.9", etc.).
-        // Demonstrates calling a static method with a String return type.
-        auto get_version() 
-            -> std::string
-        {
-            return get_method<std::string>("getVersion", jni::method_type::STATIC)->call();
-        }
-
-        // Returns the number of ticks since the game started.
-        // "ticksRan" is a static int field.
-        // Demonstrates reading a static primitive field.
-        auto get_ticks_ran() 
-            -> int
-        {
-            return get_field<int>("ticksRan", jni::field_type::STATIC)->get();
-        }
     };
 }
 
@@ -254,14 +237,13 @@ static auto register_hooks()
     // Hook EntityPlayer.getHealth()
     // Demonstrates cancelling a method and returning a custom value.
     // The game will always see 20.0f as the player's health while this hook is active.
-    static auto get_health_hook = [](jni::hotspot::frame* frame, jni::hotspot::java_thread*, bool* cancel)
+    static auto set_health_hook = [](jni::hotspot::frame* frame, jni::hotspot::java_thread*, bool* cancel)
     {
-        auto [self] = frame->get_arguments<jni::entity_player_sp>();
-        std::println("[HOOK] getHealth() called, forcing return value to 20.0f");
-        jni::set_return_value(cancel, 20.0f);
+        std::println("[HOOK] setHealth() called, forcing return value to 20.0f");
+        jni::set_return_value<float>(cancel, 20.0f);
     };
 
-    jni::hook<jni::entity_player_sp>("getHealth", get_health_hook);
+    jni::hook<jni::entity_player_sp>("setHealth", set_health_hook);
 }
 
 static DWORD WINAPI thread_entry(HMODULE module)
@@ -286,11 +268,15 @@ static DWORD WINAPI thread_entry(HMODULE module)
     // Get the Minecraft singleton via its static field.
     const std::unique_ptr<jni::minecraft>& the_minecraft{ std::make_unique<jni::minecraft>(nullptr)->get_the_minecraft() };
 
-    std::println("[INFO] Minecraft version: {}", the_minecraft->get_version());
-
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds{ 2000 });
+
+        // Exit when DELETE is held
+        if (GetAsyncKeyState(VK_DELETE) bitand 0x8000)
+        {
+            break;
+        }
 
         // Re-fetch the player each tick since it can change (world reload, death, etc.)
         const std::unique_ptr<jni::entity_player_sp>& the_player{ the_minecraft->get_the_player() };
@@ -311,9 +297,6 @@ static DWORD WINAPI thread_entry(HMODULE module)
             the_player->get_experience_level(),
             the_player->is_on_ground()
         );
-
-        // Reading a static field (ticksRan)
-        std::println("[INFO] Ticks elapsed: {}", the_minecraft->get_ticks_ran());
 
         // Writing a field: set the player's XP level to 30
         the_player->set_experience_level(30);
@@ -338,12 +321,6 @@ static DWORD WINAPI thread_entry(HMODULE module)
             {
                 std::println("  - {} (health: {:.1f})", player->get_name(), player->get_health());
             }
-        }
-
-        // Exit when DELETE is held
-        if (GetAsyncKeyState(VK_DELETE) bitand 0x8000)
-        {
-            break;
         }
     }
 
