@@ -106,7 +106,7 @@ namespace jni
 				jni::envs.insert({ id, env });
 			}
 		}
-		catch (const std::runtime_error& e)
+		catch (const std::exception& e)
 		{
 			std::println("[ERROR] {}", e.what());
 		}
@@ -192,7 +192,7 @@ namespace jni
 
 			return found;
 		}
-		catch (const std::runtime_error& e)
+		catch (const std::exception& e)
 		{
 			std::println("[ERROR] manage_envs() {}", e.what());
 			return nullptr;
@@ -462,7 +462,7 @@ namespace jni
 				return jni::signature_map.at(std::type_index{ typeid(type) });
 			}
 		}
-		catch (const std::runtime_error& e)
+		catch (const std::exception& e)
 		{
 			std::println("[ERROR] get_signature() {}", e.what());
 			return std::string{};
@@ -543,12 +543,15 @@ namespace jni
 		{
 			try
 			{
-				const jfieldID field_id{ jni::field_ids.at(this->index).find(this->name)->second };
+				const auto& inner_map{ jni::field_ids.at(this->index) };
+				const auto it{ inner_map.find(this->name) };
 
-				if (!field_id)
+				if (it == inner_map.end())
 				{
-					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
+					throw std::runtime_error{ std::format("Field ID not found for {}.", this->name) };
 				}
+
+				const jfieldID field_id{ it->second };
 
 				jobject local{};
 				if constexpr (std::is_base_of_v<object, type>)
@@ -751,7 +754,7 @@ namespace jni
 					return std::make_unique<type>(nullptr);
 				}
 			}
-			catch (const std::runtime_error& e)
+			catch (const std::exception& e)
 			{
 				std::println("[ERROR] get() {}", e.what());
 
@@ -773,12 +776,15 @@ namespace jni
 		{
 			try
 			{
-				const jfieldID field_id{ jni::field_ids.at(this->index).find(this->name)->second };
+				const auto& inner_map{ jni::field_ids.at(this->index) };
+				const auto it{ inner_map.find(this->name) };
 
-				if (!field_id)
+				if (it == inner_map.end())
 				{
-					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
+					throw std::runtime_error{ std::format("Field ID not found for {}.", this->name) };
 				}
+
+				const jfieldID field_id{ it->second };
 
 				if constexpr (std::is_base_of_v<object, type>)
 				{
@@ -972,7 +978,7 @@ namespace jni
 					}
 				}
 			}
-			catch (const std::runtime_error& e)
+			catch (const std::exception& e)
 			{
 				std::println("[ERROR] set() {}", e.what());
 			}
@@ -1023,12 +1029,15 @@ namespace jni
 		{
 			try
 			{
-				const jmethodID method_id{ jni::method_ids.at(this->index).find(this->name)->second };
+				const auto& inner_map{ jni::method_ids.at(this->index) };
+				const auto it{ inner_map.find(this->name) };
 
-				if (!method_id)
+				if (it == inner_map.end())
 				{
-					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
+					throw std::runtime_error{ std::format("Method ID not found for {}.", this->name) };
 				}
+
+				const jmethodID method_id{ it->second };
 
 				auto [jargs, string_keeper] = jni::build_jargs(std::forward<args_t>(args)...);
 				const jvalue* jargs_ptr{ jargs.empty() ? nullptr : jargs.data() };
@@ -1293,7 +1302,7 @@ namespace jni
 					return return_type{};
 				}
 			}
-			catch (const std::runtime_error& e)
+			catch (const std::exception& e)
 			{
 				std::println("[ERROR] call() {}", e.what());
 
@@ -1375,7 +1384,7 @@ namespace jni
 					std::type_index{ typeid(*this) }
 				);
 			}
-			catch (const std::runtime_error& e)
+			catch (const std::exception& e)
 			{
 				std::println("[ERROR] get_field() {}", e.what());
 				return std::make_unique<field<type>>(nullptr, field_name, field_type, std::type_index{ typeid(*this) });
@@ -1410,7 +1419,7 @@ namespace jni
 					std::type_index{ typeid(*this) }
 				);
 			}
-			catch (const std::runtime_error& e)
+			catch (const std::exception& e)
 			{
 				std::println("[ERROR] get_method() {}", e.what());
 				return std::make_unique<method<return_type>>(nullptr, method_name, method_type, std::type_index{ typeid(*this) });
@@ -1467,7 +1476,7 @@ namespace jni
 					{ field_name, field_id }
 				);
 			}
-			catch (const std::runtime_error& e)
+			catch (const std::exception& e)
 			{
 				std::println("[ERROR] register_field_id() {}", e.what());
 			}
@@ -1515,7 +1524,7 @@ namespace jni
 					{ method_name, method_id }
 				);
 			}
-			catch (const std::runtime_error& e)
+			catch (const std::exception& e)
 			{
 				std::println("[ERROR] register_method_id() {}", e.what());
 			}
@@ -1676,7 +1685,7 @@ namespace jni
 
 			return result;
 		}
-		catch (const std::runtime_error& e)
+		catch (const std::exception& e)
 		{
 			std::println("[ERROR] make_unique() {}", e.what());
 
@@ -1719,7 +1728,7 @@ namespace jni
 
 			return true;
 		}
-		catch (const std::runtime_error& e)
+		catch (const std::exception& e)
 		{
 			std::println("[ERROR] init() {}", e.what());
 			return false;
