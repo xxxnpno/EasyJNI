@@ -26,51 +26,61 @@
 // everything about EasyJNI is in this namespace
 namespace jni
 {
+	/*
+		declarations
+	*/
+
 	class object;
 
 	static auto manage_envs() -> void;
 
 	static auto shutdown_hooks() -> void;
 
-	/*
 
+	/*
+		declarations
 	*/
 
-	// global vm and jvmti do not touch
+	// global vm and jvmti pointers
 	inline JavaVM* vm{ nullptr };
 	inline jvmtiEnv* jvmti{ nullptr };
 
 	// the maximum amount of envs we will store before clearing the map, to prevent memory leaks
-	// if you know waht's your doing with thread you can set it to UINT8_MAX
+	// if you know what you're doing with threads you can set it to UINT8_MAX
 	inline std::uint8_t max_stored_envs{};
 
 	// associate the thread id with the env of that thread
 	inline std::unordered_map<std::thread::id, JNIEnv*> envs{};
 
-	// get the env of the current thread, if the env is not found, attach the thread to the JVM and store the env in the map
+	// gets the env of the current thread, if the env is not found, attaches the thread to the JVM and stores the env in the map
 	static auto get_env()
 		-> JNIEnv*
 	{
-		// every time you want an env their is a bit of overhead
 		jni::manage_envs();
 
-		// this cannot return nullptr
-		return jni::envs.at(std::this_thread::get_id());
+		JNIEnv* env{ jni::envs.at(std::this_thread::get_id()) };
+
+		if (!env)
+		{
+			std::println("[ERROR] get_env() env is nullptr.");
+		}
+
+		return env;
 	}
 
-	// manage the envs of the threads, if the current thread is not in the map, 
-	// attach it to the JVM and store the env in the map, if the map is full, clear it to prevent memory leaks
+	// manages the envs of the threads, if the current thread is not in the map, 
+	// attaches it to the JVM and stores the env in the map, if the map is full, clear it to prevent memory leaks
 	static auto manage_envs()
 		-> void
 	{
 		try
 		{
-			// if the map become to big it gets cleared
+			// if the map becomes to big it gets cleared
 			if (jni::envs.size() >= jni::max_stored_envs)
 			{
-				std::println("[WARN] manage_envs() env map full ({} entries), clearing. "
-					"Consider calling jni::exit_thread() on threads that exit, "
-					"or increase max_envs in jni::init().", jni::envs.size());
+				std::println(
+					"[WARNING] manage_envs() env map full ({} entries), clearing. Consider calling jni::exit_thread() on threads that exit, or increase max_envs in jni::init()."
+					, jni::envs.size());
 
 				jni::envs.clear();
 			}
@@ -89,7 +99,6 @@ namespace jni
 				{
 					if (jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) not_eq JNI_OK)
 					{
-						// can it really fails? idk
 						throw std::runtime_error{ "Failed to attach current thread to JVM." };
 					}
 				}
@@ -103,7 +112,7 @@ namespace jni
 		}
 	}
 
-	// detach the current thread from the JVM, should be called when the thread is done using the JVM to prevent memory leaks
+	// detaches the current thread from the JVM, should be called when the thread is done using the JVM to prevent memory leaks
 	static auto exit_thread()
 		-> void
 	{
@@ -112,10 +121,10 @@ namespace jni
 		jni::envs.erase(std::this_thread::get_id());
 	}
 
-	// associate the class name with the global reference of the class
+	// associates the class name with the global reference of the class
 	inline std::unordered_map<std::string, jclass> classes{};
 
-	// take a class name a create a global reference to the class
+	// takes a class name a creates a global reference to the class
 	static auto load_class(const std::string& name)
 		-> jclass
 	{
@@ -124,30 +133,45 @@ namespace jni
 			const jclass clazz{ jni::get_env()->FindClass("java/lang/Class") };
 			const jmethodID get_name_id{ jni::get_env()->GetMethodID(clazz, "getName", "()Ljava/lang/String;") };
 
+			if (!clazz)
+			{
+				throw std::runtime_error{ std::format("Class is nullptr for {}.", name) };
+			}
+
+			if (!get_name_id)
+			{
+				throw std::runtime_error{ std::format("getName jmethodID is nullptr for {}.", name) };
+			}
+
 			jni::get_env()->DeleteLocalRef(clazz);
 
 			jint amount{};
 			jclass* classes_ptr{};
 
-			// classes_ptr will become an array of call the classes that jvmti got
+			// classes_ptr will become an array of all the classes that jvmti found
 			// since all the the java classes are java/lang/Class we can use the getName method
-			if (jni::jvmti->GetLoadedClasses(&amount, &classes_ptr) not_eq JVMTI_ERROR_NONE)
+			if (jni::jvmti->GetLoadedClasses(&amount, &classes_ptr) != JVMTI_ERROR_NONE)
 			{
-				throw std::runtime_error{ "Failed to get loaded classes." };
+				throw std::runtime_error{ std::format("Failed to get loaded classes for {}.", name) };
 			}
 
-			// each time you wanna get a new class it looks of it in the array and creates a global ref for it
-			// doing so be don't create a global ref for every classes in the jvm but only for the ones 
-			// you are using
+			// each time you want to get a new class it looks for it in the array and creates a global reference for it
+			// doing so we don't create a global ref for every classes in the jvm but only for the ones you are using
 			// it creates a bit of overhead the first time you use a method
 			jclass found{ nullptr };
 			for (jint i{ 0 }; i < amount; ++i)
 			{
 				const jclass current_class{ classes_ptr[i] };
+
+				if (!current_class)
+				{
+					throw std::runtime_error{ std::format("Found a null class during {}'s search.", name) };
+				}
+
 				const jstring class_name{ static_cast<jstring>(jni::get_env()->CallObjectMethod(current_class, get_name_id)) };
 
 				const char* const class_name_c_str{ jni::get_env()->GetStringUTFChars(class_name, nullptr) };
-				const bool match{ not std::strcmp(class_name_c_str, name.c_str()) };
+				const bool match{ !std::strcmp(class_name_c_str, name.c_str()) };
 
 				jni::get_env()->ReleaseStringUTFChars(class_name, class_name_c_str);
 				jni::get_env()->DeleteLocalRef(class_name);
@@ -175,42 +199,46 @@ namespace jni
 		}
 	}
 
-	// get the global reference of a class from its name, if the class is not found, return nullptr
-	static auto get_class(std::string name)
+	// gets the global reference of a class from its name, if the class is not found, return nullptr
+	static auto get_class(const std::string& name)
 		-> jclass
 	{
+		std::string class_name{ name };
+
 		// I prefer using my/Class instead of my.Class
 		// maybe I we really care we can create a preprocessor flag for "." or "/"
-		std::replace(name.begin(), name.end(), '/', '.');
+		std::replace(class_name.begin(), class_name.end(), '/', '.');
 
 		// if the class already has a global ref we just return it
-		if (const auto it{ jni::classes.find(name) }; it not_eq jni::classes.end())
+		if (const auto it{ jni::classes.find(class_name) }; it != jni::classes.end())
 		{
 			return it->second;
 		}
 
 		// if not we ask jvmti to get it
-		jclass found{ jni::load_class(name) };
+		jclass found{ jni::load_class(class_name) };
 
 		// if jvmti fails to obtain it we try FindClass from the jni api
-		if (not found)
+		if (!found)
 		{
-			std::string slash_name{ name };
-			std::replace(slash_name.begin(), slash_name.end(), '.', '/');
+			const jclass local{ jni::get_env()->FindClass(name.c_str()) };
 
-			const jclass local{ jni::get_env()->FindClass(slash_name.c_str()) };
 			if (local)
 			{
 				found = static_cast<jclass>(jni::get_env()->NewGlobalRef(local));
 				jni::get_env()->DeleteLocalRef(local);
-				jni::classes.insert({ name, found });
+				jni::classes.insert({ class_name, found });
+			}
+			else
+			{
+				std::println("[ERROR] get_class() Couldn't find the class {}.", name);
 			}
 		}
 
 		return found;
 	}
 
-	// handle strings, shoud not be used outside of this header
+	// handles strings, shoud not be used outside of this header
 	// constructor takes std::string or jstring and creates the other type and stores it
 	class string final
 	{
@@ -250,13 +278,13 @@ namespace jni
 			}
 		}
 
-		auto get_jni_string() const
+		inline auto get_jni_string() const
 			-> jstring
 		{
 			return this->jni_string;
 		}
 
-		auto get_std_string() const
+		inline auto get_std_string() const
 			-> std::string
 		{
 			return this->std_string;
@@ -274,7 +302,7 @@ namespace jni
 
 	using convert_function = std::function<std::any(const std::any&)>;
 
-	// associate a jni type to a cpp one
+	// associates a jni type to a cpp one
 	inline const std::unordered_map<std::type_index, convert_function> jni_to_cpp =
 	{
 		{ typeid(jshort),   [](const std::any& v) -> std::any { return static_cast<short>(std::any_cast<jshort>(v)); } },
@@ -284,10 +312,11 @@ namespace jni
 		{ typeid(jdouble),  [](const std::any& v) -> std::any { return static_cast<double>(std::any_cast<jdouble>(v)); } },
 		{ typeid(jboolean), [](const std::any& v) -> std::any { return static_cast<bool>(std::any_cast<jboolean>(v)); } },
 		{ typeid(jchar),    [](const std::any& v) -> std::any { return static_cast<char>(std::any_cast<jchar>(v)); } },
-		{ typeid(jstring),  [](const std::any& v) -> std::any { return jni::string(std::any_cast<jstring>(v)).get_std_string(); } },
+		{ typeid(jbyte),    [](const std::any& v) -> std::any { return static_cast<std::byte>(std::any_cast<jbyte>(v)); } },
+		{ typeid(jstring),  [](const std::any& v) -> std::any { return jni::string(std::any_cast<jstring>(v)).get_std_string(); } }
 	};
 
-	// associate a cpp type to a jni one
+	// associates a cpp type to a jni one
 	inline const std::unordered_map<std::type_index, convert_function> cpp_to_jni =
 	{
 		{ typeid(short),       [](const std::any& v) -> std::any { return static_cast<jshort>(std::any_cast<short>(v)); } },
@@ -297,12 +326,13 @@ namespace jni
 		{ typeid(double),      [](const std::any& v) -> std::any { return static_cast<jdouble>(std::any_cast<double>(v)); } },
 		{ typeid(bool),        [](const std::any& v) -> std::any { return static_cast<jboolean>(std::any_cast<bool>(v)); } },
 		{ typeid(char),        [](const std::any& v) -> std::any { return static_cast<jchar>(std::any_cast<char>(v)); } },
-		{ typeid(std::string), [](const std::any& v) -> std::any { return jni::string(std::any_cast<std::string>(v)).get_jni_string(); } },
+		{ typeid(std::byte),   [](const std::any& v) -> std::any { return static_cast<jbyte>(std::any_cast<std::byte>(v)); } },
+		{ typeid(std::string), [](const std::any& v) -> std::any { return jni::string(std::any_cast<std::string>(v)).get_jni_string(); } }
 	};
 
 	using jvalue_setter = std::function<jvalue(const std::any&)>;
 
-	// associate a jni type to a function that takes a cpp type and returns a jvalue with the corresponding field set, 
+	// associates a jni type to a function that takes a cpp type and returns a jvalue with the corresponding field set, 
 	// used to call methods with arguments or to set fields
 	inline const std::unordered_map<std::type_index, jvalue_setter> jni_to_jvalue =
 	{
@@ -313,15 +343,16 @@ namespace jni
 		{ typeid(jdouble),  [](const std::any& v) -> jvalue { jvalue j{}; j.d = std::any_cast<jdouble>(v);  return j; } },
 		{ typeid(jboolean), [](const std::any& v) -> jvalue { jvalue j{}; j.z = std::any_cast<jboolean>(v); return j; } },
 		{ typeid(jchar),    [](const std::any& v) -> jvalue { jvalue j{}; j.c = std::any_cast<jchar>(v);    return j; } },
+		{ typeid(jbyte),    [](const std::any& v) -> jvalue { jvalue j{}; j.b = std::any_cast<jbyte>(v);    return j; } },
 		{ typeid(jstring),  [](const std::any& v) -> jvalue { jvalue j{}; j.l = std::any_cast<jstring>(v);  return j; } },
-		{ typeid(jobject),  [](const std::any& v) -> jvalue { jvalue j{}; j.l = std::any_cast<jobject>(v);  return j; } },
+		{ typeid(jobject),  [](const std::any& v) -> jvalue { jvalue j{}; j.l = std::any_cast<jobject>(v);  return j; } }
 	};
 
 	/*
 		type cast helper
 	*/
 
-	// associate a cpp type to a jni signature
+	// associates a cpp type to a jni signature
 	inline const std::unordered_map<std::type_index, std::string> signature_map
 	{
 		{ std::type_index{ typeid(void) }, "V" },
@@ -332,6 +363,7 @@ namespace jni
 		{ std::type_index{ typeid(double) }, "D" },
 		{ std::type_index{ typeid(bool) }, "Z" },
 		{ std::type_index{ typeid(char) }, "C" },
+		{ std::type_index{ typeid(std::byte) }, "B" },
 		{ std::type_index{ typeid(std::string) }, "Ljava/lang/String;" },
 		{ std::type_index{ typeid(jobjectArray) }, "[Ljava/lang/Object;" }
 	};
@@ -340,65 +372,61 @@ namespace jni
 		helpers for requires
 	*/
 
-	template<typename type>
-	struct is_std_type : public std::false_type {};
-
-	template<> struct is_std_type<short> : public std::true_type {};
-	template<> struct is_std_type<int> : public std::true_type {};
-	template<> struct is_std_type<long long> : public std::true_type {};
-
-	template<> struct is_std_type<float> : public std::true_type {};
-	template<> struct is_std_type<double> : public std::true_type {};
-
-	template<> struct is_std_type<bool> : public std::true_type {};
-	template<> struct is_std_type<char> : public std::true_type {};
-
-	template<> struct is_std_type<std::string> : public std::true_type {};
-
-	template<> struct is_std_type<void> : public std::true_type {};
-
-	template<typename type>
-	struct is_jni_type : public std::false_type {};
-
-	template<> struct is_jni_type<jshort> : public std::true_type {};
-	template<> struct is_jni_type<jint> : public std::true_type {};
-	template<> struct is_jni_type<jlong> : public std::true_type {};
-
-	template<> struct is_jni_type<jfloat> : public std::true_type {};
-	template<> struct is_jni_type<jdouble> : public std::true_type {};
-
-	template<> struct is_jni_type<jboolean> : public std::true_type {};
-	template<> struct is_jni_type<jchar> : public std::true_type {};
-	template<> struct is_jni_type<jbyte> : public std::true_type {};
-
-	template<> struct is_jni_type<jstring> : public std::true_type {};
-	template<> struct is_jni_type<jobject> : public std::true_type {};
-	template<> struct is_jni_type<jobjectArray> : public std::true_type {};
-
 	template<typename T>
-	struct is_object_ptr : std::false_type {};
+	struct unwrap_object_ptr { using type = T; };
 
 	template<typename T>
 		requires (std::is_base_of_v<object, T>)
-	struct is_object_ptr<std::unique_ptr<T>> : std::true_type {};
+	struct unwrap_object_ptr<std::unique_ptr<T>> { using type = T; };
+
+	template<typename T>
+	concept std_type =
+		std::is_same_v<T, short> ||
+		std::is_same_v<T, int> ||
+		std::is_same_v<T, long long> ||
+		std::is_same_v<T, float> ||
+		std::is_same_v<T, double> ||
+		std::is_same_v<T, bool> ||
+		std::is_same_v<T, char> ||
+		std::is_same_v<T, std::byte> ||
+		std::is_same_v<T, std::string> ||
+		std::is_same_v<T, void>;
+
+	template<typename T>
+	concept jni_object = std::is_base_of_v<object, T>;
+
+	template<typename T>
+	concept jni_object_ptr = jni_object<typename unwrap_object_ptr<T>::type>
+		&& !jni_object<T>;
+
+	template<typename T>
+	concept method_return = std_type<T> || jni_object<T> || std::is_same_v<T, jobjectArray>;
+
+	template<typename T>
+	concept field_type_c = std_type<T> || jni_object<T>;
+
+	template<typename T>
+	concept callable_arg = std_type<std::remove_cvref_t<T>>
+		|| jni_object<std::remove_cvref_t<T>>
+		|| jni_object_ptr<std::remove_cvref_t<T>>
+		|| std::is_convertible_v<std::remove_cvref_t<T>, std::string>;
 
 	/*
 		helpers for requires
 	*/
 
-	// associate the type index of a cpp type to the signature of the corresponding java type,
+	// associates the type index of a cpp type to the signature of the corresponding java type,
 	// used to get the signature of a method or a field from the cpp type
 	inline std::unordered_map<std::type_index, std::string> class_map{};
 
-	// associate your cpp class to a java class
-	template <typename type>
-		requires (std::is_base_of_v<object, type>)
+	// associates your cpp class to a java class
+	template <jni_object type>
 	static auto register_class(const std::string& class_name)
 		-> bool
 	{
 		jni::class_map.insert_or_assign(std::type_index{ typeid(type) }, class_name);
 
-		if (not jni::get_class(class_name))
+		if (!jni::get_class(class_name))
 		{
 			std::println("[ERROR] register_class() class not found in JVM: {}", class_name);
 			jni::class_map.erase(std::type_index{ typeid(type) });
@@ -408,9 +436,8 @@ namespace jni
 		return true;
 	}
 
-	// return the signature of a type primitive or not
-	template <typename type>
-		requires (is_std_type<type>::value or std::is_base_of_v<object, type> or std::is_same_v<type, jobjectArray>)
+	// returns the signature of a type primitive or not
+	template <method_return type>
 	static auto get_signature()
 		-> std::string
 	{
@@ -421,7 +448,6 @@ namespace jni
 				const auto it{ jni::class_map.find(std::type_index{ typeid(type) }) };
 				if (it == jni::class_map.end())
 				{
-					// this error should not proc alone
 					throw std::runtime_error{ std::format("Class not registered for type {}.", typeid(type).name()) };
 				}
 
@@ -429,7 +455,7 @@ namespace jni
 			}
 			else if constexpr (std::is_same_v<type, jobjectArray>)
 			{
-				return "[Ljava/lang/Object;";
+				return signature_map.at(std::type_index{ typeid(jobjectArray) });
 			}
 			else
 			{
@@ -443,7 +469,50 @@ namespace jni
 		}
 	}
 
-	// associate typeid(*this) with the map of its fieldIDs
+	// helper function to transform args_t&&... args into a vector of jvalues
+	template<callable_arg... args_t>
+	static auto build_jargs(args_t&&... args)
+		-> std::pair<std::vector<jvalue>, std::vector<jni::string>>
+	{
+		std::vector<jni::string> string_keeper{};
+		string_keeper.reserve(sizeof...(args_t));
+
+		auto convert_arg = [&string_keeper](auto&& arg) -> jvalue
+		{
+			using raw = std::remove_cvref_t<decltype(arg)>;
+
+			std::any jni_val{};
+			if constexpr (std::is_base_of_v<object, raw>)
+			{
+				jni_val = arg.get_instance();
+			}
+			else if constexpr (jni_object_ptr<raw>)
+			{
+				jni_val = arg->get_instance();
+			}
+			else if constexpr (std::is_convertible_v<raw, std::string>)
+			{
+				string_keeper.emplace_back(std::string{ arg });
+				jni_val = string_keeper.back().get_jni_string();
+			}
+			else
+			{
+				jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
+			}
+
+			return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
+		};
+
+		std::vector<jvalue> jargs{};
+		if constexpr (sizeof...(args_t) > 0)
+		{
+			jargs = { convert_arg(std::forward<args_t>(args))... };
+		}
+
+		return { std::move(jargs), std::move(string_keeper) };
+	}
+
+	// associates type_index of a cpp class with the map of its fieldIDs
 	inline std::unordered_map<std::type_index, std::unordered_map<std::string, jfieldID>> field_ids{};
 
 	// used to know if a field is static or not
@@ -455,21 +524,20 @@ namespace jni
 
 	// used to represent a field and to get and set the field
 	// should not be used outside of this header
-	template <typename type>
-		requires (is_std_type<type>::value or std::is_base_of_v<object, type>)
+	template <field_type_c type>
 	class field final
 	{
 	public:
 		field(void* class_or_instance, const std::string& name, const jni::field_type field_type, const std::type_index index)
 			: class_or_instance{ class_or_instance }
 			, name{ name }
-			, field_type{ field_type }
 			, index{ index }
+			, field_type{ field_type }
 		{
 
 		}
 
-		// get the field value, if the field is static, class_or_instance will be a jclass, otherwise it will be a jobject
+		// gets the field value
 		auto get() const
 			-> std::conditional_t<std::is_base_of_v<object, type>, std::unique_ptr<type>, type>
 		{
@@ -477,7 +545,7 @@ namespace jni
 			{
 				const jfieldID field_id{ jni::field_ids.at(this->index).find(this->name)->second };
 
-				if (not field_id)
+				if (!field_id)
 				{
 					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
 				}
@@ -630,6 +698,23 @@ namespace jni
 						);
 					}
 				}
+				else if constexpr (std::is_same<type, std::byte>::value)
+				{
+					if (this->field_type == jni::field_type::NOT_STATIC)
+					{
+						result = jni::get_env()->GetByteField(
+							reinterpret_cast<jbyte>(this->class_or_instance),
+							field_id
+						);
+					}
+					else
+					{
+						result = jni::get_env()->GetStaticByteField(
+							reinterpret_cast<jbyte>(this->class_or_instance),
+							field_id
+						);
+					}
+				}
 				else if constexpr (std::is_same<type, std::string>::value)
 				{
 					if (this->field_type == jni::field_type::NOT_STATIC)
@@ -652,7 +737,7 @@ namespace jni
 					}
 				}
 
-				if constexpr (not std::is_base_of_v<object, type>)
+				if constexpr (!std::is_base_of_v<object, type>)
 				{
 					auto it = jni::jni_to_cpp.find(result.type());
 					if (it not_eq jni::jni_to_cpp.end())
@@ -681,7 +766,8 @@ namespace jni
 			}
 		}
 
-		// set the field value, if the field is static, class_or_instance will be a jclass, otherwise it will be a jobject
+		// set the field value
+		// pass primitive types and unique ptrs, do not pass the jobject directly
 		auto set(const type& value) const
 			-> void
 		{
@@ -689,7 +775,7 @@ namespace jni
 			{
 				const jfieldID field_id{ jni::field_ids.at(this->index).find(this->name)->second };
 
-				if (not field_id)
+				if (!field_id)
 				{
 					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
 				}
@@ -847,6 +933,25 @@ namespace jni
 						);
 					}
 				}
+				else if constexpr (std::is_same<type, std::byte>::value)
+				{
+					if (this->field_type == jni::field_type::NOT_STATIC)
+					{
+						jni::get_env()->SetByteField(
+							reinterpret_cast<jobject>(this->class_or_instance),
+							field_id,
+							static_cast<jbyte>(value)
+						);
+					}
+					else
+					{
+						jni::get_env()->SetStaticByteField(
+							reinterpret_cast<jclass>(this->class_or_instance),
+							field_id,
+							static_cast<jbyte>(value)
+						);
+					}
+				}
 				else if constexpr (std::is_same<type, std::string>::value)
 				{
 					if (this->field_type == jni::field_type::NOT_STATIC)
@@ -874,18 +979,18 @@ namespace jni
 		}
 
 	private:
-		// store the class or instance depending on if the field is static or not, 
+		// stores the class or instance pointer depending on if the field is static or not,
 		// to prevent having to pass it every time we want to get or set the field
 		void* class_or_instance;
 
 		std::string name;
 
-		field_type field_type;
-
 		std::type_index index;
+
+		field_type field_type;
 	};
 
-	// associate typeid(*this) with the map of its methodIDs
+	// associates type_index of a cpp class with the map of its methodIDs
 	inline std::unordered_map<std::type_index, std::unordered_map<std::string, jmethodID>> method_ids{};
 
 	// used to know if a method is static or not
@@ -897,95 +1002,36 @@ namespace jni
 
 	// used to represent a method and to call the method
 	// should not be used outside of this header
-	template <typename return_type>
-		requires (
-	is_std_type<return_type>::value or std::is_base_of_v<object, return_type> or std::is_same_v<return_type, jobjectArray>
-		)
-		class method final
+	template <method_return return_type>
+	class method final
 	{
 	public:
 		method(void* class_or_instance, const std::string& name, const jni::method_type method_type, const std::type_index index)
 			: class_or_instance{ class_or_instance }
 			, name{ name }
-			, method_type{ method_type }
 			, index{ index }
+			, method_type{ method_type }
 		{
 
 		}
 
-		// call the method with the given arguments, if the method is static, class_or_instance will be a jclass, 
-		// otherwise it will be a jobject
+		// call the method with the given arguments
 		// pass primitive types and unique ptrs, do not pass the jobject directly
-		template<typename... args_t>
-			requires (
-		(
-			is_std_type<std::remove_cvref_t<args_t>>::value
-			or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
-			or is_object_ptr<std::remove_cvref_t<args_t>>::value
-			) and ...
-			)
-			auto call(args_t&&... args) const
+		template<callable_arg... args_t>
+		auto call(args_t&&... args) const
 			-> std::conditional_t<std::is_base_of_v<object, return_type>, std::unique_ptr<return_type>, return_type>
 		{
 			try
 			{
-				const auto outer_it{ jni::method_ids.find(this->index) };
-				if (outer_it == jni::method_ids.end())
-				{
-					throw std::runtime_error{ std::format("No methods registered for type at {}.", this->name) };
-				}
+				const jmethodID method_id{ jni::method_ids.at(this->index).find(this->name)->second };
 
-				const auto inner_it{ outer_it->second.find(this->name) };
-				if (inner_it == outer_it->second.end())
-				{
-					throw std::runtime_error{ std::format("Method id not found for {}.", this->name) };
-				}
-
-				const jmethodID method_id{ inner_it->second };
-
-				if (not method_id)
+				if (!method_id)
 				{
 					throw std::runtime_error{ std::format("Failed to get method id for {}.", this->name) };
 				}
 
-				std::vector<jni::string> string_keeper{};
-				string_keeper.reserve(sizeof...(args_t));
-
-				// we will use jvalue* to handle arguements and then use Call<type>MethodA
-				auto convert_arg = [&string_keeper](auto&& arg) -> jvalue
-					{
-						using raw = std::remove_cvref_t<decltype(arg)>;
-
-						std::any jni_val{};
-						if constexpr (std::is_base_of_v<object, raw>)
-						{
-							jni_val = arg.get_instance();
-						}
-						else if constexpr (is_object_ptr<raw>::value)
-						{
-							jni_val = arg->get_instance();
-						}
-						else if constexpr (std::is_same_v<raw, std::string>)
-						{
-							string_keeper.emplace_back(arg);
-							jni_val = string_keeper.back().get_jni_string();
-						}
-						else
-						{
-							jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
-						}
-
-						return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
-					};
-
-				const jvalue* jargs_ptr{ nullptr };
-				std::vector<jvalue> jargs{};
-
-				if constexpr (sizeof...(args_t) > 0)
-				{
-					jargs = { convert_arg(std::forward<args_t>(args))... };
-					jargs_ptr = jargs.data();
-				}
+				auto [jargs, string_keeper] = jni::build_jargs(std::forward<args_t>(args)...);
+				const jvalue* jargs_ptr{ jargs.empty() ? nullptr : jargs.data() };
 
 				if constexpr (std::is_base_of_v<object, return_type>)
 				{
@@ -1171,6 +1217,25 @@ namespace jni
 						);
 					}
 				}
+				else if constexpr (std::is_same_v<return_type, std::byte>)
+				{
+					if (this->method_type == jni::method_type::NOT_STATIC)
+					{
+						result = jni::get_env()->CallByteMethodA(
+							reinterpret_cast<jobject>(this->class_or_instance),
+							method_id,
+							jargs_ptr
+						);
+					}
+					else
+					{
+						result = jni::get_env()->CallStaticByteMethodA(
+							reinterpret_cast<jclass>(this->class_or_instance),
+							method_id,
+							jargs_ptr
+						);
+					}
+				}
 				else if constexpr (std::is_same_v<return_type, std::string>)
 				{
 					jobject local{};
@@ -1191,7 +1256,7 @@ namespace jni
 						);
 					}
 
-					if (not local)
+					if (!local)
 					{
 						return std::string{};
 					}
@@ -1218,7 +1283,7 @@ namespace jni
 					}
 				}
 
-				if constexpr (not std::is_base_of_v<object, return_type> and not std::is_same_v<return_type, void>)
+				if constexpr (!std::is_base_of_v<object, return_type> && !std::is_same_v<return_type, void>)
 				{
 					auto it = jni::jni_to_cpp.find(result.type());
 					if (it not_eq jni::jni_to_cpp.end())
@@ -1248,27 +1313,26 @@ namespace jni
 		}
 
 	private:
-		// store the class or instance depending on if the method is static or not, to prevent having to pass it every time we want to call the method
+		// store the class or instance pointer depending on if the method is static or not, to prevent having to pass it every time we want to call the method
 		void* class_or_instance;
 
 		std::string name;
 
-		method_type method_type;
-
 		std::type_index index;
+
+		method_type method_type;
 	};
 
 	// used to represent a java object and to get and set its fields and call its methods
-	// store the jobject as a global reference to prevent it from being garbage collected while we are using it
+	// stores the jobject as a global reference to prevent it from being garbage collected while we are using it
 	// inherit from this class to create a wrapper for a java class
-	// should not be used outside of this header
 	class object
 	{
 	public:
 		// you can pass a nullptr and it will store it
 		// used for constructors or for object that are null in the jvm
 		explicit object(const jobject instance = nullptr)
-			// create a global ref of the jobject that is how every jobjects are managed 
+			// create a global reference of the jobject that is how every jobjects are managed 
 			: instance{ instance ? jni::get_env()->NewGlobalRef(instance) : nullptr }
 		{
 
@@ -1278,14 +1342,13 @@ namespace jni
 		{
 			if (this->instance)
 			{
-				// delete the global ref created
+				// delete the global reference created
 				jni::get_env()->DeleteGlobalRef(this->instance);
 			}
 		}
 
-		// obtain a wrapped field that you can get or set
-		template<typename type>
-			requires (is_std_type<type>::value or std::is_base_of_v<object, type>)
+		// obtains a wrapped field that you can get or set
+		template<field_type_c type>
 		auto get_field(const std::string& field_name, const jni::field_type field_type = jni::field_type::NOT_STATIC) const
 			-> std::unique_ptr<field<type>>
 		{
@@ -1293,12 +1356,12 @@ namespace jni
 			{
 				const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
 
-				if (not clazz)
+				if (!clazz)
 				{
 					throw std::runtime_error{ std::format("Class not found for {}.", field_name) };
 				}
 
-				if (not this->instance and field_type == jni::field_type::NOT_STATIC)
+				if (!this->instance && field_type == jni::field_type::NOT_STATIC)
 				{
 					throw std::runtime_error{ std::format("Instance is null for {}.", field_name) };
 				}
@@ -1314,31 +1377,26 @@ namespace jni
 			}
 			catch (const std::runtime_error& e)
 			{
-				std::println("[ERROR] {}", e.what());
+				std::println("[ERROR] get_field() {}", e.what());
 				return std::make_unique<field<type>>(nullptr, field_name, field_type, std::type_index{ typeid(*this) });
 			}
 		}
 
-		// obtain a wrapped method that you can call
-		template<typename return_type, typename... args_t>
-			requires (
-		(is_std_type<return_type>::value or std::is_base_of_v<object, return_type> or std::is_same_v<return_type, jobjectArray>)
-			and
-			((is_std_type<std::remove_cvref_t<args_t>>::value or std::is_base_of_v<object, std::remove_cvref_t<args_t>>) and ...)
-			)
-			auto get_method(const std::string& method_name, const jni::method_type method_type = jni::method_type::NOT_STATIC) const
+		// obtains a wrapped method that you can call
+		template<method_return return_type, callable_arg... args_t>
+		auto get_method(const std::string& method_name, const jni::method_type method_type = jni::method_type::NOT_STATIC) const
 			-> std::unique_ptr<method<return_type>>
 		{
 			try
 			{
 				const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
 
-				if (not clazz)
+				if (!clazz)
 				{
 					throw std::runtime_error{ std::format("Class not found for {}.", method_name) };
 				}
 
-				if (not this->instance and method_type == jni::method_type::NOT_STATIC)
+				if (!this->instance && method_type == jni::method_type::NOT_STATIC)
 				{
 					throw std::runtime_error{ std::format("Instance is null for {}.", method_name) };
 				}
@@ -1359,8 +1417,9 @@ namespace jni
 			}
 		}
 
-		// unique ptrs are never nullptr but the instance might be nullptr if the object is also null in the jvm
-		auto get_instance() const -> jobject
+		// unique pointers are never nullptr but the instance might be nullptr if the object is also null in the jvm
+		inline auto get_instance() const 
+			-> jobject
 		{
 			return this->instance;
 		}
@@ -1369,16 +1428,15 @@ namespace jni
 		jobject instance;
 
 	private:
-		// obtain the fieldID of a field
-		template<typename type>
-			requires (is_std_type<type>::value or std::is_base_of_v<object, type>)
+		// obtains the jfieldID of a field
+		template<field_type_c type>
 		auto register_field_id(const jclass clazz, const std::string& field_name, const jni::field_type field_type, const std::type_index index) const
 			-> void
 		{
 			try
 			{
 				if (jni::field_ids[std::type_index{ index }].find(field_name)
-					not_eq jni::field_ids[std::type_index{ index }].end())
+					!= jni::field_ids[std::type_index{ index }].end())
 				{
 					return;
 				}
@@ -1400,7 +1458,7 @@ namespace jni
 					field_id = jni::get_env()->GetStaticFieldID(clazz, field_name.c_str(), signature.c_str());
 				}
 
-				if (not field_id)
+				if (!field_id)
 				{
 					throw std::runtime_error{ std::format("Failed to get field id for {}.", field_name) };
 				}
@@ -1415,20 +1473,15 @@ namespace jni
 			}
 		}
 
-		// obtain the methodID of a method
-		template<typename return_type, typename... args_t>
-			requires (
-		(is_std_type<return_type>::value or std::is_base_of_v<object, return_type> or std::is_same_v<return_type, jobjectArray>)
-			and
-			((is_std_type<std::remove_cvref_t<args_t>>::value or std::is_base_of_v<object, std::remove_cvref_t<args_t>>) and ...)
-			)
-			auto register_method_id(const jclass clazz, const std::string& method_name, const jni::method_type method_type, const std::type_index index = typeid(*this)) const
+		// obtains the jmethodID of a method
+		template<method_return return_type, callable_arg... args_t>
+		auto register_method_id(const jclass clazz, const std::string& method_name, const jni::method_type method_type, const std::type_index index = typeid(*this)) const
 			-> void
 		{
 			try
 			{
 				if (jni::method_ids[std::type_index{ index }].find(method_name)
-					not_eq jni::method_ids[std::type_index{ index }].end())
+					!= jni::method_ids[std::type_index{ index }].end())
 				{
 					return;
 				}
@@ -1453,7 +1506,7 @@ namespace jni
 					method_id = jni::get_env()->GetStaticMethodID(clazz, method_name.c_str(), signature.c_str());
 				}
 
-				if (not method_id)
+				if (!method_id)
 				{
 					throw std::runtime_error{ std::format("Failed to get method id for {}.", method_name) };
 				}
@@ -1469,17 +1522,14 @@ namespace jni
 		}
 
 		// friend function to use NewObject from the jni api
-		// holy requires need to be symplified
-		template<typename type, typename... args_t>
-			requires (
-		std::is_base_of_v<object, type> and
-			((std::is_convertible_v<std::remove_cvref_t<args_t>, std::string>
-				or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
-				or is_object_ptr<std::remove_cvref_t<args_t>>::value) and ...)
-			)
-			friend auto make_unique(args_t&&... args)
+		template<jni_object type, callable_arg... args_t>
+		friend auto make_unique(args_t&&... args)
 			-> std::unique_ptr<type>;
 	};
+
+	/*
+		java data structure helpers
+	*/
 
 	// own wrapper of java Collection, you can override it if you really need
 	class collection : public jni::object
@@ -1492,7 +1542,7 @@ namespace jni
 		}
 
 		template<typename type>
-			requires (std::is_base_of_v<object, type> or std::is_same_v<type, std::string>)
+			requires (std::is_base_of_v<object, type> || std::is_same_v<type, std::string>)
 		auto to_vector() const
 			-> std::conditional_t<std::is_same_v<type, std::string>, std::vector<std::string>, std::vector<std::unique_ptr<type>>>
 		{
@@ -1500,14 +1550,14 @@ namespace jni
 
 			try
 			{
-				if (not this->instance)
+				if (!this->instance)
 				{
 					return result_t{};
 				}
 
 				const jobjectArray array{ this->get_method<jobjectArray>("toArray")->call() };
 
-				if (not array)
+				if (!array)
 				{
 					return result_t{};
 				}
@@ -1573,6 +1623,7 @@ namespace jni
 		}
 	};
 
+	// I needed uuid for an other projet, not that useful
 	class uuid final : public jni::object
 	{
 	public:
@@ -1589,30 +1640,21 @@ namespace jni
 		}
 	};
 
-	template<typename T>
-	struct unwrap_object_ptr { using type = T; };
-
-	template<typename T>
-		requires (std::is_base_of_v<object, T>)
-	struct unwrap_object_ptr<std::unique_ptr<T>> { using type = T; };
+	/*
+		java data structure helpers
+	*/
 
 	// friend function of jni::object 
 	// allows you to create jobject using java constructors
-	template<typename type, typename... args_t>
-		requires (
-	std::is_base_of_v<object, type> and
-		((std::is_convertible_v<std::remove_cvref_t<args_t>, std::string>
-			or std::is_base_of_v<object, std::remove_cvref_t<args_t>>
-			or is_object_ptr<std::remove_cvref_t<args_t>>::value) and ...)
-		)
-		auto make_unique(args_t&&... args)
+	template<jni_object type, callable_arg... args_t>
+	auto make_unique(args_t&&... args)
 		-> std::unique_ptr<type>
 	{
 		try
 		{
 			const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(type) })) };
 
-			if (not clazz)
+			if (!clazz)
 			{
 				throw std::runtime_error{ std::format("Class not found for constructor.") };
 			}
@@ -1624,44 +1666,8 @@ namespace jni
 
 			const jmethodID constructor_id{ jni::method_ids.at(typeid(type)).at("<init>") };
 
-			std::vector<jni::string> string_keeper{};
-			string_keeper.reserve(sizeof...(args_t));
-
-			// create a jvalue array, same as the method call in the jni::object class
-			auto convert_arg = [&string_keeper](auto&& arg) -> jvalue
-				{
-					using raw = std::remove_cvref_t<decltype(arg)>;
-
-					std::any jni_val{};
-					if constexpr (std::is_base_of_v<object, raw>)
-					{
-						jni_val = arg.get_instance();
-					}
-					else if constexpr (is_object_ptr<raw>::value)
-					{
-						jni_val = arg->get_instance();
-					}
-					else if constexpr (std::is_convertible_v<raw, std::string>)
-					{
-						string_keeper.emplace_back(std::string{ arg });
-						jni_val = string_keeper.back().get_jni_string();
-					}
-					else
-					{
-						jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
-					}
-
-					return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
-				};
-
-			const jvalue* jargs_ptr{ nullptr };
-			std::vector<jvalue> jargs{};
-
-			if constexpr (sizeof...(args_t) > 0)
-			{
-				jargs = { convert_arg(std::forward<args_t>(args))... };
-				jargs_ptr = jargs.data();
-			}
+			auto [jargs, string_keeper] = jni::build_jargs(std::forward<args_t>(args)...);
+			const jvalue* jargs_ptr{ jargs.empty() ? nullptr : jargs.data() };
 
 			const jobject local{ jni::get_env()->NewObjectA(clazz, constructor_id, jargs_ptr) };
 
@@ -1678,7 +1684,7 @@ namespace jni
 		}
 	}
 
-	// initialize EasyJNI, take the maximum amount of envs to store before clearing the map as an argument
+	// initializes EasyJNI, takes the maximum amount of envs to store before clearing the map as an argument
 	// if you are sure about your thread managment with jni::exit_thread no need to change max_envs
 	// otherwise put a small value
 	static auto init(const std::uint8_t max_envs = UINT8_MAX)
@@ -1694,7 +1700,7 @@ namespace jni
 				throw std::runtime_error{ "Failed to get created Java VMs." };
 			}
 
-			if (not jni::vm)
+			if (!jni::vm)
 			{
 				throw std::runtime_error{ "No Java VM found." };
 			}
@@ -1797,7 +1803,7 @@ namespace jni
 			{
 				static VMStructEntry_ptr_t length_entry{ find_VMStructEntry("Symbol", "_length") };
 				static VMStructEntry_ptr_t body_entry{ find_VMStructEntry("Symbol", "_body") };
-				if (not length_entry or not body_entry) return "";
+				if (!length_entry || !body_entry) return "";
 
 				const std::uint16_t length{ *(std::uint16_t*)((std::uint8_t*)this + length_entry->offset) };
 				const char* body{ (const char*)((std::uint8_t*)this + body_entry->offset) };
@@ -1816,7 +1822,7 @@ namespace jni
 					{
 						for (VMTypeEntry_ptr_t _entry{ gHotSpotVMTypes }; _entry->typeName; ++_entry)
 						{
-							if (not std::strcmp(_entry->typeName, "ConstantPool"))
+							if (!std::strcmp(_entry->typeName, "ConstantPool"))
 							{
 								return _entry;
 							}
@@ -1825,7 +1831,7 @@ namespace jni
 						return nullptr;
 					}();
 
-				if (not entry)
+				if (!entry)
 				{
 					return nullptr;
 				}
@@ -1841,7 +1847,7 @@ namespace jni
 				-> constant_pool*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_constants") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				return *(constant_pool**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1850,7 +1856,7 @@ namespace jni
 				-> symbol*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_name_index") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				const std::uint16_t index = *(std::uint16_t*)((std::uint8_t*)this + entry->offset);
 				return (symbol*)get_constants()->get_base()[index];
@@ -1860,7 +1866,7 @@ namespace jni
 				-> symbol*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_signature_index") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				const std::uint16_t index{ *(std::uint16_t*)((std::uint8_t*)this + entry->offset) };
 				return (symbol*)get_constants()->get_base()[index];
@@ -1874,7 +1880,7 @@ namespace jni
 				-> void*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_i2i_entry") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				return *(void**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1883,7 +1889,7 @@ namespace jni
 				-> void*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_from_interpreted_entry") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				return *(void**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1892,7 +1898,7 @@ namespace jni
 				-> std::uint32_t*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_access_flags") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				return (uint32_t*)((std::uint8_t*)this + entry->offset);
 			}
@@ -1901,7 +1907,7 @@ namespace jni
 				-> std::uint16_t*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_flags") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				return (std::uint16_t*)((std::uint8_t*)this + entry->offset);
 			}
@@ -1910,7 +1916,7 @@ namespace jni
 				-> const_method*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_constMethod") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				return *(const_method**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1919,10 +1925,10 @@ namespace jni
 				-> std::string
 			{
 				const_method* const_method{ get_const_method() };
-				if (not const_method) return "";
+				if (!const_method) return "";
 
 				symbol* symbol{ const_method->get_name() };
-				if (not symbol) return "";
+				if (!symbol) return "";
 
 				return symbol->to_string();
 			}
@@ -1931,10 +1937,10 @@ namespace jni
 				-> std::string
 			{
 				const_method* const_method{ get_const_method() };
-				if (not const_method) return "";
+				if (!const_method) return "";
 
 				symbol* symbol{ const_method->get_signature() };
-				if (not symbol) return "";
+				if (!symbol) return "";
 
 				return symbol->to_string();
 			}
@@ -1963,7 +1969,7 @@ namespace jni
 				-> JNIEnv*
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_anchor") };
-				if (not entry) return nullptr;
+				if (!entry) return nullptr;
 
 				// _anchor is a  JavaFrameAnchor, JNIEnv* is at +32
 				return (JNIEnv*)((std::uint8_t*)this + entry->offset + 32);
@@ -1973,7 +1979,7 @@ namespace jni
 				-> java_thread_state
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
-				if (not entry) return _thread_uninitialized;
+				if (!entry) return _thread_uninitialized;
 
 				return *(java_thread_state*)((std::uint8_t*)this + entry->offset);
 			}
@@ -1982,7 +1988,7 @@ namespace jni
 				-> void
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
-				if (not entry) return;
+				if (!entry) return;
 
 				*(java_thread_state*)((std::uint8_t*)this + entry->offset) = state;
 			}
@@ -1991,7 +1997,7 @@ namespace jni
 				-> std::uint32_t
 			{
 				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_suspend_flags") };
-				if (not entry) return 0;
+				if (!entry) return 0;
 
 				return *(std::uint32_t*)((std::uint8_t*)this + entry->offset);
 			}
@@ -2056,7 +2062,7 @@ namespace jni
 			// we scan the first 0x400 bytes from i2i_entry
 			std::uint8_t* hook_location{ scan(curr, 0x400, pattern, sizeof(pattern)) };
 
-			if (not hook_location)
+			if (!hook_location)
 			{
 				std::println("[ERROR] find_hook_location: pattern not found\n");
 				return nullptr;
@@ -2116,7 +2122,7 @@ namespace jni
 				using return_type = std::conditional_t<std::is_base_of_v<jni::object, type>, std::unique_ptr<type>, type>;
 
 				void** locals{ this->get_locals() };
-				if (not locals)
+				if (!locals)
 				{
 					return return_type{};
 				}
@@ -2125,7 +2131,7 @@ namespace jni
 
 				if constexpr (std::is_same_v<type, std::string>)
 				{
-					if (not raw)
+					if (!raw)
 					{
 						return std::string{};
 					}
@@ -2135,7 +2141,7 @@ namespace jni
 					std::int32_t length{};
 					std::memcpy(&length, char_array + 12, sizeof(std::int32_t));
 
-					if (length <= 0 or length > 512)
+					if (length <= 0 || length > 512)
 					{
 						return std::string{};
 					}
@@ -2147,7 +2153,7 @@ namespace jni
 				}
 				else if constexpr (std::is_base_of_v<jni::object, type>)
 				{
-					if (not raw)
+					if (!raw)
 					{
 						return return_type{};
 					}
@@ -2276,7 +2282,7 @@ namespace jni
 				};
 
 				this->allocated = allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
-				if (not this->allocated)
+				if (!this->allocated)
 				{
 					std::println("[ERROR] midi2i_hook: failed to allocate memory");
 					return;
@@ -2314,7 +2320,7 @@ namespace jni
 
 				// restore original bytes
 				DWORD old_protect{};
-				if (this->target[0] == 0xE9 and VirtualProtect(this->target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
+				if (this->target[0] == 0xE9 && VirtualProtect(this->target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
 				{
 					std::memcpy(this->target, this->allocated, 5);
 					VirtualProtect(this->target, 5, old_protect, &old_protect);
@@ -2351,9 +2357,9 @@ namespace jni
 
 		static void common_detour(frame* f, java_thread* thread, bool* cancel)
 		{
-			if (not thread) return;
-			if (not thread->get_env()) return;
-			if (thread->get_thread_state() not_eq _thread_in_Java) return;
+			if (!thread) return;
+			if (!thread->get_env()) return;
+			if (thread->get_thread_state() != _thread_in_Java) return;
 
 			method* current_method{ f->get_method() };
 
@@ -2370,16 +2376,16 @@ namespace jni
 		}
 
 		// flags to desactivate jit compilation on hooked method
-		static constexpr std::int32_t NO_COMPILE =
-			0x02000000 bitor // JVM_ACC_NOT_C2_COMPILABLE
-			0x04000000 bitor // JVM_ACC_NOT_C1_COMPILABLE
-			0x08000000 bitor // JVM_ACC_NOT_C2_OSR_COMPILABLE
+		inline constexpr std::int32_t NO_COMPILE =
+			0x02000000 | // JVM_ACC_NOT_C2_COMPILABLE
+			0x04000000 | // JVM_ACC_NOT_C1_COMPILABLE
+			0x08000000 | // JVM_ACC_NOT_C2_OSR_COMPILABLE
 			0x01000000;  // JVM_ACC_QUEUED
 
 		static void set_dont_inline(method* m, bool enabled)
 		{
 			std::uint16_t* flags{ m->get_flags() };
-			if (not flags)
+			if (!flags)
 			{
 				return;
 			}
@@ -2395,15 +2401,14 @@ namespace jni
 		}
 	}
 
-	template <typename type>
-		requires (std::is_base_of_v<jni::object, type>)
+	template <jni_object type>
 	static auto hook(const std::string& method_name, hotspot::detour_t detour)
 		-> bool
 	{
-		if (not detour) return false;
+		if (!detour) return false;
 
 		const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(type) })) };
-		if (not clazz)
+		if (!clazz)
 		{
 			std::println("[ERROR] hook: class not found");
 			return false;
@@ -2421,7 +2426,7 @@ namespace jni
 		for (jint i{ 0 }; i < method_count; ++i)
 		{
 			hotspot::method* m{ *(hotspot::method**)methods[i] };
-			if (m and m->get_name() == method_name)
+			if (m && m->get_name() == method_name)
 			{
 				method_id = methods[i];
 				break;
@@ -2430,7 +2435,7 @@ namespace jni
 
 		jni::jvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
 
-		if (not method_id)
+		if (!method_id)
 		{
 			std::println("[ERROR] hook: method '{}' not found", method_name);
 			return false;
@@ -2474,13 +2479,13 @@ namespace jni
 			}
 		}
 
-		if (not hook_new_i2i)
+		if (!hook_new_i2i)
 		{
 			return true;
 		}
 
 		std::uint8_t* target{ (std::uint8_t*)hotspot::find_hook_location(i2i) };
-		if (not target)
+		if (!target)
 		{
 			std::println("[ERROR] hook: failed to find hook location");
 			return false;
