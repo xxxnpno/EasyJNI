@@ -1752,58 +1752,68 @@ namespace jni
 	namespace hotspot
 	{
 		// https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/vmStructs.hpp
-		typedef struct VMTypeEntry
+		typedef struct vm_type_entry
 		{
-			const char* typeName;
-			const char* superclassName;
+			const char* type_name;
+			const char* superclass_name;
 
-			std::int32_t isOopType;
-			std::int32_t isIntegerType;
-			std::int32_t isUnsigned;
+			std::int32_t is_oop_type;
+			std::int32_t is_integer_type;
+			std::int32_t is_unsigned;
 
 			std::uint64_t size;
-		} VMTypeEntry_t, * VMTypeEntry_ptr_t;
+		} vm_type_entry_t, * vm_type_entry_ptr_t;
 
 		// https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/vmStructs.hpp
-		typedef struct VMStructEntry
+		typedef struct vm_struct_entry
 		{
-			const char* typeName;
-			const char* fieldName;
-			const char* typeString;
+			const char* type_name;
+			const char* field_name;
+			const char* type_string;
 
-			std::int32_t isStatic;
+			std::int32_t is_static;
 
 			std::uint64_t offset;
 
 			void* address;
-		} VMStructEntry_t, * VMStructEntry_ptr_t;
+		} vm_struct_entry_t, * vm_struct_entry_ptr_t;
 
-		extern "C" JNIIMPORT VMTypeEntry_ptr_t gHotSpotVMTypes;
-		extern "C" JNIIMPORT VMStructEntry_ptr_t gHotSpotVMStructs;
+		extern "C" JNIIMPORT vm_type_entry_ptr_t gHotSpotVMTypes;
+		extern "C" JNIIMPORT vm_struct_entry_ptr_t gHotSpotVMStructs;
 
 		// find offsets based on the jvm
-		static auto find_VMStructEntry(const char* typeName, const char* fieldName)
-			-> VMStructEntry_ptr_t
+		static auto find_VMStructEntry(const char* type_mame, const char* field_name)
+			-> vm_struct_entry_ptr_t
 		{
-			for (VMStructEntry_ptr_t entry{ gHotSpotVMStructs }; entry->typeName; ++entry)
+			for (vm_struct_entry_ptr_t entry{ gHotSpotVMStructs }; entry->type_name; ++entry)
 			{
-				if (std::strcmp(entry->typeName, typeName)) continue;
-				if (std::strcmp(entry->fieldName, fieldName)) continue;
+				if (std::strcmp(entry->type_name, type_mame))
+				{
+					continue;
+				}
+
+				if (std::strcmp(entry->field_name, field_name))
+				{
+					continue;
+				}
+
 				return entry;
 			}
 
 			return nullptr;
 		}
 
-		class symbol final
+		struct symbol
 		{
-		public:
 			auto to_string()
 				-> std::string
 			{
-				static VMStructEntry_ptr_t length_entry{ find_VMStructEntry("Symbol", "_length") };
-				static VMStructEntry_ptr_t body_entry{ find_VMStructEntry("Symbol", "_body") };
-				if (!length_entry || !body_entry) return "";
+				static vm_struct_entry_ptr_t length_entry{ find_VMStructEntry("Symbol", "_length") };
+				static vm_struct_entry_ptr_t body_entry{ find_VMStructEntry("Symbol", "_body") };
+				if (!length_entry || !body_entry)
+				{
+					return "";
+				}
 
 				const std::uint16_t length{ *(std::uint16_t*)((std::uint8_t*)this + length_entry->offset) };
 				const char* body{ (const char*)((std::uint8_t*)this + body_entry->offset) };
@@ -1812,24 +1822,23 @@ namespace jni
 			}
 		};
 
-		class constant_pool final
+		struct constant_pool
 		{
-		public:
 			auto get_base()
 				-> void**
 			{
-				static VMTypeEntry_ptr_t entry = []() -> VMTypeEntry_ptr_t
+				static vm_type_entry_ptr_t entry = []() -> vm_type_entry_ptr_t
+				{
+					for (vm_type_entry_ptr_t _entry{ gHotSpotVMTypes }; _entry->type_name; ++_entry)
 					{
-						for (VMTypeEntry_ptr_t _entry{ gHotSpotVMTypes }; _entry->typeName; ++_entry)
+						if (!std::strcmp(_entry->type_name, "ConstantPool"))
 						{
-							if (!std::strcmp(_entry->typeName, "ConstantPool"))
-							{
-								return _entry;
-							}
+							return _entry;
 						}
+					}
 
-						return nullptr;
-					}();
+					return nullptr;
+				}();
 
 				if (!entry)
 				{
@@ -1840,14 +1849,16 @@ namespace jni
 			}
 		};
 
-		class const_method final
+		struct const_method
 		{
-		public:
 			auto get_constants()
 				-> constant_pool*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_constants") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_constants") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				return *(constant_pool**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1855,8 +1866,11 @@ namespace jni
 			auto get_name()
 				-> symbol*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_name_index") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_name_index") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				const std::uint16_t index = *(std::uint16_t*)((std::uint8_t*)this + entry->offset);
 				return (symbol*)get_constants()->get_base()[index];
@@ -1865,22 +1879,27 @@ namespace jni
 			auto get_signature()
 				-> symbol*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_signature_index") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("ConstMethod", "_signature_index") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				const std::uint16_t index{ *(std::uint16_t*)((std::uint8_t*)this + entry->offset) };
 				return (symbol*)get_constants()->get_base()[index];
 			}
 		};
 
-		class method final
+		struct method
 		{
-		public:
 			auto get_i2i_entry()
 				-> void*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_i2i_entry") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("Method", "_i2i_entry") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				return *(void**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1888,8 +1907,11 @@ namespace jni
 			auto get_from_interpreted_entry()
 				-> void*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_from_interpreted_entry") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("Method", "_from_interpreted_entry") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				return *(void**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1897,8 +1919,11 @@ namespace jni
 			auto get_access_flags()
 				-> std::uint32_t*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_access_flags") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("Method", "_access_flags") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				return (uint32_t*)((std::uint8_t*)this + entry->offset);
 			}
@@ -1906,8 +1931,11 @@ namespace jni
 			auto get_flags()
 				-> std::uint16_t*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_flags") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("Method", "_flags") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				return (std::uint16_t*)((std::uint8_t*)this + entry->offset);
 			}
@@ -1915,8 +1943,11 @@ namespace jni
 			auto get_const_method()
 				-> const_method*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("Method", "_constMethod") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("Method", "_constMethod") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
 				return *(const_method**)((std::uint8_t*)this + entry->offset);
 			}
@@ -1925,10 +1956,16 @@ namespace jni
 				-> std::string
 			{
 				const_method* const_method{ get_const_method() };
-				if (!const_method) return "";
+				if (!const_method)
+				{
+					return "";
+				}
 
 				symbol* symbol{ const_method->get_name() };
-				if (!symbol) return "";
+				if (!symbol)
+				{
+					return "";
+				}
 
 				return symbol->to_string();
 			}
@@ -1937,16 +1974,22 @@ namespace jni
 				-> std::string
 			{
 				const_method* const_method{ get_const_method() };
-				if (!const_method) return "";
+				if (!const_method)
+				{
+					return "";
+				}
 
 				symbol* symbol{ const_method->get_signature() };
-				if (!symbol) return "";
+				if (!symbol)
+				{
+					return "";
+				}
 
 				return symbol->to_string();
 			}
 		};
 
-		enum java_thread_state : std::int32_t
+		enum java_thread_state : std::int8_t
 		{
 			_thread_uninitialized = 0,
 			_thread_new = 2,
@@ -1962,24 +2005,29 @@ namespace jni
 			_thread_max_state = 12
 		};
 
-		class java_thread final
+		struct java_thread
 		{
-		public:
 			auto get_env()
 				-> JNIEnv*
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_anchor") };
-				if (!entry) return nullptr;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("JavaThread", "_anchor") };
+				if (!entry)
+				{
+					return nullptr;
+				}
 
-				// _anchor is a  JavaFrameAnchor, JNIEnv* is at +32
+				// _anchor is a JavaFrameAnchor, JNIEnv* is at +32
 				return (JNIEnv*)((std::uint8_t*)this + entry->offset + 32);
 			}
 
 			auto get_thread_state()
 				-> java_thread_state
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
-				if (!entry) return _thread_uninitialized;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
+				if (!entry)
+				{
+					return _thread_uninitialized;
+				}
 
 				return *(java_thread_state*)((std::uint8_t*)this + entry->offset);
 			}
@@ -1987,8 +2035,11 @@ namespace jni
 			auto set_thread_state(const java_thread_state state)
 				-> void
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
-				if (!entry) return;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("JavaThread", "_thread_state") };
+				if (!entry)
+				{
+					return;
+				}
 
 				*(java_thread_state*)((std::uint8_t*)this + entry->offset) = state;
 			}
@@ -1996,8 +2047,11 @@ namespace jni
 			auto get_suspend_flags()
 				-> std::uint32_t
 			{
-				static VMStructEntry_ptr_t entry{ find_VMStructEntry("JavaThread", "_suspend_flags") };
-				if (!entry) return 0;
+				static vm_struct_entry_ptr_t entry{ find_VMStructEntry("JavaThread", "_suspend_flags") };
+				if (!entry)
+				{
+					return 0;
+				}
 
 				return *(std::uint32_t*)((std::uint8_t*)this + entry->offset);
 			}
@@ -2014,7 +2068,7 @@ namespace jni
 					continue; // wildcard
 				}
 
-				if (addr[i] not_eq pattern[i])
+				if (addr[i] != pattern[i])
 				{
 					return false;
 				}
@@ -2064,7 +2118,7 @@ namespace jni
 
 			if (!hook_location)
 			{
-				std::println("[ERROR] find_hook_location: pattern not found\n");
+				std::println("[ERROR] find_hook_location() pattern not found\n");
 				return nullptr;
 			}
 
@@ -2088,7 +2142,7 @@ namespace jni
 		template<typename type>
 		using argument_return_t = std::conditional_t<std::is_base_of_v<jni::object, type>, std::unique_ptr<type>, type>;
 
-		class frame final
+		struct frame
 		{
 		public:
 			auto get_method() const
@@ -2284,7 +2338,7 @@ namespace jni
 				this->allocated = allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
 				if (!this->allocated)
 				{
-					std::println("[ERROR] midi2i_hook: failed to allocate memory");
+					std::println("[ERROR] midi2i_hook failed to allocate memory");
 					return;
 				}
 
@@ -2316,7 +2370,10 @@ namespace jni
 
 			~midi2i_hook()
 			{
-				if (this->error) return;
+				if (this->error)
+				{
+					return;
+				}
 
 				// restore original bytes
 				DWORD old_protect{};
@@ -2329,7 +2386,8 @@ namespace jni
 				VirtualFree(this->allocated, 0, MEM_RELEASE);
 			}
 
-			bool has_error() const
+			inline auto has_error() const
+				-> bool
 			{
 				return this->error;
 			}
@@ -2342,24 +2400,36 @@ namespace jni
 
 		struct hooked_method
 		{
-			method* m = nullptr;
-			detour_t detour = nullptr;
+			method* m{ nullptr };
+			detour_t detour{ nullptr };
 		};
 
 		struct i2i_hook_data
 		{
-			void* i2i_entry = nullptr;
-			midi2i_hook* hook = nullptr;
+			void* i2i_entry{ nullptr };
+			midi2i_hook* hook{ nullptr };
 		};
 
 		inline std::vector<hooked_method> hooked_methods{};
 		inline std::vector<i2i_hook_data> hooked_i2i_entries{};
 
-		static void common_detour(frame* f, java_thread* thread, bool* cancel)
+		static auto common_detour(frame* f, java_thread* thread, bool* cancel)
+			-> void
 		{
-			if (!thread) return;
-			if (!thread->get_env()) return;
-			if (thread->get_thread_state() != _thread_in_Java) return;
+			if (!thread)
+			{
+				return;
+			}
+
+			if (!thread->get_env())
+			{
+				return;
+			}
+
+			if (thread->get_thread_state() != _thread_in_Java)
+			{
+				return;
+			}
 
 			method* current_method{ f->get_method() };
 
@@ -2382,7 +2452,8 @@ namespace jni
 			0x08000000 | // JVM_ACC_NOT_C2_OSR_COMPILABLE
 			0x01000000;  // JVM_ACC_QUEUED
 
-		static void set_dont_inline(method* m, bool enabled)
+		static auto set_dont_inline(method* m, bool enabled)
+			-> void
 		{
 			std::uint16_t* flags{ m->get_flags() };
 			if (!flags)
@@ -2405,12 +2476,15 @@ namespace jni
 	static auto hook(const std::string& method_name, hotspot::detour_t detour)
 		-> bool
 	{
-		if (!detour) return false;
+		if (!detour)
+		{
+			return false;
+		}
 
 		const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(type) })) };
 		if (!clazz)
 		{
-			std::println("[ERROR] hook: class not found");
+			std::println("[ERROR] hook() class not found");
 			return false;
 		}
 
@@ -2418,7 +2492,7 @@ namespace jni
 		jmethodID* methods{};
 		if (jni::jvmti->GetClassMethods(clazz, &method_count, &methods) not_eq JVMTI_ERROR_NONE)
 		{
-			std::println("[ERROR] hook: GetClassMethods failed");
+			std::println("[ERROR] hook() GetClassMethods failed");
 			return false;
 		}
 
@@ -2445,7 +2519,10 @@ namespace jni
 
 		for (hotspot::hooked_method& hk : hotspot::hooked_methods)
 		{
-			if (hk.m == m) return true;
+			if (hk.m == m)
+			{
+				return true;
+			}
 		}
 
 		hotspot::set_dont_inline(m, true);
@@ -2487,7 +2564,7 @@ namespace jni
 		std::uint8_t* target{ (std::uint8_t*)hotspot::find_hook_location(i2i) };
 		if (!target)
 		{
-			std::println("[ERROR] hook: failed to find hook location");
+			std::println("[ERROR] hook() failed to find hook location");
 			return false;
 		}
 
