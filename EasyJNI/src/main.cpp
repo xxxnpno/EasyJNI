@@ -233,17 +233,6 @@ static auto register_hooks()
     };
 
     jni::hook<jni::entity_player_sp>("addChatMessage", add_chat_hook);
-
-    // Hook EntityPlayer.getHealth()
-    // Demonstrates cancelling a method and returning a custom value.
-    // The game will always see 20.0f as the player's health while this hook is active.
-    static auto set_health_hook = [](jni::hotspot::frame* frame, jni::hotspot::java_thread*, bool* cancel)
-    {
-        std::println("[HOOK] setHealth() called, forcing return value to 20.0f");
-        jni::set_return_value<float>(cancel, 20.0f);
-    };
-
-    jni::hook<jni::entity_player_sp>("setHealth", set_health_hook);
 }
 
 static DWORD WINAPI thread_entry(HMODULE module)

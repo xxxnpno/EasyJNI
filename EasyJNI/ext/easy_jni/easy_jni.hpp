@@ -32,8 +32,6 @@ namespace jni
 
 	class object;
 
-	static auto manage_envs() -> void;
-
 	static auto shutdown_hooks() -> void;
 
 
@@ -45,20 +43,26 @@ namespace jni
 	inline JavaVM* vm{ nullptr };
 	inline jvmtiEnv* jvmti{ nullptr };
 
-	// the maximum amount of envs we will store before clearing the map, to prevent memory leaks
-	// if you know what you're doing with threads you can set it to UINT8_MAX
-	inline std::uint8_t max_stored_envs{};
-
-	// associate the thread id with the env of that thread
-	inline std::unordered_map<std::thread::id, JNIEnv*> envs{};
-
-	// gets the env of the current thread, if the env is not found, attaches the thread to the JVM and stores the env in the map
-	static auto get_env()
+	// gets the env of the current thread, if the env is not found, attaches the thread to the JVM and stores it locally
+	static auto get_env() noexcept
 		-> JNIEnv*
 	{
-		jni::manage_envs();
+		thread_local JNIEnv* env{ nullptr };
 
-		JNIEnv* env{ jni::envs.at(std::this_thread::get_id()) };
+		if (!env)
+		{
+			const jint result{ jni::vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) };
+
+			// jni basic api
+			if (result == JNI_EDETACHED)
+			{
+				if (jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
+				{
+					std::println("[ERROR] get_env() Failed to attach current thread to JVM.");
+					return nullptr;
+				}
+			}
+		}
 
 		if (!env)
 		{
@@ -68,57 +72,21 @@ namespace jni
 		return env;
 	}
 
-	// manages the envs of the threads, if the current thread is not in the map, 
-	// attaches it to the JVM and stores the env in the map, if the map is full, clear it to prevent memory leaks
-	static auto manage_envs()
+	// detaches the current thread from the JVM, should be called before thread exit
+	static auto exit_thread() noexcept
 		-> void
 	{
-		try
-		{
-			// if the map becomes to big it gets cleared
-			if (jni::envs.size() >= jni::max_stored_envs)
-			{
-				std::println(
-					"[WARNING] manage_envs() env map full ({} entries), clearing. Consider calling jni::exit_thread() on threads that exit, or increase max_envs in jni::init()."
-					, jni::envs.size());
+		thread_local JNIEnv* env{ nullptr };
 
-				jni::envs.clear();
+		if (env)
+		{
+			if (jni::vm->DetachCurrentThread() != JNI_OK)
+			{
+				std::println("[WARNING] exit_thread() Failed to detach current thread from JVM.");
 			}
 
-			const std::thread::id id{ std::this_thread::get_id() };
-			const auto it{ jni::envs.find(id) };
-
-			// if the thread doesn't have an env
-			if (it == jni::envs.end())
-			{
-				JNIEnv* env{ nullptr };
-				const jint result{ jni::vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) };
-
-				// jni basic api
-				if (result == JNI_EDETACHED)
-				{
-					if (jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) not_eq JNI_OK)
-					{
-						throw std::runtime_error{ "Failed to attach current thread to JVM." };
-					}
-				}
-
-				jni::envs.insert({ id, env });
-			}
+			env = nullptr;
 		}
-		catch (const std::exception& e)
-		{
-			std::println("[ERROR] {}", e.what());
-		}
-	}
-
-	// detaches the current thread from the JVM, should be called when the thread is done using the JVM to prevent memory leaks
-	static auto exit_thread()
-		-> void
-	{
-		jni::vm->DetachCurrentThread();
-
-		jni::envs.erase(std::this_thread::get_id());
 	}
 
 	// associates the class name with the global reference of the class
@@ -1693,14 +1661,10 @@ namespace jni
 		}
 	}
 
-	// initializes EasyJNI, takes the maximum amount of envs to store before clearing the map as an argument
-	// if you are sure about your thread managment with jni::exit_thread no need to change max_envs
-	// otherwise put a small value
-	static auto init(const std::uint8_t max_envs = UINT8_MAX)
+	// initializes EasyJNI
+	static auto init()
 		-> bool
 	{
-		jni::max_stored_envs = max_envs;
-
 		try
 		{
 			jsize count{};
@@ -1713,8 +1677,6 @@ namespace jni
 			{
 				throw std::runtime_error{ "No Java VM found." };
 			}
-
-			jni::manage_envs();
 
 			if (jni::vm->GetEnv(reinterpret_cast<void**>(&jni::jvmti), JVMTI_VERSION_1_2) not_eq JNI_OK)
 			{
