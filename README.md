@@ -38,8 +38,7 @@ jni::shutdown();
 
 ```cpp
 // Initialize EasyJNI. Call once before using any other function.
-// max_envs: how many thread environments to cache before the map is cleared (default: UINT8_MAX)
-auto jni::init(std::uint8_t max_envs = UINT8_MAX) -> bool;
+auto jni::init() -> bool;
 
 // Shut down EasyJNI. Cleans up all global refs, hooks, and cached environments.
 auto jni::shutdown() -> void;
