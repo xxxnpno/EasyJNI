@@ -40,8 +40,8 @@ namespace jni
 	*/
 
 	// global vm and jvmti pointers
-	inline JavaVM* vm{ nullptr };
-	inline jvmtiEnv* jvmti{ nullptr };
+	inline constinit JavaVM* vm{ nullptr };
+	inline constinit jvmtiEnv* jvmti{ nullptr };
 
 	// gets the env of the current thread, if the env is not found, attaches the thread to the JVM and stores it locally
 	static auto get_env() noexcept
@@ -238,7 +238,64 @@ namespace jni
 			}
 		}
 
-		~string()
+		string(const string& other)
+			: jni_string{ nullptr }
+			, std_string{ other.std_string }
+		{
+			if (other.jni_string)
+			{
+				this->jni_string = static_cast<jstring>(jni::get_env()->NewGlobalRef(other.jni_string));
+			}
+		}
+
+		auto operator=(const string& other) 
+			-> string&
+		{
+			if (this == &other)
+			{
+				return *this;
+			}
+
+			if (this->jni_string)
+			{
+				jni::get_env()->DeleteGlobalRef(this->jni_string);
+			}
+
+			this->std_string = other.std_string;
+			this->jni_string = other.jni_string
+				? static_cast<jstring>(jni::get_env()->NewGlobalRef(other.jni_string))
+				: nullptr;
+
+			return *this;
+		}
+
+		string(string&& other) noexcept
+			: jni_string{ other.jni_string }
+			, std_string{ std::move(other.std_string) }
+		{
+			other.jni_string = nullptr;
+		}
+
+		auto operator=(string&& other) noexcept -> string&
+		{
+			if (this == &other)
+			{
+				return *this;
+			}
+
+			if (this->jni_string)
+			{
+				jni::get_env()->DeleteGlobalRef(this->jni_string);
+			}
+
+			this->jni_string = other.jni_string;
+			this->std_string = std::move(other.std_string);
+			other.jni_string = nullptr;
+
+			return *this;
+		}
+
+		~string() noexcept
 		{
 			if (this->jni_string)
 			{
@@ -246,13 +303,13 @@ namespace jni
 			}
 		}
 
-		inline auto get_jni_string() const
+		inline auto get_jni_string() const noexcept
 			-> jstring
 		{
 			return this->jni_string;
 		}
 
-		inline auto get_std_string() const
+		inline auto get_std_string() const noexcept
 			-> std::string
 		{
 			return this->std_string;
@@ -1315,7 +1372,57 @@ namespace jni
 
 		}
 
-		virtual ~object()
+		object(const object& other)
+			: instance{ other.instance ? jni::get_env()->NewGlobalRef(other.instance) : nullptr }
+		{
+
+		}
+
+		auto operator=(const object& other) 
+			-> object&
+		{
+			if (this == &other)
+			{
+				return *this;
+			}
+
+			if (this->instance)
+			{
+				jni::get_env()->DeleteGlobalRef(this->instance);
+			}
+
+			this->instance = other.instance ? jni::get_env()->NewGlobalRef(other.instance) : nullptr;
+
+			return *this;
+		}
+
+		object(object&& other) noexcept
+			: instance{ other.instance }
+		{
+			other.instance = nullptr;
+		}
+
+		// move assignment
+		auto operator=(object&& other) noexcept 
+			-> object&
+		{
+			if (this == &other)
+			{
+				return *this;
+			}
+
+			if (this->instance)
+			{
+				jni::get_env()->DeleteGlobalRef(this->instance);
+			}
+
+			this->instance = other.instance;
+			other.instance = nullptr;
+
+			return *this;
+		}
+
+		virtual ~object() noexcept
 		{
 			if (this->instance)
 			{
@@ -1395,7 +1502,7 @@ namespace jni
 		}
 
 		// unique pointers are never nullptr but the instance might be nullptr if the object is also null in the jvm
-		inline auto get_instance() const 
+		inline auto get_instance() const noexcept
 			-> jobject
 		{
 			return this->instance;
