@@ -1,7 +1,5 @@
 #include <easy_jni/easy_jni.hpp>
 
-#include <windows.h>
-
 /*
     Minecraft 1.8.9 example using MCP deobfuscated names.
 
