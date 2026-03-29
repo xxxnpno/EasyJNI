@@ -3293,7 +3293,7 @@ namespace jni
 					// _jni_environment immediately follows _anchor in the JavaThread layout.
 					// The offset between them is exactly sizeof(JavaFrameAnchor) = 32 bytes,
 					// which is stable across all x64 HotSpot builds.
-					static constexpr std::ptrdiff_t SIZEOF_JAVA_FRAME_ANCHOR{ 32 };
+					static const constexpr std::ptrdiff_t SIZEOF_JAVA_FRAME_ANCHOR{ 32 };
 					return (JNIEnv*)((std::uint8_t*)this + anchor_entry->offset + SIZEOF_JAVA_FRAME_ANCHOR);
 				}
 				catch (const std::exception& e)
@@ -3969,53 +3969,53 @@ namespace jni
 					0x6A, 0x00,                                     // push 0x0         ; push cancel flag (bool* = false by default)
 
 					0x48, 0x89, 0xE9,                               // mov rcx, rbp     ; first argument  
-					//					; -> frame* (rbp = current interpreter frame)
-0x4C, 0x89, 0xFA,                               // mov rdx, r15     ; second argument 
-//					; -> java_thread* (r15 = current JavaThread*)
-0x4C, 0x8D, 0x04, 0x24,                         // lea r8,  [rsp]   ; third argument  
-//					; -> bool* cancel (points to the 0x0 we pushed)
-
-0x48, 0x89, 0xE5,                               // mov rbp, rsp     ; save rsp into rbp for 
-//					; stack restoration after the call
-0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16     ; align rsp to 16 bytes as required 
-//					; by the Windows x64 ABI
-0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20    ; allocate 32 bytes of shadow space 
-//					; as required by the Windows x64 ABI
-
-0xFF, 0x15, 0x2D, 0x00, 0x00, 0x00,             // call [rip+0x2D]  ; call the C++ detour function via 
-//					; RIP-relative indirect call
-
-0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp from rbp 
-//					; (undo alignment and shadow space)
-
-0x58,                                           // pop rax          ; rax = cancel flag value 
-//					; (0x0 = do not cancel, non-zero = cancel)
-0x48, 0x83, 0xF8, 0x00,                         // cmp rax, 0x0     ; check if the detour requested cancellation
-
-0x5D,                                           // pop rbp          ; restore rbp (frame base pointer)
-0x41, 0x5B,                                     // pop r11          ; restore r11
-0x41, 0x5A,                                     // pop r10          ; restore r10
-0x41, 0x59,                                     // pop r9           ; restore r9
-0x41, 0x58,                                     // pop r8           ; restore r8
-0x5A,                                           // pop rdx          ; restore rdx
-0x59,                                           // pop rcx          ; restore rcx
-0x58,                                           // pop rax          ; restore rax
-
-0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je 0x????????    ; if cancel flag was set -> jump to the 
-//					; return path (offset patched at runtime)
-
-// cancel path: the detour requested early return, rax holds the custom return value
-0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax   ; move rax into xmm0 for floating point 
-//					; return value compatibility
-0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8] ; restore rbx from the interpreter frame
-0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp to the interpreter frame base
-0x5D,                                           // pop rbp          ; restore rbp (caller frame base pointer)
-0x5E,                                           // pop rsi          ; restore rsi (interpreter state pointer)
-0x48, 0x89, 0xDC,                               // mov rsp, rbx     ; restore rsp to the caller stack pointer
-0xFF, 0xE6,                                     // jmp rsi          ; jump to the return address saved in rsi
-
-// data slot: 8-byte address of the C++ detour function, written at construction time
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // .quad 0x0        ; detour function pointer (patched at runtime)
+																	//					; -> frame* (rbp = current interpreter frame)
+					0x4C, 0x89, 0xFA,                               // mov rdx, r15     ; second argument 
+																	//					; -> java_thread* (r15 = current JavaThread*)
+					0x4C, 0x8D, 0x04, 0x24,                         // lea r8,  [rsp]   ; third argument  
+																	//					; -> bool* cancel (points to the 0x0 we pushed)
+					
+					0x48, 0x89, 0xE5,                               // mov rbp, rsp     ; save rsp into rbp for 
+																	//					; stack restoration after the call
+					0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16     ; align rsp to 16 bytes as required 
+																	//					; by the Windows x64 ABI
+					0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20    ; allocate 32 bytes of shadow space 
+																	//					; as required by the Windows x64 ABI
+					
+					0xFF, 0x15, 0x2D, 0x00, 0x00, 0x00,             // call [rip+0x2D]  ; call the C++ detour function via 
+																	//					; RIP-relative indirect call
+					
+					0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp from rbp 
+																	//					; (undo alignment and shadow space)
+					
+					0x58,                                           // pop rax          ; rax = cancel flag value 
+																	//					; (0x0 = do not cancel, non-zero = cancel)
+					0x48, 0x83, 0xF8, 0x00,                         // cmp rax, 0x0     ; check if the detour requested cancellation
+					
+					0x5D,                                           // pop rbp          ; restore rbp (frame base pointer)
+					0x41, 0x5B,                                     // pop r11          ; restore r11
+					0x41, 0x5A,                                     // pop r10          ; restore r10
+					0x41, 0x59,                                     // pop r9           ; restore r9
+					0x41, 0x58,                                     // pop r8           ; restore r8
+					0x5A,                                           // pop rdx          ; restore rdx
+					0x59,                                           // pop rcx          ; restore rcx
+					0x58,                                           // pop rax          ; restore rax
+					
+					0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je 0x????????    ; if cancel flag was set -> jump to the 
+																	//					; return path (offset patched at runtime)
+					
+					// cancel path: the detour requested early return, rax holds the custom return value
+					0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax   ; move rax into xmm0 for floating point 
+																	//					; return value compatibility
+					0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8] ; restore rbx from the interpreter frame
+					0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp to the interpreter frame base
+					0x5D,                                           // pop rbp          ; restore rbp (caller frame base pointer)
+					0x5E,                                           // pop rsi          ; restore rsi (interpreter state pointer)
+					0x48, 0x89, 0xDC,                               // mov rsp, rbx     ; restore rsp to the caller stack pointer
+					0xFF, 0xE6,                                     // jmp rsi          ; jump to the return address saved in rsi
+					
+					// data slot: 8-byte address of the C++ detour function, written at construction time
+					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // .quad 0x0        ; detour function pointer (patched at runtime)
 				};
 
 				// Allocate a block of memory near the target within 32-bit relative JMP range,
