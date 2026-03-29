@@ -184,7 +184,7 @@ namespace jni
 			@brief Returns the error message
 			@return C-style string containing the error description
 		*/
-		auto what() const noexcept 
+		auto what() const noexcept
 			-> const char* override
 		{
 			return this->message.c_str();
@@ -443,15 +443,15 @@ namespace jni
 					if (const jint attach_result{ jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&scoped_env), nullptr) };
 						attach_result != JNI_OK)
 					{
-						throw jni::jni_exception{ 
+						throw jni::jni_exception{
 							std::format("AttachCurrentThread failed with result {}.", static_cast<std::int32_t>(attach_result))
 						};
 					}
 				}
 				else if (get_env_result != JNI_OK)
 				{
-					throw jni::jni_exception{ 
-						std::format("GetEnv failed with result {}.", static_cast<std::int32_t>(get_env_result)) 
+					throw jni::jni_exception{
+						std::format("GetEnv failed with result {}.", static_cast<std::int32_t>(get_env_result))
 					};
 				}
 			}
@@ -570,11 +570,11 @@ namespace jni
 			}
 
 			// Retrieve all loaded classes via JVMTI.
-			if (const jint loaded_classes_result{ jni::jvmti->GetLoadedClasses(&amount, &classes_ptr) }; 
+			if (const jint loaded_classes_result{ jni::jvmti->GetLoadedClasses(&amount, &classes_ptr) };
 				loaded_classes_result != JVMTI_ERROR_NONE)
 			{
-				throw std::runtime_error{ 
-					std::format("GetLoadedClasses failed with result {}.", static_cast<std::int32_t>(loaded_classes_result)) 
+				throw std::runtime_error{
+					std::format("GetLoadedClasses failed with result {}.", static_cast<std::int32_t>(loaded_classes_result))
 				};
 			}
 
@@ -591,7 +591,7 @@ namespace jni
 
 				const jni::string _string{ jni::get_env()->CallObjectMethod(current_class, permanent_get_name_method_id) };
 
-				const bool match{ !std::strcmp(_string.get_std_string().c_str(), class_name.data())};
+				const bool match{ !std::strcmp(_string.get_std_string().c_str(), class_name.data()) };
 
 				if (match)
 				{
@@ -873,34 +873,34 @@ namespace jni
 		std::vector<jni::string> string_keeper{};
 		string_keeper.reserve(sizeof...(args_t));
 
-		auto convert_arg = [&string_keeper](auto&& arg) 
+		auto convert_arg = [&string_keeper](auto&& arg)
 			-> jvalue
-		{
-			using raw = std::remove_cvref_t<decltype(arg)>;
+			{
+				using raw = std::remove_cvref_t<decltype(arg)>;
 
-			std::any jni_val{};
-			if constexpr (std::is_base_of_v<object, raw>)
-			{
-				jni_val = arg.get_instance(); // JNI object instance
-			}
-			else if constexpr (jni_object_ptr<raw>)
-			{
-				jni_val = arg->get_instance(); // pointer to JNI object instance
-			}
-			else if constexpr (std::is_convertible_v<raw, std::string>)
-			{
-				string_keeper.emplace_back(std::string{ arg }); // store string to keep jstring alive
-				jni_val = string_keeper.back().get_jni_string();
-			}
-			else
-			{
-				// convert C++ primitive type to JNI type
-				jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
-			}
+				std::any jni_val{};
+				if constexpr (std::is_base_of_v<object, raw>)
+				{
+					jni_val = arg.get_instance(); // JNI object instance
+				}
+				else if constexpr (jni_object_ptr<raw>)
+				{
+					jni_val = arg->get_instance(); // pointer to JNI object instance
+				}
+				else if constexpr (std::is_convertible_v<raw, std::string>)
+				{
+					string_keeper.emplace_back(std::string{ arg }); // store string to keep jstring alive
+					jni_val = string_keeper.back().get_jni_string();
+				}
+				else
+				{
+					// convert C++ primitive type to JNI type
+					jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
+				}
 
-			// convert std::any JNI value to jvalue struct
-			return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
-		};
+				// convert std::any JNI value to jvalue struct
+				return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
+			};
 
 		std::vector<jvalue> jargs{};
 		if constexpr (sizeof...(args_t) > 0)
@@ -1887,7 +1887,7 @@ namespace jni
 			@return Reference to *this
 			@note Deletes the existing global reference before creating a new one.
 		*/
-		auto operator=(const object& other) 
+		auto operator=(const object& other)
 			-> object&
 		{
 			if (this == &other)
@@ -1922,7 +1922,7 @@ namespace jni
 			@return Reference to *this
 			@note Transfers ownership and deletes the existing global reference if present.
 		*/
-		auto operator=(object&& other) noexcept 
+		auto operator=(object&& other) noexcept
 			-> object&
 		{
 			if (this == &other)
@@ -2315,7 +2315,7 @@ namespace jni
 		@details
 		- Inherits from jni::collection, providing the same to_vector() helper.
 		- No additional methods are defined beyond those inherited from collection.
-	*/	
+	*/
 	class list final : public jni::collection
 	{
 	public:
@@ -2762,7 +2762,7 @@ namespace jni
 				@note The returned pointer points directly into JVM memory and remains
 					  valid as long as the owning class is loaded in the JVM.
 			*/
-			auto get_base() const noexcept
+			auto get_base() const
 				-> void**
 			{
 				static jni::hotspot::VMTypeEntry* entry{ jni::hotspot::iterate_type_entries("ConstantPool") };
@@ -2813,7 +2813,7 @@ namespace jni
 					  valid as long as the owning class is loaded in the JVM.
 				@see constant_pool
 			*/
-			auto get_constants() const noexcept
+			auto get_constants() const
 				-> constant_pool*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_constants") };
@@ -2846,7 +2846,7 @@ namespace jni
 					  valid as long as the owning class is loaded in the JVM.
 				@see symbol, constant_pool
 			*/
-			auto get_name() const noexcept
+			auto get_name() const
 				-> symbol*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_name_index") };
@@ -2880,7 +2880,7 @@ namespace jni
 					  valid as long as the owning class is loaded in the JVM.
 				@see symbol, constant_pool
 			*/
-			auto get_signature() const noexcept
+			auto get_signature() const
 				-> symbol*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_signature_index") };
@@ -2931,11 +2931,11 @@ namespace jni
 				@note The returned pointer points directly into JVM generated code memory.
 				@see midi2i_hook, find_hook_location
 			*/
-			auto get_i2i_entry() const noexcept
+			auto get_i2i_entry() const
 				-> void*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_i2i_entry") };
-				
+
 				try
 				{
 					if (!entry)
@@ -2963,11 +2963,11 @@ namespace jni
 				an adapter stub depending on the current compilation state of the method.
 				@note The returned pointer points directly into JVM generated code memory.
 			*/
-			auto get_from_interpreted_entry() const noexcept
+			auto get_from_interpreted_entry() const
 				-> void*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_from_interpreted_entry") };
-				
+
 				try
 				{
 					if (!entry)
@@ -2996,11 +2996,11 @@ namespace jni
 				@note Modifying the returned value directly affects JVM behaviour for this method.
 				@see NO_COMPILE
 			*/
-			auto get_access_flags() const noexcept
+			auto get_access_flags() const
 				-> std::uint32_t*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_access_flags") };
-				
+
 				try
 				{
 					if (!entry)
@@ -3028,11 +3028,11 @@ namespace jni
 				@note Modifying the returned value directly affects JVM behaviour for this method.
 				@see set_dont_inline
 			*/
-			auto get_flags() const noexcept
+			auto get_flags() const
 				-> std::uint16_t*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_flags") };
-				
+
 				try
 				{
 					if (!entry)
@@ -3062,11 +3062,11 @@ namespace jni
 					  valid as long as the owning class is loaded in the JVM.
 				@see const_method
 			*/
-			auto get_const_method() const noexcept
+			auto get_const_method() const
 				-> const_method*
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_constMethod") };
-				
+
 				try
 				{
 					if (!entry)
@@ -3095,11 +3095,11 @@ namespace jni
 					  Do not store it beyond the scope of the call without copying it first.
 				@see const_method, symbol
 			*/
-			auto get_name() const noexcept
+			auto get_name() const
 				-> std::string
 			{
 				const const_method* const_method{ this->get_const_method() };
-				
+
 				try
 				{
 					if (!const_method)
@@ -3134,7 +3134,7 @@ namespace jni
 					  Do not store it beyond the scope of the call without copying it first.
 				@see const_method, symbol
 			*/
-			auto get_signature() const noexcept
+			auto get_signature() const
 				-> std::string
 			{
 				const const_method* const_method{ this->get_const_method() };
@@ -3263,27 +3263,40 @@ namespace jni
 				@brief Returns the JNIEnv associated with this thread.
 				@return Pointer to the JNIEnv for this thread, or nullptr on failure.
 				@details
-				Reads the _jni_environment field using its offset retrieved from gHotSpotVMStructs.
-				The JNIEnv is embedded directly inside the JavaThread object, so its address
-				is computed by adding the field offset to the address of this.
+				_jni_environment is not exported in gHotSpotVMStructs on this JDK version,
+				so its address cannot be retrieved directly via iterate_struct_entries.
+				However, _jni_environment is always laid out immediately after _anchor in the
+				JavaThread memory layout, separated by exactly sizeof(JavaFrameAnchor) = 32 bytes.
+				Its address is therefore computed as: &_anchor + sizeof(JavaFrameAnchor).
+				_anchor itself is exported in gHotSpotVMStructs and used as the stable anchor point
+				for this calculation, making it resilient to future shifts in the JavaThread layout
+				as long as the relative ordering of _anchor and _jni_environment is preserved.
 				@note The returned JNIEnv is only valid while this thread is attached to the JVM.
 					  It should not be used after the thread has detached or exited.
+				@note sizeof(JavaFrameAnchor) = 32 bytes on x64 HotSpot:
+					  _last_Java_sp (8) + _last_Java_pc (8) + _last_Java_fp (8) + padding (8) = 32.
 			*/
-			auto get_env() const noexcept
+			auto get_env() const
 				-> JNIEnv*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_jni_environment") };
-				
+				// _anchor is used as a stable reference point since _jni_environment is not
+				// exported in gHotSpotVMStructs on this JDK version.
+				static jni::hotspot::VMStructEntry* anchor_entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_anchor") };
+
 				try
 				{
-					if (!entry)
+					if (!anchor_entry)
 					{
-						throw jni::jni_exception{ "Failed to find JavaThread._jni_environment entry." };
+						throw jni::jni_exception{ "Failed to find JavaThread._anchor entry." };
 					}
 
-					return (JNIEnv*)((std::uint8_t*)this + entry->offset);
+					// _jni_environment immediately follows _anchor in the JavaThread layout.
+					// The offset between them is exactly sizeof(JavaFrameAnchor) = 32 bytes,
+					// which is stable across all x64 HotSpot builds.
+					static constexpr std::ptrdiff_t SIZEOF_JAVA_FRAME_ANCHOR{ 32 };
+					return (JNIEnv*)((std::uint8_t*)this + anchor_entry->offset + SIZEOF_JAVA_FRAME_ANCHOR);
 				}
-				catch(const std::exception& e)
+				catch (const std::exception& e)
 				{
 					std::println("{} java_thread.get_env() {}", jni::easy_jni_error, e.what());
 
@@ -3302,7 +3315,7 @@ namespace jni
 				@note This value may change at any time as the thread transitions between states.
 				@see java_thread_state
 			*/
-			auto get_thread_state() const noexcept
+			auto get_thread_state() const
 				-> jni::hotspot::java_thread_state
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
@@ -3336,11 +3349,11 @@ namespace jni
 						 machine and lead to undefined behaviour or JVM crashes.
 				@see java_thread_state, common_detour
 			*/
-			auto set_thread_state(const jni::hotspot::java_thread_state state) const noexcept
+			auto set_thread_state(const jni::hotspot::java_thread_state state) const
 				-> void
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
-				
+
 				try
 				{
 					if (!entry)
@@ -3365,11 +3378,11 @@ namespace jni
 				thread suspension, and asynchronous exceptions across threads.
 				@note This value may change at any time as the JVM modifies it internally.
 			*/
-			auto get_suspend_flags() const noexcept
+			auto get_suspend_flags() const
 				-> std::uint32_t
 			{
 				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_suspend_flags") };
-				
+
 				try
 				{
 					if (!entry)
@@ -3444,9 +3457,9 @@ namespace jni
 			@see match_pattern, find_hook_location
 		*/
 		inline static auto scan(
-			const std::uint8_t* start, 
-			const std::size_t range, 
-			const std::uint8_t* pattern, 
+			const std::uint8_t* start,
+			const std::size_t range,
+			const std::uint8_t* pattern,
 			const std::size_t size
 		)
 			-> std::uint8_t*
@@ -3956,60 +3969,60 @@ namespace jni
 					0x6A, 0x00,                                     // push 0x0         ; push cancel flag (bool* = false by default)
 
 					0x48, 0x89, 0xE9,                               // mov rcx, rbp     ; first argument  
-																	//					; -> frame* (rbp = current interpreter frame)
-					0x4C, 0x89, 0xFA,                               // mov rdx, r15     ; second argument 
-																	//					; -> java_thread* (r15 = current JavaThread*)
-					0x4C, 0x8D, 0x04, 0x24,                         // lea r8,  [rsp]   ; third argument  
-																	//					; -> bool* cancel (points to the 0x0 we pushed)
+					//					; -> frame* (rbp = current interpreter frame)
+0x4C, 0x89, 0xFA,                               // mov rdx, r15     ; second argument 
+//					; -> java_thread* (r15 = current JavaThread*)
+0x4C, 0x8D, 0x04, 0x24,                         // lea r8,  [rsp]   ; third argument  
+//					; -> bool* cancel (points to the 0x0 we pushed)
 
-					0x48, 0x89, 0xE5,                               // mov rbp, rsp     ; save rsp into rbp for 
-																	//					; stack restoration after the call
-					0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16     ; align rsp to 16 bytes as required 
-																	//					; by the Windows x64 ABI
-					0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20    ; allocate 32 bytes of shadow space 
-																	//					; as required by the Windows x64 ABI
+0x48, 0x89, 0xE5,                               // mov rbp, rsp     ; save rsp into rbp for 
+//					; stack restoration after the call
+0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16     ; align rsp to 16 bytes as required 
+//					; by the Windows x64 ABI
+0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20    ; allocate 32 bytes of shadow space 
+//					; as required by the Windows x64 ABI
 
-					0xFF, 0x15, 0x2D, 0x00, 0x00, 0x00,             // call [rip+0x2D]  ; call the C++ detour function via 
-																	//					; RIP-relative indirect call
+0xFF, 0x15, 0x2D, 0x00, 0x00, 0x00,             // call [rip+0x2D]  ; call the C++ detour function via 
+//					; RIP-relative indirect call
 
-					0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp from rbp 
-																	//					; (undo alignment and shadow space)
+0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp from rbp 
+//					; (undo alignment and shadow space)
 
-					0x58,                                           // pop rax          ; rax = cancel flag value 
-																	//					; (0x0 = do not cancel, non-zero = cancel)
-					0x48, 0x83, 0xF8, 0x00,                         // cmp rax, 0x0     ; check if the detour requested cancellation
+0x58,                                           // pop rax          ; rax = cancel flag value 
+//					; (0x0 = do not cancel, non-zero = cancel)
+0x48, 0x83, 0xF8, 0x00,                         // cmp rax, 0x0     ; check if the detour requested cancellation
 
-					0x5D,                                           // pop rbp          ; restore rbp (frame base pointer)
-					0x41, 0x5B,                                     // pop r11          ; restore r11
-					0x41, 0x5A,                                     // pop r10          ; restore r10
-					0x41, 0x59,                                     // pop r9           ; restore r9
-					0x41, 0x58,                                     // pop r8           ; restore r8
-					0x5A,                                           // pop rdx          ; restore rdx
-					0x59,                                           // pop rcx          ; restore rcx
-					0x58,                                           // pop rax          ; restore rax
+0x5D,                                           // pop rbp          ; restore rbp (frame base pointer)
+0x41, 0x5B,                                     // pop r11          ; restore r11
+0x41, 0x5A,                                     // pop r10          ; restore r10
+0x41, 0x59,                                     // pop r9           ; restore r9
+0x41, 0x58,                                     // pop r8           ; restore r8
+0x5A,                                           // pop rdx          ; restore rdx
+0x59,                                           // pop rcx          ; restore rcx
+0x58,                                           // pop rax          ; restore rax
 
-					0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je 0x????????    ; if cancel flag was set -> jump to the 
-																	//					; return path (offset patched at runtime)
+0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je 0x????????    ; if cancel flag was set -> jump to the 
+//					; return path (offset patched at runtime)
 
-					// cancel path: the detour requested early return, rax holds the custom return value
-					0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax   ; move rax into xmm0 for floating point 
-																	//					; return value compatibility
-					0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8] ; restore rbx from the interpreter frame
-					0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp to the interpreter frame base
-					0x5D,                                           // pop rbp          ; restore rbp (caller frame base pointer)
-					0x5E,                                           // pop rsi          ; restore rsi (interpreter state pointer)
-					0x48, 0x89, 0xDC,                               // mov rsp, rbx     ; restore rsp to the caller stack pointer
-					0xFF, 0xE6,                                     // jmp rsi          ; jump to the return address saved in rsi
+// cancel path: the detour requested early return, rax holds the custom return value
+0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax   ; move rax into xmm0 for floating point 
+//					; return value compatibility
+0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8] ; restore rbx from the interpreter frame
+0x48, 0x89, 0xEC,                               // mov rsp, rbp     ; restore rsp to the interpreter frame base
+0x5D,                                           // pop rbp          ; restore rbp (caller frame base pointer)
+0x5E,                                           // pop rsi          ; restore rsi (interpreter state pointer)
+0x48, 0x89, 0xDC,                               // mov rsp, rbx     ; restore rsp to the caller stack pointer
+0xFF, 0xE6,                                     // jmp rsi          ; jump to the return address saved in rsi
 
-					// data slot: 8-byte address of the C++ detour function, written at construction time
-					0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // .quad 0x0        ; detour function pointer (patched at runtime)
+// data slot: 8-byte address of the C++ detour function, written at construction time
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // .quad 0x0        ; detour function pointer (patched at runtime)
 				};
 
 				// Allocate a block of memory near the target within 32-bit relative JMP range,
 				// large enough to hold both the saved original bytes and the trampoline assembly.
 				// PAGE_EXECUTE_READWRITE is required at this stage to allow writing the stub contents.
 				this->allocated = allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
-				
+
 				try
 				{
 					if (!this->allocated)
@@ -4244,24 +4257,8 @@ namespace jni
 		static auto common_detour(jni::hotspot::frame* f, jni::hotspot::java_thread* thread, bool* cancel)
 			-> void
 		{
-			// Cached VMStructEntry pointers for JavaThread._jni_environment and JavaThread._thread_state,
-			// resolved once on first call and reused on all subsequent calls to avoid repeated
-			// linear scans of gHotSpotVMStructs on every intercepted method invocation.
-			static jni::hotspot::VMStructEntry* jni_env_entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_jni_environment") };
-			static jni::hotspot::VMStructEntry* thread_state_entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
-
 			try
 			{
-				if (!jni_env_entry)
-				{
-					throw jni::jni_exception{ "Failed to find JavaThread._jni_environment entry." };
-				}
-
-				if (!thread_state_entry)
-				{
-					throw jni::jni_exception{ "Failed to find JavaThread._thread_state entry." };
-				}
-
 				// Verify that the JavaThread pointer itself is valid before dereferencing any of its fields.
 				// A null thread pointer indicates the trampoline fired in an unexpected context.
 				if (!thread)
@@ -4518,26 +4515,6 @@ namespace jni
 				throw jni::jni_exception{ std::format("Failed to retrieve access flags.") };
 			}
 			*flags |= jni::hotspot::NO_COMPILE;
-
-			// Force a JVMTI class retransformation to invalidate and flush any existing compiled
-			// code for this method. This ensures the interpreter will be used for all future
-			// invocations, making the i2i hook the reliable interception point.
-			jclass owner{ nullptr };
-			if (const jint get_method_result{ jni::jvmti->GetMethodDeclaringClass(method_id, &owner) }; get_method_result != JVMTI_ERROR_NONE)
-			{
-				throw jni::jni_exception{ 
-					std::format("Failed to get declaring class with error {}.", static_cast<std::int32_t>(get_method_result)) 
-				};
-			}
-
-			if (const jint retransform_result{ jni::jvmti->RetransformClasses(1, &owner) }; retransform_result != JVMTI_ERROR_NONE)
-			{
-				jni::get_env()->DeleteLocalRef(owner);
-				throw jni::jni_exception{ 
-					std::format("JVMTI RetransformClasses failed with error {}.", static_cast<std::int32_t>(retransform_result)) 
-				};
-			}
-			jni::get_env()->DeleteLocalRef(owner);
 
 			// Re-dereference the jmethodID after retransformation since the Method pointer
 			// may have changed if HotSpot reallocated the Method object during retransformation.
