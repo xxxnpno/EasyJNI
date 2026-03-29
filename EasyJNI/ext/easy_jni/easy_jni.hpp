@@ -105,19 +105,112 @@ namespace jni
 	*/
 
 	class string;
+
 	class jni_exception;
+
 	class object;
 
-	auto get_env() 
+	auto get_env()
 		-> JNIEnv*;
 
-	auto shutdown_hooks() 
+	auto shutdown_hooks()
 		-> void;
 
 	namespace hotspot
-	{ 
+	{
 		struct method;
 	}
+
+	/*
+		@brief Helpers and concepts for compile-time type checking in EasyJNI.
+		@details
+		These templates and concepts are used to constrain template parameters
+		for methods, fields, and arguments, ensuring only supported JNI/C++ types
+		are allowed.
+	*/
+
+	/*
+		@brief Helper to unwrap unique_ptr to underlying JNI object type.
+		@tparam T The type to unwrap
+		@note If T is a std::unique_ptr to a class derived from object, extracts the underlying type.
+	*/
+	template<typename T>
+	struct unwrap_object_ptr { using type = T; };
+
+	template<typename T>
+		requires (std::is_base_of_v<object, T>)
+	struct unwrap_object_ptr<std::unique_ptr<T>> { using type = T; };
+
+	/*
+		@brief Concept for standard C++ types supported by JNI.
+		@tparam T The type to check
+	*/
+	template<typename T>
+	concept std_type =
+		std::is_same_v<T, short> ||
+		std::is_same_v<T, int> ||
+		std::is_same_v<T, long long> ||
+		std::is_same_v<T, float> ||
+		std::is_same_v<T, double> ||
+		std::is_same_v<T, bool> ||
+		std::is_same_v<T, char> ||
+		std::is_same_v<T, std::byte> ||
+		std::is_same_v<T, std::string> ||
+		std::is_same_v<T, void>;
+
+	/*
+		@brief Concept for JNI objects.
+		@tparam T The type to check
+		@note T must derive from object
+	*/
+	template<typename T>
+	concept jni_object = std::is_base_of_v<object, T>;
+
+	/*
+		@brief Concept for pointers to JNI objects.
+		@tparam T The type to check
+		@note Unwraps unique_ptr and checks if underlying type is a JNI object
+	*/
+	template<typename T>
+	concept jni_object_ptr = jni_object<typename unwrap_object_ptr<T>::type>
+		&& !jni_object<T>;
+
+	/*
+		@brief Concept for valid method return types.
+		@tparam T The type to check
+		@note Must be a standard type, JNI object, or jobjectArray
+	*/
+	template<typename T>
+	concept method_return = std_type<T> || jni_object<T> || std::is_same_v<T, jobjectArray>;
+
+	/*
+		@brief Concept for valid field types.
+		@tparam T The type to check
+		@note Must be a standard type or JNI object
+	*/
+	template<typename T>
+	concept field_type_c = std_type<T> || jni_object<T>;
+
+	/*
+		@brief Concept for valid callable argument types.
+		@tparam T The type to check
+		@note Can be std_type, JNI object, pointer to JNI object, or convertible to std::string
+	*/
+	template<typename T>
+	concept callable_arg = std_type<std::remove_cvref_t<T>>
+		|| jni_object<std::remove_cvref_t<T>>
+		|| jni_object_ptr<std::remove_cvref_t<T>>
+		|| std::is_convertible_v<std::remove_cvref_t<T>, std::string>;
+
+	/*
+		Forward Declarations.
+	*/
+
+	template <field_type_c type>
+	class field;
+
+	template <method_return return_type>
+	class method;
 
 	/*
 		@brief Custom exception for JNI errors.
@@ -719,87 +812,6 @@ namespace jni
 	};
 
 	/*
-		@brief Helpers and concepts for compile-time type checking in EasyJNI.
-		@details
-		These templates and concepts are used to constrain template parameters
-		for methods, fields, and arguments, ensuring only supported JNI/C++ types
-		are allowed.
-	*/
-
-	/*
-		@brief Helper to unwrap unique_ptr to underlying JNI object type.
-		@tparam T The type to unwrap
-		@note If T is a std::unique_ptr to a class derived from object, extracts the underlying type.
-	*/
-	template<typename T>
-	struct unwrap_object_ptr { using type = T; };
-
-	template<typename T>
-		requires (std::is_base_of_v<object, T>)
-	struct unwrap_object_ptr<std::unique_ptr<T>> { using type = T; };
-
-	/*
-		@brief Concept for standard C++ types supported by JNI.
-		@tparam T The type to check
-	*/
-	template<typename T>
-	concept std_type =
-		std::is_same_v<T, short> ||
-		std::is_same_v<T, int> ||
-		std::is_same_v<T, long long> ||
-		std::is_same_v<T, float> ||
-		std::is_same_v<T, double> ||
-		std::is_same_v<T, bool> ||
-		std::is_same_v<T, char> ||
-		std::is_same_v<T, std::byte> ||
-		std::is_same_v<T, std::string> ||
-		std::is_same_v<T, void>;
-
-	/*
-		@brief Concept for JNI objects.
-		@tparam T The type to check
-		@note T must derive from object
-	*/
-	template<typename T>
-	concept jni_object = std::is_base_of_v<object, T>;
-
-	/*
-		@brief Concept for pointers to JNI objects.
-		@tparam T The type to check
-		@note Unwraps unique_ptr and checks if underlying type is a JNI object
-	*/
-	template<typename T>
-	concept jni_object_ptr = jni_object<typename unwrap_object_ptr<T>::type>
-		&& !jni_object<T>;
-
-	/*
-		@brief Concept for valid method return types.
-		@tparam T The type to check
-		@note Must be a standard type, JNI object, or jobjectArray
-	*/
-	template<typename T>
-	concept method_return = std_type<T> || jni_object<T> || std::is_same_v<T, jobjectArray>;
-
-	/*
-		@brief Concept for valid field types.
-		@tparam T The type to check
-		@note Must be a standard type or JNI object
-	*/
-	template<typename T>
-	concept field_type_c = std_type<T> || jni_object<T>;
-
-	/*
-		@brief Concept for valid callable argument types.
-		@tparam T The type to check
-		@note Can be std_type, JNI object, pointer to JNI object, or convertible to std::string
-	*/
-	template<typename T>
-	concept callable_arg = std_type<std::remove_cvref_t<T>>
-		|| jni_object<std::remove_cvref_t<T>>
-		|| jni_object_ptr<std::remove_cvref_t<T>>
-		|| std::is_convertible_v<std::remove_cvref_t<T>, std::string>;
-
-	/*
 		@brief Maps C++ type_index to the JNI class signature.
 		@details
 		Used to determine the Java type signature corresponding to a given C++ type.
@@ -890,7 +902,18 @@ namespace jni
 		}
 	}
 
-	// helper function to transform args_t&&... args into a vector of jvalues
+	/*
+		@brief Converts a pack of C++ arguments into JNI jvalues for method calls.
+		@tparam args_t Variadic template arguments constrained by `callable_arg`
+		@param args The arguments to convert
+		@return A pair containing:
+			- std::vector<jvalue>: converted JNI arguments ready for method calls
+			- std::vector<jni::string>: temporary string holders to keep JNI strings alive
+		@details
+		- Handles standard C++ types, JNI objects, pointers to JNI objects, and types convertible to std::string.
+		- Keeps jni::string instances alive in `string_keeper` to prevent dangling jstring references.
+		- Uses `cpp_to_jni` and `jni_to_jvalue` maps for primitive type conversions.
+	*/
 	template<callable_arg... args_t>
 	static auto build_jargs(args_t&&... args)
 		-> std::pair<std::vector<jvalue>, std::vector<jni::string>>
@@ -898,29 +921,32 @@ namespace jni
 		std::vector<jni::string> string_keeper{};
 		string_keeper.reserve(sizeof...(args_t));
 
-		auto convert_arg = [&string_keeper](auto&& arg) -> jvalue
+		auto convert_arg = [&string_keeper](auto&& arg) 
+			-> jvalue
 		{
 			using raw = std::remove_cvref_t<decltype(arg)>;
 
 			std::any jni_val{};
 			if constexpr (std::is_base_of_v<object, raw>)
 			{
-				jni_val = arg.get_instance();
+				jni_val = arg.get_instance(); // JNI object instance
 			}
 			else if constexpr (jni_object_ptr<raw>)
 			{
-				jni_val = arg->get_instance();
+				jni_val = arg->get_instance(); // pointer to JNI object instance
 			}
 			else if constexpr (std::is_convertible_v<raw, std::string>)
 			{
-				string_keeper.emplace_back(std::string{ arg });
+				string_keeper.emplace_back(std::string{ arg }); // store string to keep jstring alive
 				jni_val = string_keeper.back().get_jni_string();
 			}
 			else
 			{
+				// convert C++ primitive type to JNI type
 				jni_val = jni::cpp_to_jni.at(std::type_index{ typeid(raw) })(arg);
 			}
 
+			// convert std::any JNI value to jvalue struct
 			return jni::jni_to_jvalue.at(std::type_index{ jni_val.type() })(jni_val);
 		};
 
@@ -933,23 +959,46 @@ namespace jni
 		return { std::move(jargs), std::move(string_keeper) };
 	}
 
-	// associates type_index of a cpp class with the map of its fieldIDs
+	/*
+		@brief Maps a C++ class type to its Java field IDs.
+		@details
+		The outer map keys are C++ type_index values (unique per type),
+		the inner map associates field names (std::string) to their corresponding JNI jfieldID.
+		This allows quick lookup of field IDs for both instance and static fields.
+	*/
 	inline std::unordered_map<std::type_index, std::unordered_map<std::string, jfieldID>> field_ids{};
 
-	// used to know if a field is static or not
+	/*
+		@brief Enum to indicate whether a Java field is static or not.
+	*/
 	enum class field_type : std::int8_t
 	{
 		STATIC,
 		NOT_STATIC
 	};
 
-	// used to represent a field and to get and set the field
-	// should not be used outside of this header
+	/*
+		@brief Represents a Java field and provides get/set access from C++.
+		@tparam type The C++ type corresponding to the Java field type (primitive, object, string, etc.)
+		@details
+		- Supports static and instance fields.
+		- Supports primitive types (short, int, long long, float, double, bool, char, std::byte) and std::string.
+		- Supports JNI objects derived from `jni::object` (wrapped in std::unique_ptr when returned).
+		- Uses `jni::field_ids` to cache jfieldID for fast access.
+		- Should not be used outside this header.
+	*/
 	template <field_type_c type>
 	class field final
 	{
 	public:
-		field(void* class_or_instance, const std::string& name, const jni::field_type field_type, const std::type_index index)
+		/*
+			@brief Constructs a field object.
+			@param class_or_instance Pointer to the Java class (for static) or instance (for instance fields)
+			@param name Field name as a string
+			@param field_type Indicates whether the field is static or instance
+			@param index type_index of the C++ class owning the field (used for lookup in field_ids)
+		*/
+		field(void* class_or_instance, const std::string_view name, const jni::field_type field_type, const std::type_index index)
 			: class_or_instance{ class_or_instance }
 			, name{ name }
 			, index{ index }
@@ -958,7 +1007,13 @@ namespace jni
 
 		}
 
-		// gets the field value
+		/*
+			@brief Gets the value of the field.
+			@return For primitive types, returns the value.
+					For JNI objects, returns std::unique_ptr<type>.
+			@throws std::runtime_error if the field ID cannot be found.
+			@details Handles static and instance fields appropriately.
+		*/
 		auto get() const
 			-> std::conditional_t<std::is_base_of_v<object, type>, std::unique_ptr<type>, type>
 		{
@@ -969,12 +1024,12 @@ namespace jni
 
 				if (it == inner_map.end())
 				{
-					throw std::runtime_error{ std::format("Field ID not found for {}.", this->name) };
+					throw jni::jni_exception{ "Field ID not found." };
 				}
 
 				const jfieldID field_id{ it->second };
 
-				jobject local{};
+				jobject local{ nullptr };
 				if constexpr (std::is_base_of_v<object, type>)
 				{
 					if (this->field_type == jni::field_type::NOT_STATIC)
@@ -1177,7 +1232,7 @@ namespace jni
 			}
 			catch (const std::exception& e)
 			{
-				std::println("[ERROR] get() {}", e.what());
+				std::println("{} jni::field.get() for {}: {}", jni::easy_jni_error, this->name, e.what());
 
 				if constexpr (std::is_base_of_v<object, type>)
 				{
@@ -1190,8 +1245,12 @@ namespace jni
 			}
 		}
 
-		// set the field value
-		// pass primitive types and unique ptrs, do not pass the jobject directly
+		/*
+			@brief Sets the value of the field.
+			@param value Value to set (primitive or unique_ptr for objects)
+			@details Handles static and instance fields appropriately.
+					 Converts C++ types to JNI types where necessary.
+		*/
 		auto set(const type& value) const
 			-> void
 		{
@@ -1202,7 +1261,7 @@ namespace jni
 
 				if (it == inner_map.end())
 				{
-					throw std::runtime_error{ std::format("Field ID not found for {}.", this->name) };
+					throw jni::jni_exception{ "Field ID not found." };
 				}
 
 				const jfieldID field_id{ it->second };
@@ -1401,44 +1460,93 @@ namespace jni
 			}
 			catch (const std::exception& e)
 			{
-				std::println("[ERROR] set() {}", e.what());
+				std::println("{} jni::field.set() for {}: {}", jni::easy_jni_error, this->name, e.what());
+				return;
 			}
 		}
 
 	private:
-		// stores the class or instance pointer depending on if the field is static or not,
-		// to prevent having to pass it every time we want to get or set the field
+		/*
+			@brief Stores the class pointer (for static) or instance pointer (for instance fields)
+			to avoid passing it for every get/set call.
+		*/
 		void* class_or_instance;
 
+		/*
+			@brief Name of the Java field
+		*/
 		std::string name;
 
+		/*
+			@brief type_index of the C++ class owning this field
+		*/
 		std::type_index index;
 
+		/*
+			@brief Indicates if the field is static or instance
+		*/
 		field_type field_type;
 	};
 
-	struct cached_method 
+	/*
+		@brief Stores a cached method ID and its optional JVMTI method pointer.
+	*/
+	struct cached_method
 	{
+		/*
+			@brief JNI method ID
+		*/
 		jmethodID id;
+
+		/*
+			@brief Optional pointer to the JVMTI method structure
+			@details Used for HotSpot-specific introspection or profiling
+		*/
 		jni::hotspot::method* ptr;
 	};
 
+	/*
+		@brief Maps C++ class types to their Java method IDs.
+		@details
+		- First key: std::type_index of the C++ class
+		- Second key: method name as string
+		- Value: cached_method containing JNI method ID and optional JVMTI pointer
+		- Speeds up repeated calls by avoiding repeated GetMethodID/GetStaticMethodID calls
+	*/
 	inline std::unordered_map<std::type_index, std::unordered_map<std::string, jni::cached_method>> method_ids{};
 
-	// used to know if a method is static or not
+	/*
+		@brief Specifies whether a Java method is static or an instance method.
+	*/
 	enum class method_type : std::uint8_t
 	{
 		STATIC,
 		NOT_STATIC
 	};
 
-	// used to represent a method and to call the method
-	// should not be used outside of this header
+	/*
+		@brief Represents a Java method and provides call access from C++.
+		@tparam return_type The C++ type corresponding to the Java method's return type (primitive, object, string, void, etc.)
+		@details
+		- Supports static and instance methods.
+		- Supports all primitive return types (short, int, long long, float, double, bool, char, std::byte),
+		  std::string, jobjectArray, and JNI objects derived from `jni::object` (wrapped in std::unique_ptr when returned).
+		- Uses `jni::method_ids` to cache jmethodID for fast repeated calls.
+		- Arguments are passed as C++ types and converted to JNI jvalue array via `jni::build_jargs`.
+		- Should not be used outside this header.
+	*/
 	template <method_return return_type>
 	class method final
 	{
 	public:
-		method(void* class_or_instance, const std::string& name, const jni::method_type method_type, const std::type_index index)
+		/*
+			@brief Constructs a method object.
+			@param class_or_instance Pointer to the Java class (for static) or instance (for instance methods)
+			@param name Method name as a string
+			@param method_type Indicates whether the method is static or instance
+			@param index type_index of the C++ class owning the method (used for lookup in method_ids)
+		*/
+		method(void* class_or_instance, const std::string_view name, const jni::method_type method_type, const std::type_index index)
 			: class_or_instance{ class_or_instance }
 			, name{ name }
 			, index{ index }
@@ -1447,8 +1555,21 @@ namespace jni
 
 		}
 
-		// call the method with the given arguments
-		// pass primitive types and unique ptrs, do not pass the jobject directly
+		/*
+			@brief Calls the Java method with the given arguments.
+			@tparam args_t Variadic template arguments constrained by `callable_arg`
+			@param args Arguments to pass to the method (primitives or unique_ptr to JNI objects)
+			@return For primitive types, returns the value directly.
+					For JNI objects, returns std::unique_ptr<return_type>.
+					For void methods, returns nothing.
+			@throws std::runtime_error if the method ID cannot be found.
+			@details
+			- Converts C++ arguments to JNI jvalue array via `jni::build_jargs`.
+			- Dispatches to the appropriate JNI call (CallXxxMethodA or CallStaticXxxMethodA)
+			  depending on the return type and whether the method is static.
+			- On exception, returns a default-constructed value or nullptr unique_ptr.
+			@note Do not pass jobject directly, pass primitive types or unique_ptr to JNI objects.
+		*/
 		template<callable_arg... args_t>
 		auto call(args_t&&... args) const
 			-> std::conditional_t<std::is_base_of_v<object, return_type>, std::unique_ptr<return_type>, return_type>
@@ -1460,7 +1581,7 @@ namespace jni
 
 				if (it == inner_map.end())
 				{
-					throw std::runtime_error{ std::format("Method ID not found for {}.", this->name) };
+					throw jni::jni_exception{ "Method ID not found." };
 				}
 
 				const jmethodID method_id{ it->second.id };
@@ -1730,7 +1851,7 @@ namespace jni
 			}
 			catch (const std::exception& e)
 			{
-				std::println("[ERROR] call() {}", e.what());
+				std::println("{} jni::method.call() for {}: {}", jni::easy_jni_error, this->name, e.what());
 
 				if constexpr (std::is_same_v<return_type, void>)
 				{
@@ -1748,37 +1869,72 @@ namespace jni
 		}
 
 	private:
-		// store the class or instance pointer depending on if the method is static or not, to prevent having to pass it every time we want to call the method
+		/*
+			@brief Stores the class pointer (for static) or instance pointer (for instance methods)
+			to avoid passing it on every call.
+		*/
 		void* class_or_instance;
 
+		/*
+			@brief Name of the Java method.
+		*/
 		std::string name;
 
+		/*
+			@brief type_index of the C++ class owning this method.
+		*/
 		std::type_index index;
 
+		/*
+			@brief Indicates if the method is static or instance.
+		*/
 		method_type method_type;
 	};
 
-	// used to represent a java object and to get and set its fields and call its methods
-	// stores the jobject as a global reference to prevent it from being garbage collected while we are using it
-	// inherit from this class to create a wrapper for a java class
+	/*
+		@brief Base class representing a Java object accessible from C++.
+		@details
+		- Wraps a jobject as a global JNI reference to prevent it from being
+		  garbage collected while the C++ object is alive.
+		- Inherit from this class to create a typed wrapper for a Java class.
+		- Provides access to fields via `get_field` and methods via `get_method`,
+		  which cache their respective IDs for fast repeated use.
+		- The wrapped instance may be nullptr if the Java object is also null in the JVM.
+		- All copies create a new independent global reference; moves transfer ownership.
+	*/
 	class object
 	{
 	public:
-		// you can pass a nullptr and it will store it
-		// used for constructors or for object that are null in the jvm
+		/*
+			@brief Constructs an object from a jobject.
+			@param instance The Java object to wrap (may be nullptr)
+			@note Creates a global JNI reference to prevent garbage collection.
+				  If nullptr is passed, no global reference is created.
+		*/
 		explicit object(const jobject instance = nullptr)
-			// create a global reference of the jobject that is how every jobjects are managed 
+			// Create a global reference of the jobject that is how every jobjects are managed
 			: instance{ instance ? jni::get_env()->NewGlobalRef(instance) : nullptr }
 		{
 
 		}
 
+		/*
+			@brief Copy constructor.
+			@param other Another object instance to copy from
+			@note Creates a new independent global reference for the copy.
+		*/
 		object(const object& other)
 			: instance{ other.instance ? jni::get_env()->NewGlobalRef(other.instance) : nullptr }
 		{
 
 		}
 
+		/*
+			@brief Copy assignment operator.
+			@param other Another object instance to copy from
+			@return Reference to *this
+			@note Deletes the existing global reference before creating a new one.
+		*/
 		auto operator=(const object& other) 
 			-> object&
 		{
@@ -1797,13 +1953,23 @@ namespace jni
 			return *this;
 		}
 
+		/*
+			@brief Move constructor.
+			@param other Another object instance to move from
+			@note Transfers ownership of the global reference without creating a new one.
+		*/
 		object(object&& other) noexcept
 			: instance{ other.instance }
 		{
 			other.instance = nullptr;
 		}
 
-		// move assignment
+		/*
+			@brief Move assignment operator.
+			@param other Another object instance to move from
+			@return Reference to *this
+			@note Transfers ownership and deletes the existing global reference if present.
+		*/
 		auto operator=(object&& other) noexcept 
 			-> object&
 		{
@@ -1823,6 +1989,10 @@ namespace jni
 			return *this;
 		}
 
+		/*
+			@brief Destructor.
+			@note Deletes the JNI global reference if one was created.
+		*/
 		virtual ~object() noexcept
 		{
 			if (this->instance)
@@ -1832,23 +2002,33 @@ namespace jni
 			}
 		}
 
-		// obtains a wrapped field that you can get or set
+		/*
+			@brief Retrieves a wrapped field that can be read or written.
+			@tparam type The C++ type corresponding to the Java field type (must satisfy field_type_c)
+			@param field_name Name of the Java field
+			@param field_type Indicates whether the field is static or instance (default: NOT_STATIC)
+			@return A unique_ptr to a field<type> allowing get/set access.
+					On failure, returns a field wrapping a nullptr instance.
+			@throws std::runtime_error if the class is not registered or the instance is null
+				  for a non-static field.
+			@note Caches the jfieldID on first call for fast repeated access.
+		*/
 		template<field_type_c type>
 		auto get_field(const std::string& field_name, const jni::field_type field_type = jni::field_type::NOT_STATIC) const
 			-> std::unique_ptr<field<type>>
 		{
+			const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
+
 			try
 			{
-				const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
-
 				if (!clazz)
 				{
-					throw std::runtime_error{ std::format("Class not found for {}.", field_name) };
+					throw jni::jni_exception{ "Class not found." };
 				}
 
 				if (!this->instance && field_type == jni::field_type::NOT_STATIC)
 				{
-					throw std::runtime_error{ std::format("Instance is null for {}.", field_name) };
+					throw jni::jni_exception{ "Instance is null." };
 				}
 
 				this->register_field_id<type>(clazz, field_name, field_type, std::type_index{ typeid(*this) });
@@ -1862,28 +2042,41 @@ namespace jni
 			}
 			catch (const std::exception& e)
 			{
-				std::println("[ERROR] get_field() {}", e.what());
+				std::println("{} jni::object.get_field() for {}: {}", jni::easy_jni_error, field_name, e.what());
+
 				return std::make_unique<field<type>>(nullptr, field_name, field_type, std::type_index{ typeid(*this) });
 			}
 		}
 
-		// obtains a wrapped method that you can call
+		/*
+			@brief Retrieves a wrapped method that can be called.
+			@tparam return_type The C++ return type of the Java method (must satisfy method_return)
+			@tparam args_t The C++ types of the method's parameters (must satisfy callable_arg)
+			@param method_name Name of the Java method
+			@param method_type Indicates whether the method is static or instance (default: NOT_STATIC)
+			@return A unique_ptr to a method<return_type> allowing call access.
+					On failure, returns a method wrapping a nullptr instance.
+			@throws std::runtime_error if the class is not registered or the instance is null
+					for a non-static method.
+			@note Caches the jmethodID on first call for fast repeated access.
+				  The method signature is derived automatically from the template parameters.
+		*/
 		template<method_return return_type, callable_arg... args_t>
 		auto get_method(const std::string& method_name, const jni::method_type method_type = jni::method_type::NOT_STATIC) const
 			-> std::unique_ptr<method<return_type>>
 		{
+			const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
+
 			try
 			{
-				const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(*this) })) };
-
 				if (!clazz)
 				{
-					throw std::runtime_error{ std::format("Class not found for {}.", method_name) };
+					throw jni::jni_exception{ "Class not found." };
 				}
 
 				if (!this->instance && method_type == jni::method_type::NOT_STATIC)
 				{
-					throw std::runtime_error{ std::format("Instance is null for {}.", method_name) };
+					throw jni::jni_exception{ "Instance is null." };
 				}
 
 				this->register_method_id<return_type, args_t...>(clazz, method_name, method_type, std::type_index{ typeid(*this) });
@@ -1897,12 +2090,19 @@ namespace jni
 			}
 			catch (const std::exception& e)
 			{
-				std::println("[ERROR] get_method() {}", e.what());
+				std::println("{} jni::object.get_method() for {}: {}", jni::easy_jni_error, method_name, e.what());
+
 				return std::make_unique<method<return_type>>(nullptr, method_name, method_type, std::type_index{ typeid(*this) });
 			}
 		}
 
-		// unique pointers are never nullptr but the instance might be nullptr if the object is also null in the jvm
+		/*
+			@brief Returns the underlying JNI global reference.
+			@return The wrapped jobject, or nullptr if the Java object is null.
+			@note The returned jobject remains valid as long as this object is alive.
+				Unique pointers to object are never nullptr, but the instance they
+				wrap may be nullptr if the Java object is null in the JVM.
+		*/
 		inline auto get_instance() const noexcept
 			-> jobject
 		{
@@ -1910,27 +2110,40 @@ namespace jni
 		}
 
 	protected:
+		/*
+			@brief The JNI global reference to the wrapped Java object.
+			@note Managed exclusively by this class — do not delete manually.
+		*/
 		jobject instance;
 
 	private:
-		// obtains the jfieldID of a field
+		/*
+			@brief Looks up or registers the jfieldID for a given field.
+			@tparam type The C++ type of the field (must satisfy field_type_c)
+			@param clazz The jclass of the owning Java class
+			@param field_name Name of the Java field
+			@param field_type Indicates whether the field is static or instance
+			@param index type_index of the C++ class owning the field
+			@note Skips registration if the ID is already cached in jni::field_ids.
+				  The JNI signature is derived automatically from the type template parameter.
+		*/
 		template<field_type_c type>
 		auto register_field_id(const jclass clazz, const std::string& field_name, const jni::field_type field_type, const std::type_index index) const
 			-> void
 		{
+			if (jni::field_ids[std::type_index{ index }].find(field_name)
+				!= jni::field_ids[std::type_index{ index }].end())
+			{
+				return;
+			}
+
+			const std::string& signature{ jni::get_signature<type>() };
+
 			try
 			{
-				if (jni::field_ids[std::type_index{ index }].find(field_name)
-					!= jni::field_ids[std::type_index{ index }].end())
-				{
-					return;
-				}
-
-				const std::string& signature{ jni::get_signature<type>() };
-
 				if (signature.empty())
 				{
-					throw std::runtime_error{ std::format("Failed to get signature for {}.", field_name) };
+					throw jni::jni_exception{ "Failed to get signature." };
 				}
 
 				jfieldID field_id{};
@@ -1945,7 +2158,7 @@ namespace jni
 
 				if (!field_id)
 				{
-					throw std::runtime_error{ std::format("Failed to get field id for {}.", field_name) };
+					throw jni::jni_exception{ "Failed to get field id." };
 				}
 
 				jni::field_ids[std::type_index{ index }].insert(
@@ -1954,36 +2167,49 @@ namespace jni
 			}
 			catch (const std::exception& e)
 			{
-				std::println("[ERROR] register_field_id() {}", e.what());
+				std::println("{} jni::object.register_field_id() for {}: {}", jni::easy_jni_error, field_name, e.what());
+				return;
 			}
 		}
 
-		// obtains the jmethodID of a method
+		/*
+			@brief Looks up or registers the jmethodID for a given method.
+			@tparam return_type The C++ return type of the method (must satisfy method_return)
+			@tparam args_t The C++ parameter types of the method (must satisfy callable_arg)
+			@param clazz The jclass of the owning Java class
+			@param method_name Name of the Java method
+			@param method_type Indicates whether the method is static or instance
+			@param index type_index of the C++ class owning the method
+			@note Skips registration if the ID is already cached in jni::method_ids,
+				  unless the underlying HotSpot method pointer has changed (e.g. after
+				  class redefinition), in which case the cached ID is invalidated and refreshed.
+				  The JNI signature is built automatically from the template parameters.
+		*/
 		template<method_return return_type, callable_arg... args_t>
 		auto register_method_id(const jclass clazz, const std::string& method_name, const jni::method_type method_type, const std::type_index index = typeid(*this)) const
 			-> void
 		{
+			auto& inner{ jni::method_ids[std::type_index{ index }] };
+			if (auto it{ inner.find(method_name) }; it != inner.end())
+			{
+				hotspot::method* current = *(hotspot::method**)it->second.id;
+				if (current == it->second.ptr)
+				{
+					return;
+				}
+				inner.erase(it);
+			}
+
+			std::string params_sig{};
+			((params_sig += jni::get_signature<std::remove_cvref_t<args_t>>()), ...);
+
+			const std::string signature{ std::format("({}){}", params_sig, jni::get_signature<return_type>()) };
+
 			try
 			{
-				auto& inner{ jni::method_ids[std::type_index{ index }] };
-				if (auto it{ inner.find(method_name) }; it != inner.end())
-				{
-					hotspot::method* current = *(hotspot::method**)it->second.id;
-					if (current == it->second.ptr)
-					{
-						return;
-					}
-					inner.erase(it);
-				}
-
-				std::string params_sig{};
-				((params_sig += jni::get_signature<std::remove_cvref_t<args_t>>()), ...);
-
-				const std::string signature{ std::format("({}){}", params_sig, jni::get_signature<return_type>()) };
-
 				if (signature.empty())
 				{
-					throw std::runtime_error{ std::format("Failed to get signature for {}.", method_name) };
+					throw jni::jni_exception{ "Failed to get signature." };
 				}
 
 				jmethodID method_id{};
@@ -1998,7 +2224,7 @@ namespace jni
 
 				if (!method_id)
 				{
-					throw std::runtime_error{ std::format("Failed to get method id for {}.", method_name) };
+					throw jni::jni_exception{ "Failed to get method id." };
 				}
 
 				inner.insert({
@@ -2008,30 +2234,60 @@ namespace jni
 			}
 			catch (const std::exception& e)
 			{
-				std::println("[ERROR] register_method_id() {}", e.what());
+				std::println("{} jni::object.register_field_id() for {}: {}", jni::easy_jni_error, method_name, e.what());
+				return;
 			}
 		}
 
-		// friend function to use NewObject from the jni api
+		/*
+			@brief Grants make_unique<> access to NewObjectA for constructor calls.
+			@see jni::make_unique
+		*/
 		template<jni_object type, callable_arg... args_t>
 		friend auto make_unique(args_t&&... args)
 			-> std::unique_ptr<type>;
 	};
 
 	/*
-		java data structure helpers
+		Java data structure helpers.
 	*/
 
-	// own wrapper of java Collection, you can override it if you really need
+	/*
+		@brief Wrapper for the Java Collection interface.
+		@details
+		- Inherits from jni::object and adds a helper to convert the collection
+		  to a C++ std::vector.
+		- Can be inherited to add more specific methods for a given collection type.
+		- The wrapped instance may be nullptr if the Java object is also null in the JVM.
+	*/
 	class collection : public jni::object
 	{
 	public:
+		/*
+			@brief Constructs a collection from a jobject.
+			@param instance The Java Collection object to wrap (may be nullptr)
+		*/
 		explicit collection(const jobject instance = nullptr)
 			: jni::object{ instance }
 		{
 
 		}
 
+		/*
+			@brief Converts the Java Collection to a C++ std::vector.
+			@tparam type The C++ type of the collection's elements.
+					Must be either a class derived from jni::object or std::string.
+			@return For jni::object-derived types, returns std::vector<std::unique_ptr<type>>.
+					For std::string, returns std::vector<std::string>.
+					Returns an empty vector if the instance is nullptr, the underlying
+					toArray() call fails, or the collection is empty.
+			@details
+			- Calls Java's Collection::toArray() internally to retrieve elements.
+			- Each element is wrapped in std::unique_ptr<type> (or std::string) and
+			  its local JNI reference is deleted after wrapping.
+			- Null elements in the Java collection produce nullptr unique_ptrs
+			  or empty strings respectively.
+		*/
 		template<typename type>
 			requires (std::is_base_of_v<object, type> || std::is_same_v<type, std::string>)
 		auto to_vector() const
@@ -2102,11 +2358,19 @@ namespace jni
 		}
 	};
 
-	// wrapper for java List, inherite to_vector
-	// same as collection but no new methods for now
+	/*
+		@brief Wrapper for the Java List interface.
+		@details
+		- Inherits from jni::collection, providing the same to_vector() helper.
+		- No additional methods are defined beyond those inherited from collection.
+	*/	
 	class list final : public jni::collection
 	{
 	public:
+		/*
+			@brief Constructs a list from a jobject.
+			@param instance The Java List object to wrap (may be nullptr)
+		*/
 		explicit list(const jobject instance = nullptr)
 			: jni::collection{ instance }
 		{
@@ -2114,16 +2378,29 @@ namespace jni
 		}
 	};
 
-	// I needed uuid for an other projet, not that useful
+	/*
+		@brief Wrapper for the Java UUID class.
+		@details
+		- Inherits from jni::object and exposes the version() method.
+	*/
 	class uuid final : public jni::object
 	{
 	public:
+		/*
+			@brief Constructs a uuid from a jobject.
+			@param instance The Java UUID object to wrap (may be nullptr)
+		*/
 		explicit uuid(const jobject instance = nullptr)
 			: jni::object{ instance }
 		{
 
 		}
 
+		/*
+			@brief Returns the version number of this UUID.
+			@return The UUID version as an int (e.g. 1, 4).
+			@details Calls Java's UUID::version() method internally.
+		*/
 		auto version() const
 			-> int
 		{
@@ -2132,19 +2409,29 @@ namespace jni
 	};
 
 	/*
-		java data structure helpers
+		@brief Creates a new Java object using its constructor and wraps it in a std::unique_ptr.
+		@tparam type The C++ wrapper type to instantiate (must satisfy jni_object)
+		@tparam args_t The C++ types of the constructor's parameters (must satisfy callable_arg)
+		@param args Arguments to pass to the Java constructor
+		@return A std::unique_ptr<type> wrapping the newly created Java object.
+				On failure, returns a unique_ptr wrapping a nullptr instance.
+		@details
+		- Looks up the registered Java class for the given C++ type via jni::class_map.
+		- Resolves and caches the constructor jmethodID (registered as "<init>").
+		- Converts C++ arguments to a JNI jvalue array via jni::build_jargs.
+		- Calls JNI's NewObjectA and wraps the resulting jobject in a std::unique_ptr<type>.
+		- The local reference returned by NewObjectA is deleted after wrapping.
+		@note The class must have been registered via jni::register_class<type>() beforehand.
+			  This function is a friend of jni::object to access register_method_id internally.
 	*/
-
-	// friend function of jni::object 
-	// allows you to create jobject using java constructors
 	template<jni_object type, callable_arg... args_t>
 	auto make_unique(args_t&&... args)
 		-> std::unique_ptr<type>
 	{
+		const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(type) })) };
+
 		try
 		{
-			const jclass clazz{ jni::get_class(jni::class_map.at(std::type_index{ typeid(type) })) };
-
 			if (!clazz)
 			{
 				throw std::runtime_error{ std::format("Class not found for constructor.") };
@@ -2169,13 +2456,19 @@ namespace jni
 		}
 		catch (const std::exception& e)
 		{
-			std::println("[ERROR] make_unique() {}", e.what());
+			std::println("{} jni::make_unique() {}", jni::easy_jni_error, e.what());
 
 			return std::make_unique<type>(nullptr);
 		}
 	}
 
-	inline const constexpr DWORD versions[] = 
+	/*
+		@brief List of JVMTI versions to attempt when acquiring the JVMTI environment.
+		@details
+		- Versions are tried in descending order to obtain the most recent
+		  available JVMTI environment supported by the running JVM.
+	*/
+	inline const constexpr DWORD versions[]
 	{
 		JVMTI_VERSION_1_2,
 		JVMTI_VERSION_1_1,
@@ -2183,13 +2476,25 @@ namespace jni
 		JVMTI_VERSION
 	};
 
-	// initializes EasyJNI
+	/*
+		@brief Initializes EasyJNI.
+		@return true on success, false if any step of the initialization fails.
+		@details
+		- Retrieves the running JavaVM via JNI_GetCreatedJavaVMs.
+		- Attaches the current thread to the JVM if not already attached.
+		- Acquires a JVMTI environment by trying each version in jni::versions
+		  in order, stopping at the first success.
+		- Registers built-in Java data structure wrappers:
+		  jni::collection, jni::list, and jni::uuid.
+		@note Must be called before any other EasyJNI function.
+			  Requires a JVM to already be running in the process.
+	*/
 	static auto init()
 		-> bool
 	{
 		try
 		{
-			jsize count{};
+			jsize count{ 0 };
 			if (JNI_GetCreatedJavaVMs(&jni::vm, 1, &count) != JNI_OK)
 			{
 				throw std::runtime_error{ "Failed to get created Java VMs." };
@@ -2200,7 +2505,7 @@ namespace jni
 				throw std::runtime_error{ "No Java VM found." };
 			}
 
-			JNIEnv* env{};
+			JNIEnv* env{ nullptr };
 			if (jni::vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) == JNI_EDETACHED)
 			{
 				if (jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
@@ -2222,7 +2527,7 @@ namespace jni
 				}
 			}
 
-			// already register some java datastructures that have helper methods
+			// Already register some java datastructures that have helper methods
 			jni::register_class<jni::collection>("java/util/Collection");
 			jni::register_class<jni::list>("java/util/List");
 			jni::register_class<jni::uuid>("java/util/UUID");
@@ -2231,16 +2536,26 @@ namespace jni
 		}
 		catch (const std::exception& e)
 		{
-			std::println("[ERROR] init() {}", e.what());
+			std::println("{} jni::init() {}", jni::easy_jni_error, e.what());
 			return false;
 		}
 	}
 
-	// shutdown EasyJNI, detach the current thread from the JVM and clear the map of envs and classes to prevent memory leaks
-	static auto shutdown()
+	/*
+		@brief Shuts down EasyJNI.
+		@details
+		- Runs any registered shutdown hooks via jni::shutdown_hooks().
+		- Deletes all cached global jclass references stored in jni::classes
+		  to prevent memory leaks.
+		- Detaches the current thread from the JVM via jni::exit_thread().
+		@note Should be called before the consuming thread exits to ensure
+			  proper cleanup of JNI global references.
+		@warning Any use of EasyJNI after this call results in undefined behaviour.
+	*/
+	static auto shutdown() noexcept
 		-> void
 	{
-		std::println("[INFO] shutdown() Shutdown");
+		std::println("{} shutdown() Shutdown", jni::easy_jni_info);
 
 		jni::shutdown_hooks();
 
