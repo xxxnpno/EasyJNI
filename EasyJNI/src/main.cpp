@@ -153,13 +153,6 @@ namespace jni
         {
             return get_field<jni::list>("playerEntities")->get()->to_vector<entity_player>();
         }
-
-        // Returns the name of the current world dimension.
-        auto get_world_info_name() 
-            -> std::string
-        {
-            return get_field<std::string>("levelName")->get();
-        }
     };
 
     // net.minecraft.client.Minecraft

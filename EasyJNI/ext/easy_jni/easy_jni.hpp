@@ -34,7 +34,6 @@ namespace jni
 
 	static auto shutdown_hooks() -> void;
 
-
 	/*
 		declarations
 	*/
@@ -44,16 +43,21 @@ namespace jni
 	inline constinit jvmtiEnv* jvmti{ nullptr };
 
 	// gets the env of the current thread, if the env is not found, attaches the thread to the JVM and stores it locally
-	static auto get_env() noexcept
+	static auto get_env() noexcept 
 		-> JNIEnv*
 	{
 		thread_local JNIEnv* env{ nullptr };
+
+		if (!jni::vm)
+		{
+			std::println("[ERROR] get_env() called before jni::vm is initialized.");
+			return nullptr;
+		}
 
 		if (!env)
 		{
 			const jint result{ jni::vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) };
 
-			// jni basic api
 			if (result == JNI_EDETACHED)
 			{
 				if (jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
@@ -62,11 +66,11 @@ namespace jni
 					return nullptr;
 				}
 			}
-		}
-
-		if (!env)
-		{
-			std::println("[ERROR] get_env() env is nullptr.");
+			else if (result != JNI_OK)
+			{
+				std::println("[ERROR] get_env() GetEnv failed with result {}.", static_cast<std::int32_t>(result));
+				return nullptr;
+			}
 		}
 
 		return env;
@@ -78,7 +82,7 @@ namespace jni
 	{
 		thread_local JNIEnv* env{ nullptr };
 
-		if (env)
+		if (env && jni::vm)
 		{
 			if (jni::vm->DetachCurrentThread() != JNI_OK)
 			{
@@ -768,7 +772,7 @@ namespace jni
 				if constexpr (!std::is_base_of_v<object, type>)
 				{
 					auto it = jni::jni_to_cpp.find(result.type());
-					if (it not_eq jni::jni_to_cpp.end())
+					if (it != jni::jni_to_cpp.end())
 					{
 						return std::any_cast<type>(it->second(result));
 					}
@@ -1320,7 +1324,7 @@ namespace jni
 				if constexpr (!std::is_base_of_v<object, return_type> && !std::is_same_v<return_type, void>)
 				{
 					auto it = jni::jni_to_cpp.find(result.type());
-					if (it not_eq jni::jni_to_cpp.end())
+					if (it != jni::jni_to_cpp.end())
 					{
 						return std::any_cast<return_type>(it->second(result));
 					}
@@ -1768,6 +1772,14 @@ namespace jni
 		}
 	}
 
+	inline const constexpr DWORD versions[] = 
+	{
+		JVMTI_VERSION_1_2,
+		JVMTI_VERSION_1_1,
+		JVMTI_VERSION_1_0,
+		JVMTI_VERSION
+	};
+
 	// initializes EasyJNI
 	static auto init()
 		-> bool
@@ -1775,7 +1787,7 @@ namespace jni
 		try
 		{
 			jsize count{};
-			if (JNI_GetCreatedJavaVMs(&jni::vm, 1, &count) not_eq JNI_OK)
+			if (JNI_GetCreatedJavaVMs(&jni::vm, 1, &count) != JNI_OK)
 			{
 				throw std::runtime_error{ "Failed to get created Java VMs." };
 			}
@@ -1785,9 +1797,26 @@ namespace jni
 				throw std::runtime_error{ "No Java VM found." };
 			}
 
-			if (jni::vm->GetEnv(reinterpret_cast<void**>(&jni::jvmti), JVMTI_VERSION_1_2) not_eq JNI_OK)
+			JNIEnv* env{};
+			if (jni::vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) == JNI_EDETACHED)
 			{
-				throw std::runtime_error{ "Failed to get JVMTI environment." };
+				if (jni::vm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK)
+				{
+					throw std::runtime_error{ "Failed to attach init thread." };
+				}
+			}
+
+			if (!env)
+			{
+				throw std::runtime_error{ "JNIEnv is null after attach." };
+			}
+
+			for (const DWORD version : jni::versions)
+			{
+				if (jni::vm->GetEnv(reinterpret_cast<void**>(&jni::jvmti), version) == JNI_OK && jni::jvmti)
+				{
+					break;
+				}
 			}
 
 			// already register some java datastructures that have helper methods
@@ -2568,7 +2597,7 @@ namespace jni
 
 		jint method_count{};
 		jmethodID* methods{};
-		if (jni::jvmti->GetClassMethods(clazz, &method_count, &methods) not_eq JVMTI_ERROR_NONE)
+		if (jni::jvmti->GetClassMethods(clazz, &method_count, &methods) != JVMTI_ERROR_NONE)
 		{
 			std::println("[ERROR] hook() GetClassMethods failed");
 			return false;
@@ -2655,14 +2684,6 @@ namespace jni
 
 		hotspot::hooked_i2i_entries.push_back({ i2i, hook_instance });
 		return true;
-	}
-
-	template<typename T>
-	static auto set_return_value(bool* cancel, T value)
-		-> void
-	{
-		*(T*)((void**)cancel + 8) = value;
-		*cancel = true;
 	}
 
 	static auto shutdown_hooks()
