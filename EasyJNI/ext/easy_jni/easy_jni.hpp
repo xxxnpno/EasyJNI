@@ -2692,16 +2692,15 @@ namespace jni
 		struct symbol
 		{
 			/*
-				@brief Converts this HotSpot Symbol to a std::string_view.
-				@return A string_view over the raw character body of the symbol.
-						Returns an empty string_view on failure.
+				@brief Converts this HotSpot Symbol to a std::string.
+				@return A std::string containing a copy of the symbol's character data.
+						Returns an empty string on failure.
 				@details
 				Reads the symbol length from the _length field and the character
 				data from the _body field using offsets retrieved from gHotSpotVMStructs.
-				The returned string_view points directly into JVM memory and remains
-				valid as long as the symbol is alive in the JVM symbol table.
-				@note Do not store the returned string_view beyond the scope of the call
-					  without copying it into a std::string first.
+				The returned std::string owns its data, making it safe to use independently
+				of the JVM memory.
+				@note This function performs a copy of the underlying data.
 			*/
 			auto to_string() const
 				-> std::string
@@ -3085,15 +3084,16 @@ namespace jni
 			}
 
 			/*
-				@brief Returns the name of this method as a string_view.
-				@return A string_view over the method name symbol (e.g., "toString"),
-						or an empty string_view on failure.
-				@details
-				Retrieves the ConstMethod via get_const_method(), then reads the name
-				symbol via const_method::get_name() and converts it to a string_view.
-				@note The returned string_view points directly into JVM symbol table memory.
-					  Do not store it beyond the scope of the call without copying it first.
-				@see const_method, symbol
+				 brief Returns the name of this method as a std::string.
+				 return A std::string containing a copy of the method name (e.g., "toString"),
+				 	or an empty string on failure.
+				 details
+				 etrieves the ConstMethod via get_const_method(), then reads the name
+				 ymbol via const_method::get_name() and converts it to a std::string.
+				 he returned string owns its data and is safe to use independently
+				 f the JVM memory.
+				 note This function performs a copy of the underlying symbol data.
+				 see const_method, symbol
 			*/
 			auto get_name() const
 				-> std::string
@@ -3124,14 +3124,15 @@ namespace jni
 			}
 
 			/*
-				@brief Returns the signature of this method as a string_view.
-				@return A string_view over the method signature symbol
-						(e.g., "(I)Ljava/lang/String;"), or an empty string_view on failure.
+				@brief Returns the signature of this method as a std::string.
+				@return A std::string containing a copy of the method signature
+						(e.g., "(I)Ljava/lang/String;"), or an empty string on failure.
 				@details
 				Retrieves the ConstMethod via get_const_method(), then reads the signature
-				symbol via const_method::get_signature() and converts it to a string_view.
-				@note The returned string_view points directly into JVM symbol table memory.
-					  Do not store it beyond the scope of the call without copying it first.
+				symbol via const_method::get_signature() and converts it to a std::string.
+				The returned string owns its data and is safe to use independently
+				of the JVM memory.
+				@note This function performs a copy of the underlying symbol data.
 				@see const_method, symbol
 			*/
 			auto get_signature() const
