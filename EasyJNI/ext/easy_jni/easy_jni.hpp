@@ -2629,7 +2629,7 @@ namespace jni
 				  and remains valid for the lifetime of the JVM process.
 			@see VMTypeEntry, gHotSpotVMTypes
 		*/
-		static auto iterate_type_entries(const char* type_name) noexcept
+		static auto iterate_type_entries(const char* const type_name) noexcept
 			-> jni::hotspot::VMTypeEntry*
 		{
 			for (jni::hotspot::VMTypeEntry* entry{ jni::hotspot::gHotSpotVMTypes }; entry->type_name; ++entry)
@@ -2658,7 +2658,7 @@ namespace jni
 				  and remains valid for the lifetime of the JVM process.
 			@see VMStructEntry, gHotSpotVMStructs
 		*/
-		static auto iterate_struct_entries(const char* type_mame, const char* field_name) noexcept
+		static auto iterate_struct_entries(const char* const type_mame, const char* const field_name) noexcept
 			-> jni::hotspot::VMStructEntry*
 		{
 			for (jni::hotspot::VMStructEntry* entry{ jni::hotspot::gHotSpotVMStructs }; entry->type_name; ++entry)
@@ -2705,8 +2705,8 @@ namespace jni
 			auto to_string() const
 				-> std::string
 			{
-				static jni::hotspot::VMStructEntry* length_entry{ jni::hotspot::iterate_struct_entries("Symbol", "_length") };
-				static jni::hotspot::VMStructEntry* body_entry{ jni::hotspot::iterate_struct_entries("Symbol", "_body") };
+				static const jni::hotspot::VMStructEntry* const length_entry{ jni::hotspot::iterate_struct_entries("Symbol", "_length") };
+				static const jni::hotspot::VMStructEntry* const body_entry{ jni::hotspot::iterate_struct_entries("Symbol", "_body") };
 
 				try
 				{
@@ -2721,7 +2721,7 @@ namespace jni
 					}
 
 					const std::uint16_t length{ *(std::uint16_t*)((std::uint8_t*)this + length_entry->offset) };
-					const char* body{ (const char*)((std::uint8_t*)this + body_entry->offset) };
+					const char* const body{ (const char*)((std::uint8_t*)this + body_entry->offset) };
 
 					return std::string{ body, length };
 				}
@@ -2764,7 +2764,7 @@ namespace jni
 			auto get_base() const
 				-> void**
 			{
-				static jni::hotspot::VMTypeEntry* entry{ jni::hotspot::iterate_type_entries("ConstantPool") };
+				static const jni::hotspot::VMTypeEntry* const entry{ jni::hotspot::iterate_type_entries("ConstantPool") };
 
 				try
 				{
@@ -2815,7 +2815,7 @@ namespace jni
 			auto get_constants() const
 				-> constant_pool*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_constants") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_constants") };
 
 				try
 				{
@@ -2848,7 +2848,7 @@ namespace jni
 			auto get_name() const
 				-> symbol*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_name_index") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_name_index") };
 
 				try
 				{
@@ -2882,7 +2882,7 @@ namespace jni
 			auto get_signature() const
 				-> symbol*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_signature_index") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("ConstMethod", "_signature_index") };
 
 				try
 				{
@@ -2933,7 +2933,7 @@ namespace jni
 			auto get_i2i_entry() const
 				-> void*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_i2i_entry") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Method", "_i2i_entry") };
 
 				try
 				{
@@ -2965,7 +2965,7 @@ namespace jni
 			auto get_from_interpreted_entry() const
 				-> void*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_from_interpreted_entry") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Method", "_from_interpreted_entry") };
 
 				try
 				{
@@ -2998,7 +2998,7 @@ namespace jni
 			auto get_access_flags() const
 				-> std::uint32_t*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_access_flags") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Method", "_access_flags") };
 
 				try
 				{
@@ -3030,7 +3030,7 @@ namespace jni
 			auto get_flags() const
 				-> std::uint16_t*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_flags") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Method", "_flags") };
 
 				try
 				{
@@ -3064,7 +3064,7 @@ namespace jni
 			auto get_const_method() const
 				-> const_method*
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("Method", "_constMethod") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Method", "_constMethod") };
 
 				try
 				{
@@ -3098,7 +3098,7 @@ namespace jni
 			auto get_name() const
 				-> std::string
 			{
-				const const_method* const_method{ this->get_const_method() };
+				const const_method* const const_method{ this->get_const_method() };
 
 				try
 				{
@@ -3107,7 +3107,7 @@ namespace jni
 						throw jni::jni_exception{ "ConstMethod is nullptr." };
 					}
 
-					const symbol* symbol{ const_method->get_name() };
+					const symbol* const symbol{ const_method->get_name() };
 					if (!symbol)
 					{
 						throw jni::jni_exception{ "Symbol is nullptr." };
@@ -3138,7 +3138,7 @@ namespace jni
 			auto get_signature() const
 				-> std::string
 			{
-				const const_method* const_method{ this->get_const_method() };
+				const const_method* const const_method{ this->get_const_method() };
 
 				try
 				{
@@ -3147,7 +3147,7 @@ namespace jni
 						throw jni::jni_exception{ "ConstMethod is nullptr." };
 					}
 
-					const symbol* symbol{ const_method->get_signature() };
+					const symbol* const symbol{ const_method->get_signature() };
 					if (!symbol)
 					{
 						throw jni::jni_exception{ "Symbol is nullptr." };
@@ -3282,7 +3282,7 @@ namespace jni
 			{
 				// _anchor is used as a stable reference point since _jni_environment is not
 				// exported in gHotSpotVMStructs on this JDK version.
-				static jni::hotspot::VMStructEntry* anchor_entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_anchor") };
+				static const jni::hotspot::VMStructEntry* const anchor_entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_anchor") };
 
 				try
 				{
@@ -3319,7 +3319,7 @@ namespace jni
 			auto get_thread_state() const
 				-> jni::hotspot::java_thread_state
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
 
 				try
 				{
@@ -3353,7 +3353,7 @@ namespace jni
 			auto set_thread_state(const jni::hotspot::java_thread_state state) const
 				-> void
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
 
 				try
 				{
@@ -3382,7 +3382,7 @@ namespace jni
 			auto get_suspend_flags() const
 				-> std::uint32_t
 			{
-				static jni::hotspot::VMStructEntry* entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_suspend_flags") };
+				static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("JavaThread", "_suspend_flags") };
 
 				try
 				{
@@ -3418,7 +3418,7 @@ namespace jni
 				  and pattern point to valid readable memory of at least size bytes.
 			@see scan, find_hook_location
 		*/
-		inline static auto match_pattern(const std::uint8_t* address, const std::uint8_t* pattern, const std::size_t size)
+		inline static auto match_pattern(const std::uint8_t* const address, const std::uint8_t* const pattern, const std::size_t size)
 			-> bool
 		{
 			for (std::size_t i{ 0 }; i < size; ++i)
@@ -3458,7 +3458,7 @@ namespace jni
 			@see match_pattern, find_hook_location
 		*/
 		inline static auto scan(
-			const std::uint8_t* start,
+			const std::uint8_t* const start,
 			const std::size_t range,
 			const std::uint8_t* pattern,
 			const std::size_t size
@@ -3549,7 +3549,7 @@ namespace jni
 			// Byte pattern matching the sequence of instructions found at the end of the
 			// interpreter frame setup, just before bytecode dispatch begins.
 			// 0x00 bytes act as wildcards for variable immediates (offsets, addresses).
-			const constexpr std::uint8_t pattern[]
+			static const constexpr std::uint8_t pattern[]
 			{
 				// mov [rsp+??], eax
 				0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00,
@@ -3569,20 +3569,20 @@ namespace jni
 
 			// Byte pattern matching the instruction that loads the local variables pointer
 			// into r14 from rbp, used to determine the locals_offset value at runtime.
-			const constexpr std::uint8_t locals_pattern[]
+			static const constexpr std::uint8_t locals_pattern[]
 			{
 				// mov r14, QWORD PTR [rbp + ??] ; ret
 				0x4C, 0x8B, 0x75, 0x00, 0xC3
 			};
 
 			// Cast i2i_entry to a byte pointer to allow pointer arithmetic during scanning.
-			const std::uint8_t* current{ (std::uint8_t*)i2i_entry };
+			const std::uint8_t* const current{ (std::uint8_t*)i2i_entry };
 
 			// Determine the safe scan range for this stub using VirtualQuery.
 			const std::size_t scan_size{ jni::hotspot::find_stub_size((std::uint8_t*)i2i_entry) };
 
 			// Scan the stub for the main hook pattern to locate the injection point.
-			std::uint8_t* hook_location{ jni::hotspot::scan(current, scan_size, pattern, sizeof(pattern)) };
+			std::uint8_t* const hook_location{ jni::hotspot::scan(current, scan_size, pattern, sizeof(pattern)) };
 
 			try
 			{
@@ -3654,7 +3654,7 @@ namespace jni
 					  for the duration of the intercepted method call only.
 				@see hotspot::method, common_detour
 			*/
-			auto get_method() const noexcept
+			inline auto get_method() const noexcept
 				-> method*
 			{
 				// The Method pointer is stored 24 bytes before the frame base pointer (rbp).
@@ -3679,7 +3679,7 @@ namespace jni
 					  valid for the duration of the intercepted method call only.
 				@see locals_offset, find_hook_location, get_arguments
 			*/
-			auto get_locals() const noexcept
+			inline auto get_locals() const noexcept
 				-> void**
 			{
 				// locals_offset is a signed byte offset from rbp to the local variables pointer.
@@ -3751,7 +3751,7 @@ namespace jni
 				using return_type = std::conditional_t<std::is_base_of_v<jni::object, type>, std::unique_ptr<type>, type>;
 
 				// Retrieve the base of the local variables array from the frame.
-				void** locals{ this->get_locals() };
+				void** const locals{ this->get_locals() };
 				if (!locals)
 				{
 					return return_type{};
@@ -3771,13 +3771,14 @@ namespace jni
 					// The raw value is a compressed OOP (ordinary object pointer) to a Java String.
 					// Taking its address and casting to jobject* gives us a pointer to the OOP slot,
 					// which NewLocalRef can resolve into a proper JNI local reference.
-					jobject obj = jni::get_env()->NewLocalRef(reinterpret_cast<jobject>(&raw));
-					jstring str = reinterpret_cast<jstring>(obj);
+					jobject obj{ jni::get_env()->NewLocalRef(reinterpret_cast<jobject>(&raw)) };
+					const jstring str{ reinterpret_cast<jstring>(obj) };
 
 					// Extract the UTF-8 characters from the JNI string reference,
 					// copy them into a std::string, then release the JNI resources.
-					const char* chars = jni::get_env()->GetStringUTFChars(str, nullptr);
+					const char* const chars{ jni::get_env()->GetStringUTFChars(str, nullptr) };
 					std::string result{ chars };
+
 					jni::get_env()->ReleaseStringUTFChars(str, chars);
 					jni::get_env()->DeleteLocalRef(obj);
 
@@ -3844,7 +3845,7 @@ namespace jni
 				  step were used.
 			@see midi2i_hook, VirtualAlloc, VirtualFree
 		*/
-		static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect) noexcept
+		static auto allocate_nearby_memory(std::uint8_t * nearby_addr, const std::size_t size, const DWORD protect) noexcept
 			-> std::uint8_t*
 		{
 			// Iterate outward from nearby_addr in steps of 65536 bytes (Windows allocation granularity),
@@ -3931,7 +3932,7 @@ namespace jni
 				makes the stub executable, then patches the target with a 5-byte relative JMP
 				to the stub. Sets error to false only if all steps succeed.
 			*/
-			midi2i_hook(std::uint8_t* target, jni::hotspot::detour_t detour)
+			midi2i_hook(std::uint8_t* const target, const jni::hotspot::detour_t detour)
 				: target{ target }
 				, allocated{ nullptr }
 				, error{ true }
@@ -3939,21 +3940,24 @@ namespace jni
 				// Size of the region patched at the target with the relative JMP instruction.
 				// A relative JMP (0xE9) requires exactly 5 bytes: 1 opcode + 4 byte offset.
 				// We patch 8 bytes to overwrite the full mov BYTE PTR [r15+??], 0x0 instruction.
-				const constexpr std::int32_t HOOK_SIZE{ 8 };
+				static const constexpr std::int32_t HOOK_SIZE{ 8 };
 
 				// Size of the relative JMP instruction patched at the target.
-				const constexpr std::int32_t JMP_SIZE{ 5 };
+				static const constexpr std::int32_t JMP_SIZE{ 5 };
 
 				// Byte offset of the JE instruction within the assembly trampoline,
 				// used to patch the conditional jump destination after allocation.
-				const constexpr std::int32_t JE_OFFSET{ 0x3d };
+				static const constexpr std::int32_t JE_OFFSET{ 0x3d };
 
 				// Size of the JE instruction in bytes (0F 84 + 4 byte signed offset).
-				const constexpr std::int32_t JE_SIZE{ 6 };
+				static const constexpr std::int32_t JE_SIZE{ 6 };
 
 				// Byte offset of the detour function pointer slot within the assembly trampoline,
 				// used to write the address of the C++ detour function into the stub.
-				const constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x56 };
+				static const constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x56 };
+
+				// Opcode for a relative JMP instruction (near jump, 32-bit signed offset).
+				static const constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
 				// The trampoline assembly stub. See the block comment above the class for
 				// a full annotated breakdown of each instruction and its purpose.
@@ -4043,7 +4047,7 @@ namespace jni
 				// so the destination is target + HOOK_SIZE. The JE itself is at allocated + HOOK_SIZE + JE_OFFSET
 				// and is JE_SIZE bytes long, so the relative offset is:
 				// delta = destination - (JE address + JE_SIZE)
-				const std::int32_t je_delta{ (std::int32_t)(target + HOOK_SIZE - (this->allocated + HOOK_SIZE + JE_OFFSET + JE_SIZE)) };
+				std::int32_t je_delta{ (std::int32_t)(target + HOOK_SIZE - (this->allocated + HOOK_SIZE + JE_OFFSET + JE_SIZE)) };
 
 				// Patch the 4-byte signed offset field of the JE instruction in the assembly buffer.
 				*(std::int32_t*)(assembly + JE_OFFSET + 2) = je_delta;
@@ -4069,7 +4073,7 @@ namespace jni
 				VirtualProtect(target, JMP_SIZE, PAGE_EXECUTE_READWRITE, &old_protect);
 
 				// Write the relative JMP opcode (0xE9) at the target injection point.
-				target[0] = 0xE9;
+				target[0] = JMP_OPCODE;
 
 				// Compute the signed 32-bit relative offset for the JMP from the target to the stub.
 				// The JMP is JMP_SIZE bytes long, so the offset is:
@@ -4104,10 +4108,13 @@ namespace jni
 					return;
 				}
 
+				// Opcode for a relative JMP instruction (near jump, 32-bit signed offset).
+				static const constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+
 				// Verify that the target still starts with our JMP patch (0xE9) before restoring,
 				// to avoid overwriting code that may have been modified by another hook or the JVM.
 				DWORD old_protect{};
-				if (this->target[0] == 0xE9 && VirtualProtect(this->target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
+				if (this->target[0] == JMP_OPCODE && VirtualProtect(this->target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
 				{
 					// Restore the original bytes from the saved copy at the start of the allocated stub.
 					std::memcpy(this->target, this->allocated, 5);
@@ -4138,7 +4145,7 @@ namespace jni
 					   with the relative JMP instruction.
 				@note Used by the destructor to restore the original bytes on unhook.
 			*/
-			std::uint8_t* target;
+			std::uint8_t* target{ nullptr };
 
 			/*
 				@brief Pointer to the allocated trampoline stub.
@@ -4147,7 +4154,7 @@ namespace jni
 				The remaining bytes hold the trampoline assembly.
 				@note Released by VirtualFree in the destructor.
 			*/
-			std::uint8_t* allocated;
+			std::uint8_t* allocated{ nullptr };
 
 			/*
 				@brief Indicates whether the hook installation encountered an error.
@@ -4156,7 +4163,7 @@ namespace jni
 				Checked by the destructor to avoid attempting cleanup of a partially
 				installed hook.
 			*/
-			bool error;
+			bool error{ true };
 		};
 
 		/*
@@ -4176,7 +4183,7 @@ namespace jni
 				@note Used by common_detour to identify the currently executing method
 					  and dispatch to the correct detour function.
 			*/
-			jni::hotspot::method* m{ nullptr };
+			jni::hotspot::method* method{ nullptr };
 
 			/*
 				@brief The C++ detour function to invoke when this method is intercepted.
@@ -4255,7 +4262,7 @@ namespace jni
 				  intercepted interpreter dispatch, potentially thousands of times per second.
 			@see midi2i_hook, hooked_methods, hooked_method, java_thread_state
 		*/
-		static auto common_detour(jni::hotspot::frame* f, jni::hotspot::java_thread* thread, bool* cancel)
+		static auto common_detour(jni::hotspot::frame* const frame, jni::hotspot::java_thread* const thread, bool* const cancel)
 			-> void
 		{
 			try
@@ -4286,24 +4293,25 @@ namespace jni
 
 				// Retrieve the Method pointer of the currently executing method from the interpreter frame.
 				// This is used to look up the correct per-method detour in hooked_methods.
-				jni::hotspot::method* current_method{ f->get_method() };
+				const jni::hotspot::method* const current_method{ frame->get_method() };
 
 				// Iterate over all registered hooked methods to find the one matching the current method.
-				for (jni::hotspot::hooked_method& hk : hooked_methods)
+				for (const jni::hotspot::hooked_method& hook : jni::hotspot::hooked_methods)
 				{
 					// Compare the Method pointer of this entry against the currently executing method.
 					// Pointer equality is sufficient here since Method objects are unique per method in HotSpot.
-					if (hk.m == current_method)
+					if (hook.method == current_method)
 					{
 						// Dispatch to the registered per-method detour, passing the frame, thread,
 						// and cancel flag so the detour can read arguments and optionally cancel the call.
-						hk.detour(f, thread, cancel);
+						hook.detour(frame, thread, cancel);
 
 						// Restore the thread state to _thread_in_Java after the detour returns.
 						// The detour may have performed JNI calls that transitioned the thread to
 						// _thread_in_native or another state, which would cause the JVM to behave
 						// incorrectly if not corrected before returning to the interpreter.
 						thread->set_thread_state(jni::hotspot::java_thread_state::_thread_in_Java);
+
 						return;
 					}
 				}
@@ -4382,12 +4390,12 @@ namespace jni
 				  prevented from occurring by the NO_COMPILE flags set beforehand.
 			@see NO_COMPILE, hotspot::method::get_flags, jni::hook, shutdown_hooks
 		*/
-		static auto set_dont_inline(jni::hotspot::method* m, bool enabled) noexcept
+		static auto set_dont_inline(const jni::hotspot::method* const method, bool enabled) noexcept
 			-> void
 		{
 			// Retrieve a pointer to the Method._flags field via the cached VMStructEntry offset.
 			// Returns nullptr if the entry could not be found in gHotSpotVMStructs.
-			std::uint16_t* flags{ m->get_flags() };
+			std::uint16_t* const flags{ method->get_flags() };
 			if (!flags)
 			{
 				return;
@@ -4441,7 +4449,7 @@ namespace jni
 		@see midi2i_hook, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
 	*/
 	template <jni_object type>
-	static auto hook(const std::string_view method_name, jni::hotspot::detour_t detour)
+	static auto hook(const std::string_view method_name, const jni::hotspot::detour_t detour)
 		-> bool
 	{
 		try
@@ -4474,8 +4482,8 @@ namespace jni
 			jmethodID method_id{ nullptr };
 			for (jint i{ 0 }; i < method_count; ++i)
 			{
-				jni::hotspot::method* m{ *(jni::hotspot::method**)methods[i] };
-				if (m && m->get_name() == method_name)
+				const jni::hotspot::method* const method{ *(jni::hotspot::method**)methods[i] };
+				if (method && method->get_name() == method_name)
 				{
 					method_id = methods[i];
 					break;
@@ -4491,13 +4499,13 @@ namespace jni
 			}
 
 			// Dereference the jmethodID to obtain the raw HotSpot Method pointer.
-			jni::hotspot::method* m{ *(jni::hotspot::method**)method_id };
+			jni::hotspot::method* __method{ *(jni::hotspot::method**)method_id };
 
 			// Check whether this method is already hooked to avoid installing duplicate hooks.
 			// If it is, return true immediately since the hook is already active.
-			for (jni::hotspot::hooked_method& hk : jni::hotspot::hooked_methods)
+			for (const jni::hotspot::hooked_method& hook : jni::hotspot::hooked_methods)
 			{
-				if (hk.m == m)
+				if (hook.method == __method)
 				{
 					return true;
 				}
@@ -4506,11 +4514,11 @@ namespace jni
 			// Prevent the JIT compiler from inlining this method at call sites.
 			// This is set before NO_COMPILE to ensure the flag is in place before
 			// the compiler has any chance to process the method.
-			jni::hotspot::set_dont_inline(m, true);
+			jni::hotspot::set_dont_inline(__method, true);
 
 			// Disable all JIT compilation tiers for this method by setting the NO_COMPILE flags
 			// in Method._access_flags, preventing C1, C2, and OSR compilation.
-			std::uint32_t* flags{ m->get_access_flags() };
+			std::uint32_t* flags{ __method->get_access_flags() };
 			if (!flags)
 			{
 				throw jni::jni_exception{ std::format("Failed to retrieve access flags.") };
@@ -4519,26 +4527,27 @@ namespace jni
 
 			// Re-dereference the jmethodID after retransformation since the Method pointer
 			// may have changed if HotSpot reallocated the Method object during retransformation.
-			m = *(jni::hotspot::method**)method_id;
+			__method = *(jni::hotspot::method**)method_id;
 
 			// Re-apply the _dont_inline and NO_COMPILE flags after retransformation,
 			// since retransformation may have reset the Method._flags and Method._access_flags fields.
-			jni::hotspot::set_dont_inline(m, true);
+			jni::hotspot::set_dont_inline(__method, true);
 
-			flags = m->get_access_flags();
+			flags = __method->get_access_flags();
 			if (!flags)
 			{
 				throw jni::jni_exception{ std::format("Failed to retrieve access flags after retransformation.") };
 			}
+
 			*flags |= jni::hotspot::NO_COMPILE;
 
 			// Register the method and its detour in hooked_methods so that common_detour
 			// can dispatch to the correct per-method detour when the hook fires.
-			jni::hotspot::hooked_methods.push_back({ m, detour });
+			jni::hotspot::hooked_methods.push_back({ __method, detour });
 
 			// Retrieve the i2i entry point of the method to determine whether a new
 			// trampoline needs to be installed or whether an existing one can be reused.
-			void* i2i = m->get_i2i_entry();
+			void* i2i{ __method->get_i2i_entry() };
 			if (!i2i)
 			{
 				throw jni::jni_exception{ std::format("Failed to retrieve i2i entry.") };
@@ -4547,9 +4556,9 @@ namespace jni
 			// Check whether this i2i entry point has already been patched by a previous hook.
 			// If so, common_detour will already dispatch correctly via hooked_methods,
 			// so no new trampoline needs to be allocated or installed.
-			for (jni::hotspot::i2i_hook_data& hk : jni::hotspot::hooked_i2i_entries)
+			for (const jni::hotspot::i2i_hook_data& hook : jni::hotspot::hooked_i2i_entries)
 			{
-				if (hk.i2i_entry == i2i)
+				if (hook.i2i_entry == i2i)
 				{
 					return true;
 				}
@@ -4581,7 +4590,7 @@ namespace jni
 		}
 		catch (const std::exception& e)
 		{
-			std::println("{} jni::hook() for '{}': {}", jni::easy_jni_error, method_name, e.what());
+			std::println("{} jni::hook() for {}: {}", jni::easy_jni_error, method_name, e.what());
 			return false;
 		}
 	}
@@ -4623,22 +4632,22 @@ namespace jni
 		// Phase 1: remove all installed trampolines by deleting each midi2i_hook instance.
 		// The destructor of midi2i_hook restores the original bytes at the patched injection
 		// point and releases the allocated trampoline memory back to the system via VirtualFree.
-		for (jni::hotspot::i2i_hook_data& hk : jni::hotspot::hooked_i2i_entries)
+		for (const jni::hotspot::i2i_hook_data& hook : jni::hotspot::hooked_i2i_entries)
 		{
-			delete hk.hook;
+			delete hook.hook;
 		}
 
 		// Phase 2: restore the _dont_inline and NO_COMPILE flags on all hooked methods
 		// to allow the JIT compiler to resume normal compilation and inlining behaviour.
-		for (jni::hotspot::hooked_method& hm : jni::hotspot::hooked_methods)
+		for (const jni::hotspot::hooked_method& hooked_method : jni::hotspot::hooked_methods)
 		{
 			// Clear the _dont_inline flag to allow the JIT compiler to inline this method
 			// at call sites again, restoring its original inlining eligibility.
-			jni::hotspot::set_dont_inline(hm.m, false);
+			jni::hotspot::set_dont_inline(hooked_method.method, false);
 
 			// Clear the NO_COMPILE flags from Method._access_flags to allow the JIT compiler
 			// to compile this method again through C1, C2, and OSR compilation tiers.
-			std::uint32_t* flags{ hm.m->get_access_flags() };
+			std::uint32_t* const flags{ hooked_method.method->get_access_flags() };
 			if (flags)
 			{
 				*flags &= ~jni::hotspot::NO_COMPILE;
