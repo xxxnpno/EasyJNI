@@ -29,14 +29,14 @@ namespace jni
         }
 
         // Returns the plain text of the component, with all formatting codes stripped.
-        auto get_unformatted_text() 
+        auto get_unformatted_text()
             -> std::string
         {
             return get_method<std::string>("getUnformattedText")->call();
         }
 
         // Returns the full formatted text, including color and style codes.
-        auto get_formatted_text() 
+        auto get_formatted_text()
             -> std::string
         {
             return get_method<std::string>("getFormattedText")->call();
@@ -66,35 +66,35 @@ namespace jni
         }
 
         // Returns the player's username.
-        auto get_name() 
+        auto get_name()
             -> std::string
         {
             return get_method<std::string>("getName")->call();
         }
 
         // Returns the player's current health as a float.
-        auto get_health() 
+        auto get_health()
             -> float
         {
             return get_method<float>("getHealth")->call();
         }
 
         // Returns the player's maximum health.
-        auto get_max_health() 
+        auto get_max_health()
             -> float
         {
             return get_method<float>("getMaxHealth")->call();
         }
 
         // Sends a chat message as this player.
-        auto send_chat_message(const std::string& message) 
+        auto send_chat_message(const std::string& message)
             -> void
         {
             get_method<void, std::string>("sendChatMessage")->call(message);
         }
 
         // Adds a chat component to the player's chat GUI.
-        auto add_chat_message(const std::unique_ptr<i_chat_component>& component) 
+        auto add_chat_message(const std::unique_ptr<i_chat_component>& component)
             -> void
         {
             get_method<void, i_chat_component>("addChatMessage")->call(component);
@@ -102,14 +102,14 @@ namespace jni
 
         // Reads the "onGround" boolean field directly.
         // Demonstrates reading a primitive instance field.
-        auto is_on_ground() 
+        auto is_on_ground()
             -> bool
         {
             return get_field<bool>("onGround")->get();
         }
 
         // Reads the "experienceLevel" int field directly.
-        auto get_experience_level() 
+        auto get_experience_level()
             -> int
         {
             return get_field<int>("experienceLevel")->get();
@@ -117,7 +117,7 @@ namespace jni
 
         // Writes the "experienceLevel" int field directly.
         // Demonstrates writing a primitive instance field.
-        auto set_experience_level(int level) 
+        auto set_experience_level(int level)
             -> void
         {
             get_field<int>("experienceLevel")->set(level);
@@ -148,7 +148,7 @@ namespace jni
         // Returns all player entities in the world as a std::vector.
         // "playerEntities" is a List<EntityPlayer> in Java.
         // Demonstrates converting a Java List to a std::vector<std::unique_ptr<T>>.
-        auto get_player_entities() 
+        auto get_player_entities()
             -> std::vector<std::unique_ptr<entity_player>>
         {
             return get_field<jni::list>("playerEntities")->get()->to_vector<entity_player>();
@@ -167,21 +167,21 @@ namespace jni
 
         // Returns the Minecraft singleton via the static "theMinecraft" field.
         // Demonstrates reading a static object field.
-        auto get_the_minecraft() 
+        auto get_the_minecraft()
             -> std::unique_ptr<minecraft>
         {
             return get_field<minecraft>("theMinecraft", jni::field_type::STATIC)->get();
         }
 
         // Returns the local player (thePlayer instance field).
-        auto get_the_player() 
+        auto get_the_player()
             -> std::unique_ptr<entity_player_sp>
         {
             return get_field<entity_player_sp>("thePlayer")->get();
         }
 
         // Returns the current world (theWorld instance field).
-        auto get_the_world() 
+        auto get_the_world()
             -> std::unique_ptr<world_client>
         {
             return get_field<world_client>("theWorld")->get();
@@ -189,8 +189,8 @@ namespace jni
     };
 }
 
-static auto register_classes() 
-    -> void
+static auto register_classes()
+-> void
 {
     jni::register_class<jni::minecraft>("net/minecraft/client/Minecraft");
     jni::register_class<jni::entity_player>("net/minecraft/entity/player/EntityPlayer");
@@ -200,30 +200,30 @@ static auto register_classes()
     jni::register_class<jni::chat_component_text>("net/minecraft/util/ChatComponentText");
 }
 
-static auto register_hooks() 
-    -> void
+static auto register_hooks()
+-> void
 {
     // Hook EntityPlayerSP.sendChatMessage(String)
     // Observes every outgoing chat message without blocking it.
     static auto send_chat_hook = [](jni::hotspot::frame* frame, jni::hotspot::java_thread*, bool*)
-    {
-        auto [self, message] = frame->get_arguments<jni::entity_player_sp, std::string>();
-        std::println("[HOOK] sendChatMessage > \"{}\"", message);
-    };
+        {
+            auto [self, message] = frame->get_arguments<jni::entity_player_sp, std::string>();
+            std::println("[HOOK] sendChatMessage > \"{}\"", message);
+        };
 
     jni::hook<jni::entity_player_sp>("sendChatMessage", send_chat_hook);
 
     // Hook EntityPlayer.addChatMessage(IChatComponent)
     // Reads the incoming chat component and logs its plain text.
     static auto add_chat_hook = [](jni::hotspot::frame* frame, jni::hotspot::java_thread*, bool*)
-    {
-        auto [self, component] = frame->get_arguments<jni::entity_player_sp, jni::i_chat_component>();
-
-        if (component->get_instance())
         {
-            std::println("[HOOK] addChatMessage > \"{}\"", component->get_unformatted_text());
-        }
-    };
+            auto [self, component] = frame->get_arguments<jni::entity_player_sp, jni::i_chat_component>();
+
+            if (component->get_instance())
+            {
+                std::println("[HOOK] addChatMessage > \"{}\"", component->get_unformatted_text());
+            }
+        };
 
     jni::hook<jni::entity_player_sp>("addChatMessage", add_chat_hook);
 }
@@ -289,7 +289,7 @@ static DWORD WINAPI thread_entry(HMODULE module)
 
         // Using jni::make_unique to construct a Java object (ChatComponentText)
         // and passing it to a method that expects an IChatComponent.
-        const std::unique_ptr<jni::i_chat_component>& chat_msg{ 
+        const std::unique_ptr<jni::i_chat_component>& chat_msg{
             jni::make_unique<jni::chat_component_text, std::string>("[EasyJNI] Constructor and object argument test.")
         };
         the_player->add_chat_message(chat_msg);
