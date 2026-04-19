@@ -1,132 +1,245 @@
 #pragma once
 
+#include <cstdint>
+#include <cstdlib>
+#include <format>
 #include <print>
-#include <thread>
-#include <chrono>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <typeindex>
 #include <memory>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+#include <type_traits>
+#include <tuple>
+#include <cstring>
 
 #include <windows.h>
 
 namespace jni
 {
+    inline constexpr std::string_view easy_jni_error{ "[EasyJNI ERROR]" };
+    inline constexpr std::string_view easy_jni_warning{ "[EasyJNI WARNING]" };
+    inline constexpr std::string_view easy_jni_info{ "[EasyJNI INFO]" };
+
     /*
-        @brief Maps C++ wrapper types to their corresponding internal Java class names.
-        @details
-        Populated by register_class() when a C++ wrapper type is associated with
-        a Java class name. Used by install_hook() and other APIs that need to look
-        up the Java class corresponding to a given C++ wrapper type at runtime.
-        Keys are std::type_index values derived from typeid() of the C++ wrapper type.
-        Values are the internal JVM class names using '/' separators.
-        @see register_class, install_hook
+        @brief Custom exception for EasyJNI errors.
     */
-    inline std::unordered_map<std::type_index, std::string> class_map{};
-
-    template<class wrapped_class>
-    static auto register_class(const std::string_view class_name) noexcept -> bool;
-
-    namespace util
+    class jni_exception final : public std::exception
     {
-        inline static auto is_valid_ptr(const void* const ptr) noexcept -> bool;
-        inline static auto untag_ptr(const void* const ptr) noexcept -> const void*;
-        static auto safe_read_ptr(const void* const ptr) noexcept -> const void*;
-    }
+    public:
+        explicit jni_exception(const std::string_view msg)
+            : message{ msg }
+        {
+
+        }
+
+        auto what() const noexcept -> const char* override
+        {
+            return this->message.c_str();
+        }
+
+    private:
+        std::string message;
+    };
 
     namespace hotspot
     {
         struct VMStructEntry;
         struct VMTypeEntry;
-
-        inline auto get_jvm_module() noexcept -> HMODULE;
-        inline auto get_vm_types() noexcept-> jni::hotspot::VMTypeEntry*;
-        inline auto get_vm_structs() noexcept -> jni::hotspot::VMStructEntry*;
-        static auto iterate_type_entries(const char* const type_name) noexcept -> jni::hotspot::VMTypeEntry*;
-        static auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept -> jni::hotspot::VMStructEntry*;
-
-		struct symbol;
+        struct symbol;
+        struct constant_pool;
+        struct const_method;
+        struct method;
         struct klass;
-        struct dictionary;
         struct class_loader_data;
-		struct class_loader_data_graph;
+        struct class_loader_data_graph;
+        struct dictionary;
+        struct java_thread;
+        struct frame;
+        class  midi2i_hook;
+        struct hooked_method;
+        struct i2i_hook_data;
 
-        /*
-            @brief Cache of klass pointers keyed by their internal class name.
-            @details
-            Populated by find_class() on first lookup of each class name.
-            Subsequent calls for the same name return the cached klass* directly
-            without repeating the ClassLoaderDataGraph walk, making repeated
-            lookups of the same class effectively free.
-            Keys use the internal JVM '/' separator format (e.g. "java/lang/String")
-            consistent with the format accepted by find_class().
-            @note Entries remain valid as long as the corresponding class is loaded.
-                  Classes loaded by short-lived classloaders may be unloaded and
-                  their cached klass* will become dangling. For stable classes such
-                  as JDK classes and main application classes this is never a concern.
-            @see find_class
-        */
-        inline std::unordered_map<std::string, jni::hotspot::klass*> loaded_classes{};
+        static auto decode_oop_ptr(std::uint32_t compressed) noexcept -> void*;
+    }
 
-        static auto find_class(const std::string_view class_name) noexcept -> jni::hotspot::klass*;
-	}
+    /*
+        @brief Maps C++ wrapper types to their corresponding internal Java class names.
+        @details
+        Populated by register_class() when a C++ wrapper type is associated with
+        a Java class name. Used by hook() and other APIs that need to look up the
+        Java class corresponding to a given C++ wrapper type at runtime.
+        Keys are std::type_index values derived from typeid() of the C++ wrapper type.
+        Values are the internal JVM class names using '/' separators.
+        @see register_class, hook
+    */
+    inline std::unordered_map<std::type_index, std::string> class_map{};
 
-    namespace util
+    template<class T>
+    static auto register_class(std::string_view class_name) noexcept -> bool;
+
+    // ─── HotSpot internals ────────────────────────────────────────────────────
+
+    namespace hotspot
     {
+        // https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/vmStructs.hpp
+        struct VMTypeEntry
+        {
+            const char*   type_name;
+            const char*   superclass_name;
+            std::int32_t  is_oop_type;
+            std::int32_t  is_integer_type;
+            std::int32_t  is_unsigned;
+            std::uint64_t size;
+        };
+
+        // https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/vmStructs.hpp
+        struct VMStructEntry
+        {
+            const char*   type_name;
+            const char*   field_name;
+            const char*   type_string;
+            std::int32_t  is_static;
+            std::uint64_t offset;
+            void*         address;
+        };
+
         /*
-            @brief Checks whether a pointer is likely valid for dereferencing.
-            @param ptr The pointer to validate.
-            @return true if the pointer is within the valid user-space range, false otherwise.
-            @details
-            Filters out null pointers, low sentinel values used by HotSpot to mark
-            the end of linked lists, and kernel-space addresses above 0x00007FFFFFFFFFFF.
-            This check is intentionally lightweight as it is called on every node
-            during dictionary and class loader data walks.
-            @note This is not a guarantee of validity. Always follow with safe_read_ptr
-                  when dereferencing unknown pointer chains.
+            @brief Returns the module handle for jvm.dll loaded in the current process.
         */
-        inline static auto is_valid_ptr(const void* const ptr) noexcept
-            -> bool
+        inline auto get_jvm_module() noexcept -> HMODULE
+        {
+            static HMODULE module{ GetModuleHandleA("jvm.dll") };
+            return module;
+        }
+
+        /*
+            @brief Returns a pointer to the global array of HotSpot VM type entries.
+            @details
+            Resolves gHotSpotVMTypes from jvm.dll via GetProcAddress on first call
+            and caches the typed pointer so subsequent calls are free.
+        */
+        inline auto get_vm_types() noexcept -> VMTypeEntry*
+        {
+            static FARPROC proc{ GetProcAddress(get_jvm_module(), "gHotSpotVMTypes") };
+            static VMTypeEntry* ptr{ *reinterpret_cast<VMTypeEntry**>(proc) };
+            return ptr;
+        }
+
+        /*
+            @brief Returns a pointer to the global array of HotSpot VM struct entries.
+            @details
+            Resolves gHotSpotVMStructs from jvm.dll via GetProcAddress on first call
+            and caches the typed pointer so subsequent calls are free.
+        */
+        inline auto get_vm_structs() noexcept -> VMStructEntry*
+        {
+            static FARPROC proc{ GetProcAddress(get_jvm_module(), "gHotSpotVMStructs") };
+            static VMStructEntry* ptr{ *reinterpret_cast<VMStructEntry**>(proc) };
+            return ptr;
+        }
+
+        /*
+            @brief Searches the gHotSpotVMTypes array for a type entry by name.
+        */
+        static auto iterate_type_entries(const char* const type_name) noexcept -> VMTypeEntry*
+        {
+            for (VMTypeEntry* entry{ get_vm_types() }; entry && entry->type_name; ++entry)
+            {
+                if (!std::strcmp(entry->type_name, type_name))
+                {
+                    return entry;
+                }
+            }
+            return nullptr;
+        }
+
+        /*
+            @brief Searches the gHotSpotVMStructs array for a field entry by type and field name.
+        */
+        static auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept -> VMStructEntry*
+        {
+            for (VMStructEntry* entry{ get_vm_structs() }; entry && entry->type_name; ++entry)
+            {
+                if (!std::strcmp(entry->type_name, type_name) && !std::strcmp(entry->field_name, field_name))
+                {
+                    return entry;
+                }
+            }
+            return nullptr;
+        }
+
+        /*
+            @brief Checks whether a pointer refers to committed readable memory.
+            @details
+            Extends is_valid_ptr with a VirtualQuery call to verify that the memory
+            region containing ptr is actually committed and readable.
+        */
+        static auto is_readable_ptr(const void* const ptr) noexcept -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(ptr) };
 
+            if (addr <= 0xFFFF || addr >= 0x00007FFFFFFFFFFF || (addr & 0x7) != 0)
+            {
+                return false;
+            }
+
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0)
+            {
+                return false;
+            }
+
+            return mbi.State == MEM_COMMIT
+                && (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY)) != 0
+                && (mbi.Protect & PAGE_GUARD) == 0;
+        }
+
+        /*
+            @brief Checks whether a pointer is likely valid for dereferencing.
+            @details
+            Filters out null pointers, low sentinel values used by HotSpot to mark
+            the end of linked lists, and kernel-space addresses above 0x00007FFFFFFFFFFF.
+        */
+        inline static auto is_valid_ptr(const void* const ptr) noexcept -> bool
+        {
+            const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(ptr) };
             return addr > 0xFFFF && addr < 0x00007FFFFFFFFFFF;
         }
 
         /*
             @brief Removes GC tag bits from a HotSpot pointer to recover the real address.
-            @param ptr The potentially tagged pointer to untag.
-            @return The untagged pointer with only the lower 47 bits preserved.
             @details
-            HotSpot's garbage collectors use the low and high bits of OOP and pointer
-            values to store metadata such as mark words and forwarding pointers during
-            GC cycles. Masking with 0x00007FFFFFFFFFFF strips these high bits and
-            recovers the underlying canonical user-space address.
-            @note Always follow with is_valid_ptr on the result before dereferencing.
+            Masking with 0x00007FFFFFFFFFFF strips high GC tag bits and recovers
+            the underlying canonical user-space address.
         */
-        inline static auto untag_ptr(const void* const ptr) noexcept
-            -> const void*
+        inline static auto untag_ptr(const void* const ptr) noexcept -> const void*
         {
             return reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(ptr) & 0x00007FFFFFFFFFFF);
         }
 
         /*
+            @brief Reads a 32-bit pointer field from a JVM structure and zero-extends it.
+        */
+        template<typename _struct>
+        inline static auto read_ptr(const void* const base, const std::uint64_t offset) noexcept -> _struct*
+        {
+            const std::uint32_t raw{ *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(base) + offset) };
+            return reinterpret_cast<_struct*>(static_cast<std::uintptr_t>(raw));
+        }
+
+        /*
             @brief Safely reads a pointer value from a memory address using ReadProcessMemory.
-            @param ptr The address to read a pointer from.
-            @return The pointer value stored at ptr, or nullptr if the read fails.
             @details
             Uses ReadProcessMemory to safely dereference a pointer without risking an
-            access violation. Before attempting the read, a fast pre-check filters out
-            obviously invalid addresses: null, low addresses below 0xFFFF, non-canonical
-            addresses above 0x00007FFFFFFFFFFF, and unaligned addresses not on an 8-byte
-            boundary. These cases are rejected immediately without calling ReadProcessMemory.
-            @note ReadProcessMemory has a higher per-call cost than a direct dereference.
-                  Use only on entry and next pointers during dictionary walks, not on
-                  every field read inside a validated entry.
+            access violation. Pre-checks filter out null, low, non-canonical, and unaligned
+            addresses before calling ReadProcessMemory.
         */
-        static auto safe_read_ptr(const void* const ptr) noexcept
-            -> const void*
+        static auto safe_read_ptr(const void* const ptr) noexcept -> const void*
         {
             if (!ptr)
             {
@@ -141,419 +254,384 @@ namespace jni
             }
 
             const void* result{ nullptr };
-            std::size_t bytes_read{ 0 };
+            SIZE_T bytes_read{ 0 };
 
-            if (!ReadProcessMemory(GetCurrentProcess(),ptr,&result,sizeof(result), &bytes_read) || bytes_read != sizeof(result))
+            if (!ReadProcessMemory(
+                GetCurrentProcess(),
+                ptr,
+                &result,
+                sizeof(result),
+                &bytes_read
+            ) || bytes_read != sizeof(result))
             {
                 return nullptr;
             }
 
             return result;
         }
-    }
-
-    namespace hotspot
-    {
-        /*
-            @brief Describes a single field of a HotSpot internal type as exported by the JVM.
-            @details
-            Each entry in the gHotSpotVMStructs array describes one field of one HotSpot
-            internal type. The array is exported by jvm.dll and populated at JVM startup.
-            It is the canonical source of truth for field offsets and static addresses
-            within the JVM process, allowing native code to access HotSpot internals
-            without hardcoding offsets that change between JVM versions or builds.
-            The array is terminated by an entry whose type_name is nullptr.
-            @see gHotSpotVMStructs, iterate_struct_entries, VMTypeEntry
-        */
-        struct VMStructEntry
-        {
-            /*
-                @brief Fully qualified name of the HotSpot type that owns this field.
-                @details
-                For example "Method", "ConstantPool", "JavaThread", "Klass".
-                Used as the primary key when searching the array via iterate_struct_entries.
-                nullptr on the sentinel terminator entry.
-            */
-            const char* type_name;
-
-            /*
-                @brief Name of the field within the owning type.
-                @details
-                For example "_constMethod", "_i2i_entry", "_thread_state".
-                Used as the secondary key when searching the array via iterate_struct_entries.
-            */
-            const char* field_name;
-
-            /*
-                @brief JVM type string describing the field's declared type.
-                @details
-                For example "void*", "int", "bool", "ConstMethod*".
-                Informational only — not used for offset or address resolution.
-            */
-            const char* type_string;
-
-            /*
-                @brief Non-zero if this field is a static (class-level) field, zero if instance.
-                @details
-                Static fields have a meaningful address value and an offset of zero.
-                Instance fields have a meaningful offset value and an address of nullptr.
-                Always check this flag before deciding whether to use offset or address.
-            */
-            std::int32_t is_static;
-
-            /*
-                @brief Byte offset of this field from the start of an instance of the owning type.
-                @details
-                Only meaningful when is_static is zero.
-                Apply this offset to a pointer to an instance of type_name to reach the field:
-                reinterpret_cast<const std::uint8_t*>(instance) + entry->offset
-                Zero for static fields.
-            */
-            std::uint64_t offset;
-
-            /*
-                @brief Absolute address of this field in the JVM process memory.
-                @details
-                Only meaningful when is_static is non-zero.
-                Points directly to the storage location of the static field value.
-                For pointer fields, dereference once to obtain the value:
-                *reinterpret_cast<T*>(entry->address)
-                nullptr for instance fields.
-            */
-            void* address;
-        };
-
-        /*
-            @brief Describes a single HotSpot internal type as exported by the JVM.
-            @details
-            Each entry in the gHotSpotVMTypes array describes one HotSpot internal type.
-            The array is exported by jvm.dll and populated at JVM startup.
-            It provides metadata about each type including its inheritance hierarchy,
-            classification, and size in bytes, allowing native code to correctly
-            interpret and navigate HotSpot internal structures without hardcoding
-            type sizes that change between JVM versions or builds.
-            The array is terminated by an entry whose type_name is nullptr.
-            @see gHotSpotVMTypes, iterate_type_entries, VMStructEntry
-        */
-        struct VMTypeEntry
-        {
-            /*
-                @brief Fully qualified name of this HotSpot type.
-                @details
-                For example "Method", "ConstantPool", "JavaThread", "Klass", "Symbol".
-                Used as the primary key when searching the array via iterate_type_entries.
-                nullptr on the sentinel terminator entry.
-            */
-            const char* type_name;
-
-            /*
-                @brief Name of the immediate superclass of this type, or nullptr if none.
-                @details
-                For example "Klass" is the superclass of "InstanceKlass".
-                nullptr for root types such as "Thread" or types with no superclass
-                in the HotSpot type hierarchy.
-                Informational only — not used for size or offset resolution.
-            */
-            const char* superclass_name;
-
-            /*
-                @brief Non-zero if this type is an OOP (ordinary object pointer) type.
-                @details
-                OOP types represent Java heap objects and are subject to garbage
-                collection. Their pointers may be compressed on 64-bit JVMs with
-                compressed OOPs enabled and must be decoded via decode_oop_ptr
-                before dereferencing.
-                Zero for non-OOP types such as metadata and native structs.
-            */
-            std::int32_t is_oop_type;
-
-            /*
-                @brief Non-zero if this type is an integer type.
-                @details
-                Integer types include primitive integral types used internally
-                by HotSpot such as int, jint, intptr_t, and similar.
-                Zero for pointer, OOP, and compound struct types.
-            */
-            std::int32_t is_integer_type;
-
-            /*
-                @brief Non-zero if this integer type is unsigned.
-                @details
-                Only meaningful when is_integer_type is non-zero.
-                Indicates that the integer type should be interpreted as unsigned
-                when reading or printing its value.
-                Zero for signed integer types and all non-integer types.
-            */
-            std::int32_t is_unsigned;
-
-            /*
-                @brief Size in bytes of this type in the JVM process memory.
-                @details
-                The primary use of VMTypeEntry is to retrieve this size value.
-                It is used to compute the base address of variable-length structures
-                that store their data immediately after the fixed-size header, such
-                as ConstantPool whose entry array begins at:
-                reinterpret_cast<const std::uint8_t*>(constant_pool_ptr) + entry->size
-                The size reflects the actual in-process layout including padding and
-                alignment, not the logical or source-level sizeof the type.
-            */
-            std::uint64_t size;
-        };
-
-        /*
-            @brief Returns the module handle for jvm.dll loaded in the current process.
-            @return Handle to jvm.dll, or nullptr if jvm.dll is not loaded.
-            @details
-            Retrieves and caches the HMODULE for jvm.dll on first call using
-            GetModuleHandleA. The result is stored in a static local variable
-            so subsequent calls return immediately without repeated system calls.
-            This handle is used as the base for resolving gHotSpotVMTypes and
-            gHotSpotVMStructs via GetProcAddress, and for computing the scan
-            range when searching jvm.dll for internal function patterns such as
-            JavaCalls::call_virtual.
-            @note jvm.dll must already be loaded in the process before this
-                  function is called for the first time. Since EasyJNI is injected
-                  into a running JVM process, this is always guaranteed to be the
-                  case by the time any EasyJNI code executes.
-            @note The returned handle is not reference counted and must not be
-                  passed to FreeLibrary.
-            @see get_vm_types, get_vm_structs
-        */
-        inline auto get_jvm_module() noexcept
-            -> HMODULE
-        {
-            static HMODULE module{ GetModuleHandleA("jvm.dll") };
-
-            return module;
-        }
-
-        /*
-            @brief Returns a pointer to the global array of HotSpot VM type entries.
-            @return Pointer to the first entry in the gHotSpotVMTypes array exported
-                    by jvm.dll, or nullptr if the symbol could not be resolved.
-            @details
-            Resolves gHotSpotVMTypes from jvm.dll via GetProcAddress on first call
-            and caches both the raw FARPROC and the typed pointer in static local
-            variables so subsequent calls return immediately without repeated
-            symbol resolution.
-            The returned array describes every HotSpot internal type known to the
-            running JVM, including its name, superclass, classification flags, and
-            size in bytes. It is terminated by an entry whose type_name is nullptr.
-            This array is the sole source used by iterate_type_entries to look up
-            type metadata such as the size of ConstantPool at runtime.
-            @note The array is populated by the JVM at startup and remains valid
-                  and immutable for the lifetime of the JVM process. The returned
-                  pointer may be used freely without synchronization.
-            @note get_jvm_module() must return a valid handle for this function
-                  to succeed. Since EasyJNI executes inside a running JVM process,
-                  jvm.dll is always loaded before any EasyJNI code runs.
-            @see VMTypeEntry, iterate_type_entries, get_vm_structs, get_jvm_module
-        */
-        inline auto get_vm_types() noexcept
-            -> jni::hotspot::VMTypeEntry*
-        {
-            static FARPROC proc{ GetProcAddress(get_jvm_module(), "gHotSpotVMTypes") };
-            
-            static VMTypeEntry* ptr{ *reinterpret_cast<VMTypeEntry**>(proc) };
-            
-            return ptr;
-        }
-
-        /*
-            @brief Returns a pointer to the global array of HotSpot VM struct entries.
-            @return Pointer to the first entry in the gHotSpotVMStructs array exported
-                    by jvm.dll, or nullptr if the symbol could not be resolved.
-            @details
-            Resolves gHotSpotVMStructs from jvm.dll via GetProcAddress on first call
-            and caches both the raw FARPROC and the typed pointer in static local
-            variables so subsequent calls return immediately without repeated
-            symbol resolution.
-            The returned array describes every field of every HotSpot internal type
-            known to the running JVM, including its name, type string, static flag,
-            byte offset within the owning type, and absolute address for static fields.
-            It is terminated by an entry whose type_name is nullptr.
-            This array is the sole source used by iterate_struct_entries to resolve
-            field offsets and static addresses at runtime without hardcoding values
-            that change between JVM versions or builds.
-            @note The array is populated by the JVM at startup and remains valid
-                  and immutable for the lifetime of the JVM process. The returned
-                  pointer may be used freely without synchronization.
-            @note get_jvm_module() must return a valid handle for this function
-                  to succeed. Since EasyJNI executes inside a running JVM process,
-                  jvm.dll is always loaded before any EasyJNI code runs.
-            @see VMStructEntry, iterate_struct_entries, get_vm_types, get_jvm_module
-        */
-        inline auto get_vm_structs() noexcept
-            -> jni::hotspot::VMStructEntry*
-        {
-            static FARPROC proc{ GetProcAddress(get_jvm_module(), "gHotSpotVMStructs") };
-            
-            static VMStructEntry* ptr{ *reinterpret_cast<VMStructEntry**>(proc) };
-            
-            return ptr;
-        }
-
-        /*
-            @brief Searches the gHotSpotVMTypes array for a type entry by name.
-            @param type_name The name of the HotSpot type to find (e.g. "ConstantPool", "Method").
-            @return Pointer to the matching VMTypeEntry if found, nullptr otherwise.
-            @details
-            Walks the gHotSpotVMTypes array linearly from the first entry until it
-            finds an entry whose type_name matches the provided string, or until the
-            null terminator entry is reached.
-            The returned pointer points directly into the gHotSpotVMTypes array and
-            remains valid for the lifetime of the JVM process.
-            The primary use of this function is to retrieve the size of a HotSpot type
-            in order to locate variable-length data stored immediately after its header,
-            such as the ConstantPool entry array.
-            @note Linear scan cost is paid only once per unique type_name since callers
-                  store the result in a static local variable.
-            @see VMTypeEntry, get_vm_types, iterate_struct_entries
-        */
-        static auto iterate_type_entries(const char* const type_name) noexcept
-            -> jni::hotspot::VMTypeEntry*
-        {
-            for (jni::hotspot::VMTypeEntry* entry{ jni::hotspot::get_vm_types() }; entry->type_name; ++entry)
-            {
-                if (!std::strcmp(entry->type_name, type_name))
-                {
-                    return entry;
-                }
-            }
-
-            return nullptr;
-        }
-
-        /*
-            @brief Searches the gHotSpotVMStructs array for a field entry by type and field name.
-            @param type_name  The name of the HotSpot type that owns the field (e.g. "Method").
-            @param field_name The name of the field to find (e.g. "_constMethod", "_i2i_entry").
-            @return Pointer to the matching VMStructEntry if found, nullptr otherwise.
-            @details
-            Walks the gHotSpotVMStructs array linearly from the first entry until it
-            finds an entry whose type_name and field_name both match the provided strings,
-            or until the null terminator entry is reached.
-            The returned pointer points directly into the gHotSpotVMStructs array and
-            remains valid for the lifetime of the JVM process.
-            For instance fields, use entry->offset to locate the field within an object:
-                reinterpret_cast<const std::uint8_t*>(instance) + entry->offset
-            For static fields, use entry->address to access the field directly:
-                *reinterpret_cast<T*>(entry->address)
-            @note Linear scan cost is paid only once per unique (type_name, field_name) pair
-                  since callers store the result in a static local variable.
-            @see VMStructEntry, get_vm_structs, iterate_type_entries
-        */
-        static auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept
-            -> jni::hotspot::VMStructEntry*
-        {
-            for (jni::hotspot::VMStructEntry* entry{ jni::hotspot::get_vm_structs() }; entry->type_name; ++entry)
-            {
-                if (!std::strcmp(entry->type_name, type_name) && !std::strcmp(entry->field_name, field_name))
-                {
-                    return entry;
-                }
-            }
-
-            return nullptr;
-        }
 
         /*
             @brief Represents a HotSpot internal Symbol object.
             @details
             Symbols are interned strings used throughout the JVM to represent class names,
-            method names, field names, and type signatures. They are stored in a shared
-            symbol table and reused across the JVM. The layout is resolved at runtime
-            via gHotSpotVMStructs using the offsets of Symbol._length and Symbol._body.
+            method names, field names, and type signatures. The layout is resolved at
+            runtime via gHotSpotVMStructs using the offsets of Symbol._length and Symbol._body.
         */
         struct symbol
         {
             /*
-                @brief Returns the length of this symbol in characters.
-                @return The number of characters in the symbol's body,
-                        or 0 if the entry could not be found or the pointer is invalid.
-                @details
-                Reads the _length field using its offset retrieved from gHotSpotVMStructs.
-                The length is stored as an unsigned 16-bit integer and represents the
-                number of bytes in the symbol body, not including any null terminator.
-            */
-            auto get_length() const noexcept
-                -> std::uint16_t
-            {
-                static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Symbol", "_length") };
-
-                if (!entry || !jni::util::is_valid_ptr(this))
-                {
-                    return 0;
-                }
-
-                return *reinterpret_cast<const std::uint16_t*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset);
-            }
-
-            /*
-                @brief Returns a pointer to the raw character data of this symbol.
-                @return Pointer to the first character of the symbol body,
-                        or nullptr if the entry could not be found or the pointer is invalid.
-                @details
-                Reads the _body field using its offset retrieved from gHotSpotVMStructs.
-                The body is a sequence of bytes of length get_length(), not null terminated.
-                The returned pointer points directly into JVM metaspace and remains valid
-                as long as the owning symbol is alive in the JVM symbol table.
-            */
-            auto get_body() const noexcept
-                -> const char*
-            {
-                static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Symbol", "_body") };
-
-                if (!entry || !jni::util::is_valid_ptr(this))
-                {
-                    return nullptr;
-                }
-
-                return reinterpret_cast<const char*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset);
-            }
-
-            /*
                 @brief Converts this HotSpot Symbol to a std::string.
                 @return A std::string containing a copy of the symbol's character data,
-                        or an empty string if the symbol pointer is invalid, the length
-                        is zero, or the length exceeds the sanity threshold.
-                @details
-                Validates the symbol pointer via safe_read_ptr before touching any fields
-                to handle partially initialized or GC-tagged symbol pointers gracefully.
-                Reads the length via get_length() and the body via get_body(), both of
-                which resolve their offsets from gHotSpotVMStructs on first call.
-                The length is checked against a sanity threshold of 0x1000 (4096) characters.
-                Legitimate Java class, method, and field names never approach this limit
-                in practice — exceeding it indicates that this pointer does not refer to
-                a valid Symbol and the memory contents are garbage, likely due to GC
-                relocation or memory reuse. Reading past this threshold risks accessing
-                gigabytes of arbitrary memory and is rejected immediately.
-                @note The returned std::string owns its data and is safe to use
-                      independently of JVM memory after construction.
+                        or an empty string on failure.
             */
-            auto to_string() const noexcept
-                -> std::string
+            auto to_string() const -> std::string
             {
-                if (!jni::util::safe_read_ptr(this))
+                static const VMStructEntry* const length_entry{ iterate_struct_entries("Symbol", "_length") };
+                static const VMStructEntry* const body_entry{ iterate_struct_entries("Symbol", "_body") };
+
+                try
                 {
+                    if (!length_entry)
+                    {
+                        throw jni_exception{ "Failed to find Symbol._length entry." };
+                    }
+
+                    if (!body_entry)
+                    {
+                        throw jni_exception{ "Failed to find Symbol._body entry." };
+                    }
+
+                    if (!safe_read_ptr(this))
+                    {
+                        return std::string{};
+                    }
+
+                    const std::uint16_t length{ *reinterpret_cast<const std::uint16_t*>(reinterpret_cast<const std::uint8_t*>(this) + length_entry->offset) };
+                    const char* const body{ reinterpret_cast<const char*>(reinterpret_cast<const std::uint8_t*>(this) + body_entry->offset) };
+
+                    if (!is_valid_ptr(body) || length == 0 || length > 0x1000)
+                    {
+                        return std::string{};
+                    }
+
+                    return std::string{ body, length };
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} symbol.to_string() {}", easy_jni_error, e.what());
                     return std::string{};
                 }
+            }
+        };
 
-                const std::uint16_t length{ this->get_length() };
+        /*
+            @brief Represents a HotSpot internal ConstantPool object.
+            @details
+            The constant pool holds all constants referenced by a Java class.
+            The layout is resolved at runtime via gHotSpotVMStructs using the size
+            of the ConstantPool type to locate the base of the pool entries array.
+        */
+        struct constant_pool
+        {
+            /*
+                @brief Returns a pointer to the base of the constant pool entries array.
+                @details
+                The entries are stored immediately after the ConstantPool header.
+                The base is computed by adding the size of the ConstantPool type to this.
+            */
+            auto get_base() const -> void**
+            {
+                static const VMTypeEntry* const entry{ iterate_type_entries("ConstantPool") };
 
-                if (!length || length > 0x1000)
+                try
                 {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ConstantPool entry." };
+                    }
+
+                    return reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<constant_pool*>(this)) + entry->size);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} constant_pool.get_base() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+        };
+
+        /*
+            @brief Represents a HotSpot internal ConstMethod object.
+            @details
+            ConstMethod holds the immutable metadata of a Java method, including its name,
+            signature, and a reference to the owning class constant pool.
+            The layout is resolved at runtime via gHotSpotVMStructs.
+        */
+        struct const_method
+        {
+            /*
+                @brief Returns a pointer to the constant pool of the owning class.
+            */
+            auto get_constants() const -> constant_pool*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("ConstMethod", "_constants") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ConstMethod._constants entry." };
+                    }
+
+                    return *reinterpret_cast<constant_pool**>(reinterpret_cast<std::uint8_t*>(const_cast<const_method*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} const_method.get_constants() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the symbol representing the name of this method.
+            */
+            auto get_name() const -> symbol*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("ConstMethod", "_name_index") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ConstMethod._name_index entry." };
+                    }
+
+                    const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<const_method*>(this)) + entry->offset) };
+                    return reinterpret_cast<symbol*>(get_constants()->get_base()[index]);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} const_method.get_name() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the symbol representing the signature of this method.
+            */
+            auto get_signature() const -> symbol*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("ConstMethod", "_signature_index") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ConstMethod._signature_index entry." };
+                    }
+
+                    const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<const_method*>(this)) + entry->offset) };
+                    return reinterpret_cast<symbol*>(get_constants()->get_base()[index]);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} const_method.get_signature() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+        };
+
+        /*
+            @brief Represents a HotSpot internal Method object.
+            @details
+            The Method object is the JVM's internal representation of a Java method.
+            It holds all runtime metadata needed to invoke, compile, and profile a method,
+            including its entry points, access flags, compilation flags, and a pointer
+            to its immutable ConstMethod.
+            The layout is resolved at runtime via gHotSpotVMStructs.
+        */
+        struct method
+        {
+            /*
+                @brief Returns the interpreter-to-interpreter entry point of this method.
+                @details
+                The i2i entry is the native code stub invoked when an interpreted method
+                calls another interpreted method. It is used as the hook location target
+                in midi2i_hook.
+            */
+            auto get_i2i_entry() const -> void*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Method", "_i2i_entry") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find Method._i2i_entry entry." };
+                    }
+
+                    return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} method.get_i2i_entry() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the from-interpreted entry point of this method.
+            */
+            auto get_from_interpreted_entry() const -> void*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Method", "_from_interpreted_entry") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find Method._from_interpreted_entry entry." };
+                    }
+
+                    return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} method.get_from_interpreted_entry() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns a pointer to the access flags of this method.
+                @details
+                Access flags encode Java visibility modifiers (public, private, static, etc.)
+                as well as JVM-internal flags such as NO_COMPILE.
+            */
+            auto get_access_flags() const -> std::uint32_t*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Method", "_access_flags") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find Method._access_flags entry." };
+                    }
+
+                    return reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} method.get_access_flags() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns a pointer to the internal method flags of this method.
+                @details
+                These flags encode HotSpot-internal method properties such as _dont_inline.
+            */
+            auto get_flags() const -> std::uint16_t*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Method", "_flags") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find Method._flags entry." };
+                    }
+
+                    return reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} method.get_flags() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns a pointer to the ConstMethod of this method.
+            */
+            auto get_const_method() const -> const_method*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Method", "_constMethod") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find Method._constMethod entry." };
+                    }
+
+                    return *reinterpret_cast<const_method**>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} method.get_const_method() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the name of this method as a std::string.
+            */
+            auto get_name() const -> std::string
+            {
+                const const_method* const cm{ this->get_const_method() };
+
+                try
+                {
+                    if (!cm)
+                    {
+                        throw jni_exception{ "ConstMethod is nullptr." };
+                    }
+
+                    const symbol* const sym{ cm->get_name() };
+                    if (!sym)
+                    {
+                        throw jni_exception{ "Symbol is nullptr." };
+                    }
+
+                    return sym->to_string();
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} method.get_name() {}", easy_jni_error, e.what());
                     return std::string{};
                 }
+            }
 
-                const char* const body{ this->get_body() };
+            /*
+                @brief Returns the signature of this method as a std::string.
+            */
+            auto get_signature() const -> std::string
+            {
+                const const_method* const cm{ this->get_const_method() };
 
-                if (!jni::util::is_valid_ptr(body))
+                try
                 {
+                    if (!cm)
+                    {
+                        throw jni_exception{ "ConstMethod is nullptr." };
+                    }
+
+                    const symbol* const sym{ cm->get_signature() };
+                    if (!sym)
+                    {
+                        throw jni_exception{ "Symbol is nullptr." };
+                    }
+
+                    return sym->to_string();
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} method.get_signature() {}", easy_jni_error, e.what());
                     return std::string{};
                 }
-
-                return std::string{ body, length };
             }
         };
 
@@ -561,41 +639,228 @@ namespace jni
             @brief Represents a HotSpot internal Klass object.
             @details
             Klass is the JVM's internal representation of a Java class or interface.
-            It holds all metadata needed to describe a type at runtime including its
-            name and superclass. The layout is resolved at runtime via gHotSpotVMStructs
-            using the offset of Klass._name.
-            @note A pointer to this struct is obtained by walking the ClassLoaderDataGraph
-                  via class_loader_data_graph::get_all_classes().
-            @see symbol, class_loader_data_graph
+            The layout is resolved at runtime via gHotSpotVMStructs.
         */
         struct klass
         {
             /*
                 @brief Returns the symbol representing the internal name of this class.
-                @return Pointer to the symbol containing the class name using '/' separators
-                        (e.g. "java/lang/String"), or nullptr if the name cannot be read.
-                @details
-                Reads the _name field using its offset retrieved from gHotSpotVMStructs.
-                The raw pointer is untagged via untag_ptr to strip any GC tag bits before
-                casting to symbol*, and validated via is_valid_ptr before returning.
-                @note The returned pointer points directly into JVM metaspace and remains
-                      valid as long as the owning class is loaded in the JVM.
+                @return Pointer to the symbol containing the class name using '/' separators,
+                        or nullptr on failure.
             */
-            auto get_name() const noexcept
-                -> symbol*
+            auto get_name() const -> symbol*
             {
-                static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("Klass", "_name") };
+                static const VMStructEntry* const entry{ iterate_struct_entries("Klass", "_name") };
 
-                if (!entry || !jni::util::is_valid_ptr(this))
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find Klass._name entry." };
+                    }
+
+                    if (!is_valid_ptr(this))
+                    {
+                        return nullptr;
+                    }
+
+                    const void* const raw{ safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
+                    symbol* const sym{ reinterpret_cast<symbol*>(const_cast<void*>(untag_ptr(raw))) };
+
+                    return is_valid_ptr(sym) ? sym : nullptr;
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} klass.get_name() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the next sibling klass in the ClassLoaderData klass linked list.
+            */
+            auto get_next_link() const -> klass*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Klass", "_next_link") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find Klass._next_link entry." };
+                    }
+
+                    if (!is_valid_ptr(this))
+                    {
+                        return nullptr;
+                    }
+
+                    klass* const next{ *reinterpret_cast<klass**>(reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + entry->offset) };
+
+                    return is_valid_ptr(next) ? next : nullptr;
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} klass.get_next_link() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the number of methods declared by this InstanceKlass.
+                @details
+                Reads InstanceKlass._methods via its VMStruct offset, then reads
+                the Array<Method*>::_length field at offset 0 of the array.
+                @note This klass* must be an InstanceKlass* (i.e. a regular Java class).
+            */
+            auto get_methods_count() const noexcept -> std::int32_t
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("InstanceKlass", "_methods") };
+
+                if (!entry || !is_valid_ptr(this))
+                {
+                    return 0;
+                }
+
+                void* const array{ *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + entry->offset) };
+
+                if (!is_valid_ptr(array))
+                {
+                    return 0;
+                }
+
+                return *reinterpret_cast<std::int32_t*>(array);
+            }
+
+            /*
+                @brief Returns a pointer to the first Method* in this InstanceKlass's methods array.
+                @details
+                Reads InstanceKlass._methods via its VMStruct offset. The Array<Method*> layout
+                in HotSpot is: [int _length (4 bytes)] [4 bytes padding] [Method* _data[...]].
+                Data starts at offset 8 from the array base pointer.
+                @note This klass* must be an InstanceKlass* (i.e. a regular Java class).
+            */
+            auto get_methods_ptr() const noexcept -> method**
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("InstanceKlass", "_methods") };
+
+                if (!entry || !is_valid_ptr(this))
                 {
                     return nullptr;
                 }
 
-                const void* const raw{ jni::util::safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
+                void* const array{ *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + entry->offset) };
 
-                jni::hotspot::symbol* const symbol{ reinterpret_cast<jni::hotspot::symbol*>(const_cast<void*>(jni::util::untag_ptr(raw))) };
+                if (!is_valid_ptr(array))
+                {
+                    return nullptr;
+                }
 
-                return jni::util::is_valid_ptr(symbol) ? symbol : nullptr;
+                return reinterpret_cast<method**>(reinterpret_cast<std::uint8_t*>(array) + 8);
+            }
+        };
+
+        /*
+            @brief Represents a HotSpot ClassLoaderData node.
+            @details
+            Each ClassLoader in the JVM has a corresponding ClassLoaderData that
+            tracks every Klass it has loaded. The ClassLoaderData nodes are chained
+            together via _next into a global linked list whose head is held by
+            ClassLoaderDataGraph::_head.
+        */
+        struct class_loader_data
+        {
+            /*
+                @brief Returns the head of the klass linked list for this classloader.
+                @details
+                Reads ClassLoaderData::_klasses using its offset from gHotSpotVMStructs.
+            */
+            auto get_klasses() const -> klass*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("ClassLoaderData", "_klasses") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ClassLoaderData._klasses entry." };
+                    }
+
+                    if (!is_valid_ptr(this))
+                    {
+                        return nullptr;
+                    }
+
+                    const std::uint32_t compressed{ *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
+                    klass* const result{ reinterpret_cast<klass*>(decode_oop_ptr(compressed)) };
+
+                    return is_valid_ptr(result) ? result : nullptr;
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} class_loader_data.get_klasses() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the next ClassLoaderData node in the global linked list.
+            */
+            auto get_next() const -> class_loader_data*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("ClassLoaderData", "_next") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ClassLoaderData._next entry." };
+                    }
+
+                    if (!is_valid_ptr(this))
+                    {
+                        return nullptr;
+                    }
+
+                    class_loader_data* const next{ reinterpret_cast<class_loader_data*>(const_cast<void*>(safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
+
+                    return is_valid_ptr(next) ? next : nullptr;
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} class_loader_data.get_next() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
+            }
+
+            /*
+                @brief Returns the Dictionary associated with this classloader.
+            */
+            auto get_dictionary() const -> dictionary*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("ClassLoaderData", "_dictionary") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ClassLoaderData._dictionary entry." };
+                    }
+
+                    if (!is_valid_ptr(this))
+                    {
+                        return nullptr;
+                    }
+
+                    dictionary* const dict{ reinterpret_cast<dictionary*>(const_cast<void*>(safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
+
+                    return is_valid_ptr(dict) ? dict : nullptr;
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} class_loader_data.get_dictionary() {}", easy_jni_error, e.what());
+                    return nullptr;
+                }
             }
         };
 
@@ -610,140 +875,57 @@ namespace jni
             Each bucket slot holds a pointer to the head of a linked list of
             DictionaryEntry nodes. Each DictionaryEntry has:
             - offset 0:  _next (DictionaryEntry*) — next entry in the chain
+            - offset 8:  _hash (uint32)
             - offset 16: _literal (Klass*) — the actual class
-            @see class_loader_data, klass
         */
         struct dictionary
         {
-            /*
-                @brief Returns the number of buckets in this dictionary.
-                @return The bucket count as a signed 32-bit integer.
-                @details
-                Reads _table_size at offset 0 per BasicHashtable VMStruct layout.
-            */
-            inline auto get_table_size() const noexcept
-                -> std::int32_t
+            inline auto get_table_size() const noexcept -> std::int32_t
             {
                 return *reinterpret_cast<const std::int32_t*>(this);
             }
 
-            /*
-                @brief Returns a pointer to the bucket array.
-                @return Pointer to the first bucket slot, or nullptr if invalid.
-                @details
-                Reads _buckets at offset 8 per BasicHashtable VMStruct layout.
-                Each bucket slot is a pointer to the head DictionaryEntry of that
-                bucket's chain.
-            */
-            inline auto get_buckets() const noexcept
-                -> const std::uint8_t*
+            inline auto get_buckets() const noexcept -> const std::uint8_t*
             {
                 return *reinterpret_cast<const std::uint8_t* const*>(reinterpret_cast<const std::uint8_t*>(this) + 8);
             }
 
             /*
-                @brief Collects all klass pointers stored in this dictionary.
-                @param result The vector to append found klass pointers into.
-                @details
-                Iterates over every bucket and follows each entry chain via the
-                _next pointer at offset 0, reading the Klass* from _literal at
-                offset 16 of each DictionaryEntry. Both entry and klass pointers
-                are validated via is_valid_ptr and untag_ptr before use to handle
-                GC-tagged values and partially initialized entries safely.
+                @brief Searches this dictionary for a klass by its internal name.
             */
-            auto collect_classes(std::vector<jni::hotspot::klass*>& result) const noexcept
-                -> void
+            auto find_klass(const std::string_view class_name) const -> klass*
             {
-                const std::int32_t table_size{ this->get_table_size() };
-                const std::uint8_t* const buckets{ this->get_buckets() };
+                const std::int32_t table_size{ get_table_size() };
+                const std::uint8_t* const buckets{ get_buckets() };
 
-                if (!jni::util::is_valid_ptr(buckets) || table_size <= 0 || table_size > 0x186A0)
+                if (!is_valid_ptr(buckets) || table_size <= 0 || table_size > 0x186A0)
                 {
-                    return;
+                    return nullptr;
                 }
 
                 for (std::int32_t i{ 0 }; i < table_size; ++i)
                 {
-                    const std::uint8_t* entry{ reinterpret_cast<const std::uint8_t*>(jni::util::untag_ptr(jni::util::safe_read_ptr(buckets + i * 8))) };
+                    const std::uint8_t* entry{ reinterpret_cast<const std::uint8_t*>(untag_ptr(safe_read_ptr(buckets + i * 8))) };
 
-                    while (jni::util::is_valid_ptr(entry))
+                    while (is_valid_ptr(entry))
                     {
-                        const void* const raw_klass{ jni::util::safe_read_ptr(entry + 16) };
+                        const void* const raw_klass{ safe_read_ptr(entry + 16) };
+                        const klass* const k{ reinterpret_cast<const klass*>(untag_ptr(raw_klass)) };
 
-                        jni::hotspot::klass* const klass{ reinterpret_cast<jni::hotspot::klass*>(const_cast<void*>(jni::util::untag_ptr(raw_klass))) };
-
-                        if (jni::util::is_valid_ptr(klass))
+                        if (is_valid_ptr(k))
                         {
-                            result.push_back(klass);
+                            const symbol* const sym{ k->get_name() };
+                            if (is_valid_ptr(sym) && sym->to_string() == class_name)
+                            {
+                                return const_cast<klass*>(k);
+                            }
                         }
 
-                        entry = reinterpret_cast<const std::uint8_t*>(jni::util::untag_ptr(jni::util::safe_read_ptr(entry)));
+                        entry = reinterpret_cast<const std::uint8_t*>(untag_ptr(safe_read_ptr(entry)));
                     }
                 }
-            }
-        };
 
-        /*
-            @brief Represents a HotSpot ClassLoaderData node.
-            @details
-            Each ClassLoader in the JVM has a corresponding ClassLoaderData that
-            tracks every Klass it has loaded. The ClassLoaderData nodes are chained
-            together via _next into a global linked list whose head is held by
-            ClassLoaderDataGraph::_head.
-            @see dictionary, class_loader_data_graph, klass
-        */
-        struct class_loader_data
-        {
-            /*
-                @brief Returns the next ClassLoaderData node in the global linked list.
-                @return Pointer to the next class_loader_data, or nullptr if this is the last.
-                @details
-                Reads ClassLoaderData::_next using its offset from gHotSpotVMStructs.
-                Uses safe_read_ptr to handle partially initialized or GC-tagged pointers.
-            */
-            auto get_next() const noexcept
-                -> jni::hotspot::class_loader_data*
-            {
-                static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("ClassLoaderData", "_next") };
-
-                if (!entry || !jni::util::is_valid_ptr(this))
-                {
-                    return nullptr;
-                }
-
-                const void* const raw{ jni::util::safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
-
-                return 
-                    jni::util::is_valid_ptr(raw)
-                    ? const_cast<jni::hotspot::class_loader_data*>(reinterpret_cast<const jni::hotspot::class_loader_data*>(raw))
-                    : nullptr;
-            }
-
-            /*
-                @brief Returns the Dictionary associated with this classloader.
-                @return Pointer to the dictionary for this classloader, or nullptr if this
-                        classloader has no dictionary or on failure.
-                @details
-                Reads ClassLoaderData::_dictionary using its offset from gHotSpotVMStructs.
-                The bootstrap classloader typically has no dictionary and returns nullptr.
-                Uses safe_read_ptr to handle partially initialized or GC-tagged pointers.
-            */
-            auto get_dictionary() const noexcept
-                -> jni::hotspot::dictionary*
-            {
-                static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("ClassLoaderData", "_dictionary") };
-
-                if (!entry || !jni::util::is_valid_ptr(this))
-                {
-                    return nullptr;
-                }
-
-                const void* const raw{ jni::util::safe_read_ptr( reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
-
-                return 
-                    jni::util::is_valid_ptr(raw)
-                    ? const_cast<jni::hotspot::dictionary*>(reinterpret_cast<const jni::hotspot::dictionary*>(raw))
-                    : nullptr;
+                return nullptr;
             }
         };
 
@@ -752,163 +934,944 @@ namespace jni
             @details
             ClassLoaderDataGraph::_head is a static field holding the head of a global
             linked list of ClassLoaderData nodes, one per classloader registered in the JVM.
-            Walking this list gives access to every class loaded by every classloader,
-            including the bootstrap loader, the platform loader, the app loader, and all
-            custom classloaders such as Minecraft's own classloader.
-            @see class_loader_data, dictionary, klass
         */
         struct class_loader_data_graph
         {
             /*
                 @brief Returns the head of the global ClassLoaderData linked list.
-                @return Pointer to the first class_loader_data node, or nullptr on failure.
-                @details
-                Reads ClassLoaderDataGraph::_head via its absolute VMStruct address since
-                _head is a static field. The returned node is the entry point for walking
-                every classloader registered in the JVM. Subsequent nodes are accessed via
-                class_loader_data::get_next().
             */
-            auto get_head() const noexcept
-                -> jni::hotspot::class_loader_data*
+            auto get_head() const -> class_loader_data*
             {
-                static const jni::hotspot::VMStructEntry* const entry{ jni::hotspot::iterate_struct_entries("ClassLoaderDataGraph", "_head") };
+                static const VMStructEntry* const entry{ iterate_struct_entries("ClassLoaderDataGraph", "_head") };
 
-                if (!entry)
+                try
                 {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find ClassLoaderDataGraph._head entry." };
+                    }
+
+                    class_loader_data* const head{ *reinterpret_cast<class_loader_data* const*>(entry->address) };
+
+                    return is_valid_ptr(head) ? head : nullptr;
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} class_loader_data_graph.get_head() {}", easy_jni_error, e.what());
                     return nullptr;
                 }
-
-                jni::hotspot::class_loader_data* const head{ *reinterpret_cast<jni::hotspot::class_loader_data* const*>(entry->address) };
-
-                return jni::util::is_valid_ptr(head) ? head : nullptr;
             }
 
             /*
-                @brief Returns a vector of pointers to all klass objects loaded in the JVM.
-                @return A std::vector containing a raw pointer to every klass found across
-                        all classloader dictionaries. May be empty if no classes are loaded yet.
+                @brief Searches all loaded classloaders for a klass by its internal name.
+                @param class_name The internal JVM class name using '/' separators
+                                  (e.g. "java/lang/String", "net/minecraft/client/Minecraft").
+                @return Pointer to the matching klass if found, nullptr otherwise.
                 @details
-                Walks the full ClassLoaderDataGraph by starting at get_head() and following
-                each ClassLoaderData::_next pointer until the end of the list. For each
-                ClassLoaderData node, retrieves its Dictionary and calls collect_classes()
-                to gather every klass pointer stored in that dictionary's hashtable.
-                The returned pointers point directly into JVM metaspace and remain valid
-                as long as the corresponding classes remain loaded. Classes loaded by
-                short-lived classloaders may be unloaded, invalidating their klass pointers.
-                @note The returned vector may contain duplicate pointers if the same class
-                      is somehow registered in multiple dictionaries, though this is rare.
-                @note Call this after the JVM has finished loading the classes you need.
-                      Classes not yet loaded will not appear in the result.
+                Walks the full ClassLoaderDataGraph using only HotSpot internal structures
+                resolved via gHotSpotVMStructs, without any JNI or JVMTI calls.
             */
-            auto get_all_classes() const noexcept
-                -> std::vector<jni::hotspot::klass*>
+            auto find_klass(const std::string_view class_name) const -> klass*
             {
-                std::vector<jni::hotspot::klass*> result{};
+                class_loader_data* cld{ this->get_head() };
 
-                jni::hotspot::class_loader_data* class_loader_data{ this->get_head() };
-
-                while (jni::util::is_valid_ptr(class_loader_data))
+                while (is_valid_ptr(cld) && cld)
                 {
-                    jni::hotspot::dictionary* const dict{ class_loader_data->get_dictionary() };
+                    dictionary* const dict{ cld->get_dictionary() };
 
-                    if (jni::util::is_valid_ptr(dict))
+                    if (is_valid_ptr(dict))
                     {
-                        dict->collect_classes(result);
+                        klass* const k{ dict->find_klass(class_name) };
+
+                        if (k)
+                        {
+                            return k;
+                        }
                     }
 
-                    class_loader_data = class_loader_data->get_next();
+                    class_loader_data* const next{ cld->get_next() };
+                    cld = is_valid_ptr(next) ? next : nullptr;
                 }
 
-                return result;
+                return nullptr;
             }
         };
 
         /*
-            @brief Finds a loaded Java class by its internal name using HotSpot internals.
-            @param class_name The internal JVM class name using '/' separators
-                              (e.g. "java/lang/String", "net/minecraft/client/Minecraft").
-            @return Pointer to the matching klass if found, nullptr otherwise.
-            @details
-            Checks the loaded_classes cache first to avoid repeating the full
-            ClassLoaderDataGraph walk on subsequent calls for the same class name.
-            On cache miss, walks the full ClassLoaderDataGraph by calling
-            get_all_classes() and comparing each klass name symbol against the
-            requested class_name. On a match the result is inserted into the cache
-            before returning.
-            This function is the HotSpot-native replacement for JNI's FindClass and
-            JVMTI's GetLoadedClasses. It covers all loaded classes across all
-            classloaders including the bootstrap loader, JDK classes, and any
-            application classloader such as Minecraft's own classloader.
-            @note The returned klass* points directly into JVM metaspace and remains
-                  valid as long as the class remains loaded in the JVM.
-            @note The class name must use '/' as the package separator, not '.'.
-            @see loaded_classes, class_loader_data_graph::get_all_classes
+            @brief Represents the possible execution states of a HotSpot JavaThread.
         */
-        static auto find_class(const std::string_view class_name) noexcept
-            -> jni::hotspot::klass*
+        enum class java_thread_state : std::int8_t
         {
-            if (const auto it{ jni::hotspot::loaded_classes.find(std::string{ class_name }) }; it != jni::hotspot::loaded_classes.end())
+            _thread_uninitialized  = 0,
+            _thread_new            = 2,
+            _thread_new_trans      = 3,
+            _thread_in_native      = 4,
+            _thread_in_native_trans = 5,
+            _thread_in_vm          = 6,
+            _thread_in_vm_trans    = 7,
+            /*
+                @brief The thread is currently executing Java bytecode in the interpreter.
+                @note This is the only state in which method hooks are safely intercepted.
+            */
+            _thread_in_Java        = 8,
+            _thread_in_Java_trans  = 9,
+            _thread_blocked        = 10,
+            _thread_blocked_trans  = 11,
+            _thread_max_state      = 12
+        };
+
+        /*
+            @brief Represents a HotSpot internal JavaThread object.
+            @details
+            JavaThread is the JVM's internal representation of a Java thread.
+            On x64 HotSpot the current JavaThread pointer is always held in register r15,
+            making it directly accessible from low-level hook stubs.
+            The layout is resolved at runtime via gHotSpotVMStructs.
+        */
+        struct java_thread
+        {
+            /*
+                @brief Returns the current execution state of this thread.
+            */
+            auto get_thread_state() const -> java_thread_state
             {
-                return it->second;
-            }
+                static const VMStructEntry* const entry{ iterate_struct_entries("JavaThread", "_thread_state") };
 
-            const jni::hotspot::class_loader_data_graph graph{};
-            const std::vector<jni::hotspot::klass*> classes{ graph.get_all_classes() };
-
-            for (jni::hotspot::klass* const klass : classes)
-            {
-                const jni::hotspot::symbol* const symbol{ klass->get_name() };
-                if (!symbol) continue;
-
-                const std::string name{ symbol->to_string() };
-                if (name.empty()) continue;
-
-                jni::hotspot::loaded_classes.emplace(name, klass);
-
-                if (name == class_name)
+                try
                 {
-                    return klass;
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find JavaThread._thread_state entry." };
+                    }
+
+                    return *reinterpret_cast<java_thread_state*>(reinterpret_cast<std::uint8_t*>(const_cast<java_thread*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} java_thread.get_thread_state() {}", easy_jni_error, e.what());
+                    return java_thread_state::_thread_uninitialized;
                 }
             }
 
+            /*
+                @brief Sets the execution state of this thread.
+                @warning Incorrect use of this function can corrupt the JVM thread state machine.
+            */
+            auto set_thread_state(const java_thread_state state) const -> void
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("JavaThread", "_thread_state") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find JavaThread._thread_state entry." };
+                    }
+
+                    *reinterpret_cast<java_thread_state*>(reinterpret_cast<std::uint8_t*>(const_cast<java_thread*>(this)) + entry->offset) = state;
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} java_thread.set_thread_state() {}", easy_jni_error, e.what());
+                }
+            }
+
+            /*
+                @brief Returns the current suspension flags of this thread.
+            */
+            auto get_suspend_flags() const -> std::uint32_t
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("JavaThread", "_suspend_flags") };
+
+                try
+                {
+                    if (!entry)
+                    {
+                        throw jni_exception{ "Failed to find JavaThread._suspend_flags entry." };
+                    }
+
+                    return *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(const_cast<java_thread*>(this)) + entry->offset);
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} java_thread.get_suspend_flags() {}", easy_jni_error, e.what());
+                    return 0;
+                }
+            }
+        };
+
+        /*
+            @brief Decodes a compressed OOP to a real 64-bit pointer.
+            @param compressed The 32-bit compressed OOP value read from a JVM structure.
+            @return The decoded real pointer, or nullptr if compressed is 0.
+            @details
+            HotSpot compresses heap pointers to 32 bits using a base+shift scheme.
+            The real address is recovered as: base + (compressed << shift).
+            Both base and shift are read from CompressedOops::_narrow_oop via VMStructs.
+        */
+        static auto decode_oop_ptr(const std::uint32_t compressed) noexcept -> void*
+        {
+            if (!compressed)
+            {
+                return nullptr;
+            }
+
+            static const VMStructEntry* const base_entry{ iterate_struct_entries("CompressedOops", "_narrow_oop._base") };
+            static const VMStructEntry* const shift_entry{ iterate_struct_entries("CompressedOops", "_narrow_oop._shift") };
+
+            if (!base_entry || !shift_entry)
+            {
+                return nullptr;
+            }
+
+            const std::uint64_t base{ *reinterpret_cast<const std::uint64_t*>(base_entry->address) };
+            const std::uint32_t shift{ *reinterpret_cast<const std::uint32_t*>(shift_entry->address) };
+
+            return reinterpret_cast<void*>(base + (static_cast<std::uint64_t>(compressed) << shift));
+        }
+
+        /*
+            @brief Decodes a compressed Klass pointer to a real 64-bit pointer.
+            @details
+            HotSpot compresses Klass pointers separately from OOPs using their own
+            base+shift scheme stored in CompressedKlassPointers::_narrow_klass.
+        */
+        static auto decode_klass_ptr(const std::uint32_t compressed) noexcept -> void*
+        {
+            if (!compressed)
+            {
+                return nullptr;
+            }
+
+            static const VMStructEntry* const base_entry{ iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._base") };
+            static const VMStructEntry* const shift_entry{ iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._shift") };
+
+            if (!base_entry || !shift_entry)
+            {
+                return nullptr;
+            }
+
+            const std::uint64_t base{ *reinterpret_cast<const std::uint64_t*>(base_entry->address) };
+            const std::uint32_t shift{ *reinterpret_cast<const std::uint32_t*>(shift_entry->address) };
+
+            return reinterpret_cast<void*>(base + (static_cast<std::uint64_t>(compressed) << shift));
+        }
+
+        /*
+            @brief Checks whether a memory region matches a given byte pattern.
+            @details
+            A pattern byte of 0x00 acts as a wildcard and always matches.
+        */
+        inline static auto match_pattern(const std::uint8_t* const address, const std::uint8_t* const pattern, const std::size_t size) -> bool
+        {
+            for (std::size_t i{ 0 }; i < size; ++i)
+            {
+                if (pattern[i] == 0x00) continue;
+                if (address[i] != pattern[i]) return false;
+            }
+            return true;
+        }
+
+        /*
+            @brief Scans a memory region for the first occurrence of a byte pattern.
+            @details
+            A pattern byte of 0x00 acts as a wildcard and always matches.
+        */
+        inline static auto scan(
+            const std::uint8_t* const start,
+            const std::size_t range,
+            const std::uint8_t* pattern,
+            const std::size_t size
+        ) -> std::uint8_t*
+        {
+            for (std::size_t i{ 0 }; i < range; ++i)
+            {
+                if (match_pattern(start + i, pattern, size))
+                {
+                    return const_cast<std::uint8_t*>(start + i);
+                }
+            }
+            return nullptr;
+        }
+
+        /*
+            @brief Determines the safe scannable size of a JVM generated code stub.
+            @details
+            Uses VirtualQuery to retrieve the memory region information and computes
+            how many bytes remain from start to the end of the region, capped at 0x2000.
+        */
+        static auto find_stub_size(const std::uint8_t* start) -> std::size_t
+        {
+            MEMORY_BASIC_INFORMATION mbi{};
+            VirtualQuery(start, &mbi, sizeof(mbi));
+
+            const std::size_t region_size{ static_cast<std::size_t>(reinterpret_cast<std::uint8_t*>(mbi.BaseAddress) + mbi.RegionSize - start) };
+            return (std::min)(region_size, static_cast<std::size_t>(0x2000));
+        }
+
+        /*
+            @brief Byte offset used to retrieve the local variables pointer from the interpreter frame.
+            @details
+            Determined at runtime by find_hook_location(). Defaults to -56.
+        */
+        inline constinit std::int8_t locals_offset{ -56 };
+
+        /*
+            @brief Locates the optimal injection point within a HotSpot i2i interpreter stub.
+            @param i2i_entry Pointer to the beginning of the i2i interpreter stub to scan.
+            @return Pointer to the injection point within the stub, or nullptr on failure.
+            @details
+            Scans the i2i stub for a known sequence of instructions that appears at a stable
+            location across JVM builds, immediately before the interpreter begins executing
+            the actual Java bytecode. All method arguments are fully set up at this point.
+            Also scans backwards to find and cache the locals_offset value.
+            @note The hook is installed 8 bytes before the end of the matched pattern,
+                  at the position of the mov BYTE PTR [r15+??], 0x0 instruction.
+        */
+        static auto find_hook_location(const void* i2i_entry) -> void*
+        {
+            static const constexpr std::uint8_t pattern[]
+            {
+                0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
+                0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
+                0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
+                0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
+                0x41, 0xC6, 0x87, 0x00, 0x00, 0x00, 0x00, 0x00 // mov BYTE PTR [r15+??], 0x0
+            };
+
+            static const constexpr std::uint8_t locals_pattern[]
+            {
+                0x4C, 0x8B, 0x75, 0x00, 0xC3 // mov r14, QWORD PTR [rbp+??] ; ret
+            };
+
+            const std::uint8_t* const current{ reinterpret_cast<const std::uint8_t*>(i2i_entry) };
+            const std::size_t scan_size{ find_stub_size(current) };
+
+            std::uint8_t* const hook_location{ scan(current, scan_size, pattern, sizeof(pattern)) };
+
+            try
+            {
+                if (!hook_location)
+                {
+                    throw jni_exception{ "Failed to find hook pattern." };
+                }
+
+                for (std::uint8_t* p{ hook_location }; p > current; --p)
+                {
+                    if (match_pattern(p, locals_pattern, sizeof(locals_pattern)))
+                    {
+                        locals_offset = static_cast<std::int8_t>(p[3]);
+                        break;
+                    }
+                }
+
+                return hook_location + sizeof(pattern) - 8;
+            }
+            catch (const std::exception& e)
+            {
+                std::println("{} find_hook_location() {}", easy_jni_error, e.what());
+                return nullptr;
+            }
+        }
+
+        /*
+            @brief Allocates a block of executable memory within a 32-bit relative jump range
+                   of a given address.
+            @details
+            Iterates outward from nearby_addr in steps of 65536 bytes (Windows allocation
+            granularity) up to +/- 0x7FFFFFFF bytes, attempting VirtualAlloc at each step.
+            This ensures the allocated block can be reached by a 5-byte relative JMP.
+        */
+        static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect) noexcept -> std::uint8_t*
+        {
+            for (std::int64_t i{ 65536 }; i < 0x7FFFFFFF; i += 65536)
+            {
+                std::uint8_t* allocated{ reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr + i, size, MEM_COMMIT | MEM_RESERVE, protect)) };
+                if (allocated) return allocated;
+
+                allocated = reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr - i, size, MEM_COMMIT | MEM_RESERVE, protect));
+                if (allocated) return allocated;
+            }
+
+            return nullptr;
+        }
+
+        using detour_t = void(*)(frame*, java_thread*, bool*);
+
+        /*
+            @brief Represents a HotSpot interpreter frame on the call stack.
+            @details
+            In HotSpot's interpreter, each method invocation creates a frame on the
+            native call stack. On x64 HotSpot, the base pointer (rbp) always points
+            to the current frame. The Method pointer is at -24 bytes from rbp, and
+            the local variables pointer is at locals_offset bytes from rbp.
+        */
+        struct frame
+        {
+        public:
+            /*
+                @brief Returns a pointer to the Method object of the currently executing method.
+            */
+            inline auto get_method() const noexcept -> method*
+            {
+                return *reinterpret_cast<method**>(reinterpret_cast<std::uint8_t*>(const_cast<frame*>(this)) - 24);
+            }
+
+            /*
+                @brief Returns a pointer to the local variables array of the currently executing method.
+            */
+            inline auto get_locals() const noexcept -> void**
+            {
+                return *reinterpret_cast<void***>(reinterpret_cast<std::uint8_t*>(const_cast<frame*>(this)) + locals_offset);
+            }
+
+            /*
+                @brief Retrieves all method arguments as a typed tuple.
+                @tparam types The C++ types of the method arguments in declaration order.
+                @return A std::tuple containing all arguments converted to their C++ types.
+                @details
+                For primitive types, the raw slot value is reinterpreted directly.
+                For pointer types, the compressed OOP is decoded via decode_oop_ptr().
+                For index 0 on instance methods, this holds the implicit `this` reference.
+            */
+            template<typename... types>
+            auto get_arguments() const noexcept -> std::tuple<types...>
+            {
+                std::int32_t index{ 0 };
+                return std::tuple<types...>{ get_argument<types>(index++)... };
+            }
+
+        private:
+            /*
+                @brief Retrieves a single method argument at the given index.
+                @tparam type The C++ type to interpret the argument as.
+                @param index Zero-based index into the local variables array.
+                @return The argument value, or a default-constructed value on failure.
+                @details
+                Arguments are stored at locals[-index].
+                - Pointer types: the slot value is treated as a compressed OOP and decoded
+                  via decode_oop_ptr(), then cast to the requested pointer type.
+                - Primitive types (sizeof <= sizeof(void*)): bit-copied via memcpy.
+            */
+            template<typename type>
+            auto get_argument(const std::int32_t index) const noexcept -> type
+            {
+                void** const locals{ get_locals() };
+                if (!locals) return type{};
+
+                void* raw{ locals[-index] };
+
+                if constexpr (std::is_pointer_v<type>)
+                {
+                    if (!raw) return nullptr;
+                    return reinterpret_cast<type>(decode_oop_ptr(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(raw))));
+                }
+                else if constexpr (sizeof(type) <= sizeof(void*))
+                {
+                    type result{};
+                    std::memcpy(&result, &raw, sizeof(type));
+                    return result;
+                }
+                else
+                {
+                    return type{};
+                }
+            }
+        };
+
+        /*
+            @brief Installs a low-level hook on a HotSpot interpreter-to-interpreter (i2i) stub.
+            @details
+            midi2i_hook patches the i2i interpreter stub of a Java method at the injection
+            point found by find_hook_location() with a 5-byte relative JMP instruction that
+            redirects execution to an allocated trampoline stub. The trampoline saves all
+            volatile registers, calls common_detour with (frame*, java_thread*, bool*), and
+            then either returns the custom value or resumes normal execution depending on
+            whether the detour set the cancel flag.
+
+            The trampoline stub is allocated within 32-bit relative JMP range of the target.
+            The stub layout is: [original 8 bytes] [assembly trampoline].
+            Only one trampoline is allocated per unique i2i entry point, even if multiple
+            methods share the same stub.
+        */
+        class midi2i_hook final
+        {
+        public:
+            /*
+                @brief Installs the hook on the given target address.
+                @param target  Pointer to the injection point within the i2i stub.
+                @param detour  The C++ function to call when the hook fires.
+            */
+            midi2i_hook(std::uint8_t* const target, const detour_t detour)
+                : target{ target }
+                , allocated{ nullptr }
+                , error{ true }
+            {
+                static const constexpr std::int32_t HOOK_SIZE{ 8 };
+                static const constexpr std::int32_t JMP_SIZE{ 5 };
+                static const constexpr std::int32_t JE_OFFSET{ 0x3d };
+                static const constexpr std::int32_t JE_SIZE{ 6 };
+                static const constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x56 };
+                static const constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+
+                std::uint8_t assembly[]
+                {
+                    0x50,                                           // push rax
+                    0x51,                                           // push rcx
+                    0x52,                                           // push rdx
+                    0x41, 0x50,                                     // push r8
+                    0x41, 0x51,                                     // push r9
+                    0x41, 0x52,                                     // push r10
+                    0x41, 0x53,                                     // push r11
+                    0x55,                                           // push rbp
+                    0x6A, 0x00,                                     // push 0x0  ; cancel flag
+
+                    0x48, 0x89, 0xE9,                               // mov rcx, rbp  ; frame*
+                    0x4C, 0x89, 0xFA,                               // mov rdx, r15  ; java_thread*
+                    0x4C, 0x8D, 0x04, 0x24,                         // lea r8,  [rsp] ; bool* cancel
+
+                    0x48, 0x89, 0xE5,                               // mov rbp, rsp
+                    0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
+                    0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20
+
+                    0xFF, 0x15, 0x2D, 0x00, 0x00, 0x00,             // call [rip+0x2D]
+
+                    0x48, 0x89, 0xEC,                               // mov rsp, rbp
+
+                    0x58,                                           // pop rax  ; cancel flag value
+                    0x48, 0x83, 0xF8, 0x00,                         // cmp rax, 0x0
+
+                    0x5D,                                           // pop rbp
+                    0x41, 0x5B,                                     // pop r11
+                    0x41, 0x5A,                                     // pop r10
+                    0x41, 0x59,                                     // pop r9
+                    0x41, 0x58,                                     // pop r8
+                    0x5A,                                           // pop rdx
+                    0x59,                                           // pop rcx
+                    0x58,                                           // pop rax
+
+                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je ????????  ; cancel path
+
+                    // resume path: fall through to original code (JE not taken)
+
+                    // cancel path
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax
+                    0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]
+                    0x48, 0x89, 0xEC,                               // mov rsp, rbp
+                    0x5D,                                           // pop rbp
+                    0x5E,                                           // pop rsi
+                    0x48, 0x89, 0xDC,                               // mov rsp, rbx
+                    0xFF, 0xE6,                                     // jmp rsi
+
+                    // data slot: detour function pointer
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                };
+
+                this->allocated = allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
+
+                try
+                {
+                    if (!this->allocated)
+                    {
+                        throw jni_exception{ "Failed to allocate memory for hook." };
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    std::println("{} midi2i_hook::midi2i_hook {}", easy_jni_error, e.what());
+                    return;
+                }
+
+                const std::int32_t je_delta{ static_cast<std::int32_t>(target + HOOK_SIZE - (this->allocated + HOOK_SIZE + JE_OFFSET + JE_SIZE)) };
+                *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
+
+                *reinterpret_cast<detour_t*>(assembly + DETOUR_ADDRESS_OFFSET) = detour;
+
+                std::memcpy(this->allocated, target, HOOK_SIZE);
+                std::memcpy(this->allocated + HOOK_SIZE, assembly, sizeof(assembly));
+
+                DWORD old_protect{};
+                VirtualProtect(this->allocated, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READ, &old_protect);
+                VirtualProtect(target, JMP_SIZE, PAGE_EXECUTE_READWRITE, &old_protect);
+
+                target[0] = JMP_OPCODE;
+                const std::int32_t jmp_delta{ static_cast<std::int32_t>(this->allocated - (target + JMP_SIZE)) };
+                *reinterpret_cast<std::int32_t*>(target + 1) = jmp_delta;
+
+                VirtualProtect(target, JMP_SIZE, old_protect, &old_protect);
+
+                this->error = false;
+            }
+
+            /*
+                @brief Removes the hook and restores the original code at the target.
+            */
+            ~midi2i_hook()
+            {
+                if (this->error) return;
+
+                static const constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+
+                DWORD old_protect{};
+                if (this->target[0] == JMP_OPCODE && VirtualProtect(this->target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
+                {
+                    std::memcpy(this->target, this->allocated, 5);
+                    VirtualProtect(this->target, 5, old_protect, &old_protect);
+                }
+
+                VirtualFree(this->allocated, 0, MEM_RELEASE);
+            }
+
+            inline auto has_error() const noexcept -> bool
+            {
+                return this->error;
+            }
+
+        private:
+            std::uint8_t* target{ nullptr };
+            std::uint8_t* allocated{ nullptr };
+            bool          error{ true };
+        };
+
+        /*
+            @brief Stores the association between a HotSpot Method object and its C++ detour function.
+        */
+        struct hooked_method
+        {
+            method*  method{ nullptr };
+            detour_t detour{ nullptr };
+        };
+
+        /*
+            @brief Stores the association between an i2i entry point and its installed midi2i_hook.
+            @details
+            Since multiple Java methods can share the same i2i stub, only one trampoline
+            is allocated per unique i2i entry point.
+        */
+        struct i2i_hook_data
+        {
+            void*        i2i_entry{ nullptr };
+            midi2i_hook* hook{ nullptr };
+        };
+
+        /*
+            @brief Global list of all currently hooked Java methods and their detour functions.
+        */
+        inline std::vector<hooked_method> hooked_methods{};
+
+        /*
+            @brief Global list of all i2i entry points that have been patched and their hooks.
+        */
+        inline std::vector<i2i_hook_data> hooked_i2i_entries{};
+
+        /*
+            @brief Common detour function invoked by the trampoline stub for every intercepted method call.
+            @param f      Pointer to the current HotSpot interpreter frame.
+            @param thread Pointer to the current HotSpot JavaThread.
+            @param cancel Pointer to the cancel flag on the trampoline stack.
+            @details
+            Single entry point for all midi2i_hook trampolines. Verifies thread state,
+            finds the matching per-method detour in hooked_methods, dispatches it, then
+            restores thread state to _thread_in_Java.
+        */
+        static auto common_detour(frame* const f, java_thread* const thread, bool* const cancel) -> void
+        {
+            try
+            {
+                if (!thread || !is_valid_ptr(thread))
+                {
+                    throw jni_exception{ "JavaThread pointer is null or invalid." };
+                }
+
+                if (thread->get_thread_state() != java_thread_state::_thread_in_Java)
+                {
+                    throw jni_exception{ "JavaThread is not in _thread_in_Java state." };
+                }
+
+                const method* const current_method{ f->get_method() };
+
+                for (const hooked_method& hook : hooked_methods)
+                {
+                    if (hook.method == current_method)
+                    {
+                        hook.detour(f, thread, cancel);
+                        thread->set_thread_state(java_thread_state::_thread_in_Java);
+                        return;
+                    }
+                }
+            }
+            catch (const std::exception& e)
+            {
+                std::println("{} common_detour() {}", easy_jni_error, e.what());
+            }
+        }
+
+        /*
+            @brief Bitmask of HotSpot access flags used to disable JIT compilation on hooked methods.
+            @details
+            OR'd into Method._access_flags to prevent C1, C2, and OSR compilation.
+            - JVM_ACC_NOT_C2_COMPILABLE   (0x02000000)
+            - JVM_ACC_NOT_C1_COMPILABLE   (0x04000000)
+            - JVM_ACC_NOT_C2_OSR_COMPILABLE (0x08000000)
+            - JVM_ACC_QUEUED              (0x01000000)
+        */
+        inline const constexpr std::int32_t NO_COMPILE =
+            0x02000000 |
+            0x04000000 |
+            0x08000000 |
+            0x01000000;
+
+        /*
+            @brief Enables or disables the _dont_inline flag on a HotSpot Method object.
+            @details
+            The _dont_inline flag is stored in Method._flags at bit position 2.
+            When set, it prevents the JIT from inlining this method at any call site.
+        */
+        static auto set_dont_inline(const method* const m, bool enabled) noexcept -> void
+        {
+            std::uint16_t* const flags{ m->get_flags() };
+            if (!flags) return;
+
+            if (enabled)
+            {
+                *flags |= (1 << 2);
+            }
+            else
+            {
+                *flags &= static_cast<std::uint16_t>(~(1 << 2));
+            }
+        }
+    }
+
+    // ─── Cache and class lookup ───────────────────────────────────────────────
+
+    /*
+        @brief Cache of klass pointers keyed by their internal class name.
+        @details
+        Populated by find_class() on first lookup of each class name.
+        Subsequent calls return the cached klass* directly without repeating
+        the full ClassLoaderDataGraph walk.
+    */
+    inline std::unordered_map<std::string, hotspot::klass*> classes_hs{};
+
+    /*
+        @brief Finds a loaded Java class by its internal name using HotSpot internals only.
+        @param class_name The internal JVM class name using '/' separators
+                          (e.g. "java/lang/String", "net/minecraft/client/Minecraft").
+        @return Pointer to the matching klass if found, nullptr otherwise.
+        @details
+        Searches all loaded classloaders for a class matching the given name by walking
+        the HotSpot ClassLoaderDataGraph entirely via gHotSpotVMStructs, without any
+        JNI or JVMTI calls. Results are cached on first lookup.
+    */
+    static auto find_class(const std::string_view class_name) -> hotspot::klass*
+    {
+        if (const auto it{ classes_hs.find(std::string{ class_name }) }; it != classes_hs.end())
+        {
+            return it->second;
+        }
+
+        try
+        {
+            const hotspot::class_loader_data_graph graph{};
+            hotspot::klass* const k{ graph.find_klass(class_name) };
+
+            if (!k)
+            {
+                return nullptr;
+            }
+
+            classes_hs.insert({ std::string{ class_name }, k });
+            return k;
+        }
+        catch (const std::exception& e)
+        {
+            std::println("{} jni::find_class() for {}: {}", easy_jni_error, class_name, e.what());
             return nullptr;
         }
     }
 
     /*
-        @brief Associates a C++ wrapper type with its corresponding Java class name.
-        @tparam wrapped_class The C++ wrapper type to register. Must derive from jni::object.
-        @param class_name The internal JVM class name using '/' separators
-                          (e.g. "java/lang/String").
+        @brief Associates a C++ type with its corresponding Java class name.
+        @tparam T The C++ type to register.
+        @param class_name The internal JVM class name using '/' separators.
         @return true if the class was found in the JVM and successfully registered,
                 false if the class could not be found.
         @details
-        Inserts or updates the mapping from the C++ type_index of wrapped_class to
-        class_name in jni::class_map, then verifies that the class actually exists
-        in the JVM by calling jni::hotspot::find_class(). If the class is not found
-        the mapping is removed and false is returned.
-        This registration is required before calling install_hook<wrapped_class>()
-        or any other API that dispatches through the C++ type system to locate the
-        corresponding Java class at runtime.
-        @note The class name must use '/' as the package separator, not '.'.
-        @note If the class is not yet loaded at the time of registration, the call
-              will fail. Call register_class() after the class has been loaded by
-              the JVM.
-        @see class_map, jni::hotspot::find_class
+        Stores the mapping from the C++ type_index of T to class_name in class_map,
+        then verifies the class exists in the JVM by calling find_class().
+        Registration is required before calling hook<T>().
     */
-    template<class wrapped_class>
-    static auto register_class(const std::string_view class_name) noexcept
-        -> bool
+    template<class T>
+    static auto register_class(const std::string_view class_name) noexcept -> bool
     {
-        jni::hotspot::klass* const klass{ jni::hotspot::find_class(class_name) };
+        hotspot::klass* const k{ find_class(class_name) };
 
-        if (!klass)
+        if (!k)
         {
+            std::println("{} register_class() for {}: class not found in JVM.", easy_jni_error, class_name);
             return false;
         }
 
-        jni::class_map.insert_or_assign(std::type_index{ typeid(wrapped_class) }, std::string{ class_name });
-
+        class_map.insert_or_assign(std::type_index{ typeid(T) }, std::string{ class_name });
         return true;
+    }
+
+    // ─── Hooking ──────────────────────────────────────────────────────────────
+
+    /*
+        @brief Installs a low-level interpreter hook on a Java method.
+        @tparam T The C++ type registered for the Java class that owns the method.
+                  Must have been registered via register_class<T>() beforehand.
+        @param method_name The name of the Java method to hook (e.g., "toString", "update").
+        @param detour      The C++ function to invoke when the hooked method is intercepted.
+                           Must match: void(*)(hotspot::frame*, hotspot::java_thread*, bool*)
+        @return true if the hook was successfully installed or was already active, false on failure.
+        @details
+        The hook installation process:
+        1. Retrieve the klass for the registered Java class via find_class().
+        2. Walk the InstanceKlass::_methods array to locate the target method by name.
+        3. Disable JIT compilation by setting NO_COMPILE in Method._access_flags
+           and _dont_inline in Method._flags.
+        4. Register the method and its detour in hooked_methods for dispatch by common_detour.
+        5. Check whether the i2i entry point has already been patched; if so, reuse it.
+        6. If the i2i entry is new, locate the injection point via find_hook_location(),
+           allocate a trampoline via midi2i_hook, and register it in hooked_i2i_entries.
+
+        @note Unlike the JNI/JVMTI version, this implementation does not force a class
+              retransformation to flush existing JIT-compiled code. Hooking a method that
+              has already been JIT-compiled by the time hook() is called will not intercept
+              calls that execute through compiled code. Hook early, before the method is called.
+        @see midi2i_hook, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
+    */
+    template<class T>
+    static auto hook(const std::string_view method_name, const hotspot::detour_t detour) -> bool
+    {
+        try
+        {
+            if (!detour)
+            {
+                throw jni_exception{ "Detour function pointer is null." };
+            }
+
+            const auto it{ class_map.find(std::type_index{ typeid(T) }) };
+            if (it == class_map.end())
+            {
+                throw jni_exception{ std::format("Class not registered for type {}. Did you call register_class<T>()?", typeid(T).name()) };
+            }
+
+            hotspot::klass* const k{ find_class(it->second) };
+            if (!k)
+            {
+                throw jni_exception{ std::format("Class '{}' not found in JVM.", it->second) };
+            }
+
+            const std::int32_t count{ k->get_methods_count() };
+            hotspot::method** const methods_ptr{ k->get_methods_ptr() };
+
+            if (!methods_ptr || count <= 0)
+            {
+                throw jni_exception{ std::format("No methods found on class '{}'.", it->second) };
+            }
+
+            hotspot::method* found_method{ nullptr };
+            for (std::int32_t i{ 0 }; i < count; ++i)
+            {
+                hotspot::method* const m{ methods_ptr[i] };
+                if (m && hotspot::is_valid_ptr(m) && m->get_name() == method_name)
+                {
+                    found_method = m;
+                    break;
+                }
+            }
+
+            if (!found_method)
+            {
+                throw jni_exception{ std::format("Method '{}' not found in class '{}'.", method_name, it->second) };
+            }
+
+            for (const hotspot::hooked_method& hm : hotspot::hooked_methods)
+            {
+                if (hm.method == found_method)
+                {
+                    return true;
+                }
+            }
+
+            hotspot::set_dont_inline(found_method, true);
+
+            std::uint32_t* const flags{ found_method->get_access_flags() };
+            if (!flags)
+            {
+                throw jni_exception{ "Failed to retrieve access flags." };
+            }
+            *flags |= hotspot::NO_COMPILE;
+
+            hotspot::hooked_methods.push_back({ found_method, detour });
+
+            void* const i2i{ found_method->get_i2i_entry() };
+            if (!i2i)
+            {
+                throw jni_exception{ "Failed to retrieve i2i entry." };
+            }
+
+            for (const hotspot::i2i_hook_data& hd : hotspot::hooked_i2i_entries)
+            {
+                if (hd.i2i_entry == i2i)
+                {
+                    return true;
+                }
+            }
+
+            std::uint8_t* const target{ reinterpret_cast<std::uint8_t*>(hotspot::find_hook_location(i2i)) };
+            if (!target)
+            {
+                throw jni_exception{ "Failed to find hook location in i2i stub." };
+            }
+
+            hotspot::midi2i_hook* const hook_instance{ new hotspot::midi2i_hook(target, hotspot::common_detour) };
+            if (hook_instance->has_error())
+            {
+                delete hook_instance;
+                throw jni_exception{ "midi2i_hook installation failed." };
+            }
+
+            hotspot::hooked_i2i_entries.push_back({ i2i, hook_instance });
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            std::println("{} jni::hook() for {}: {}", easy_jni_error, method_name, e.what());
+            return false;
+        }
+    }
+
+    /*
+        @brief Removes all active interpreter hooks and restores the JVM to its original state.
+        @details
+        Phase 1: Deletes each midi2i_hook instance, restoring original bytes and freeing memory.
+        Phase 2: Clears _dont_inline and NO_COMPILE flags on all hooked methods.
+        Both vectors are cleared after cleanup.
+    */
+    static auto shutdown_hooks() noexcept -> void
+    {
+        for (const hotspot::i2i_hook_data& hd : hotspot::hooked_i2i_entries)
+        {
+            delete hd.hook;
+        }
+
+        for (const hotspot::hooked_method& hm : hotspot::hooked_methods)
+        {
+            hotspot::set_dont_inline(hm.method, false);
+
+            std::uint32_t* const flags{ hm.method->get_access_flags() };
+            if (flags)
+            {
+                *flags &= static_cast<std::uint32_t>(~hotspot::NO_COMPILE);
+            }
+        }
+
+        hotspot::hooked_methods.clear();
+        hotspot::hooked_i2i_entries.clear();
     }
 }
