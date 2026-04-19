@@ -135,19 +135,11 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(ProjectDir)ext\jni\jvm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="ext\easy_jni\easy_jni.hpp" />
-    <ClInclude Include="ext\jni\classfile_constants.h" />
-    <ClInclude Include="ext\jni\jawt.h" />
-    <ClInclude Include="ext\jni\jawt_md.h" />
-    <ClInclude Include="ext\jni\jdwpTransport.h" />
-    <ClInclude Include="ext\jni\jni.h" />
-    <ClInclude Include="ext\jni\jni_md.h" />
-    <ClInclude Include="ext\jni\jvmti.h" />
-    <ClInclude Include="ext\jni\jvmticmlr.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
