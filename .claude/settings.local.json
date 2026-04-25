@@ -6,7 +6,14 @@
       "Bash(git commit *)",
       "Bash(git push *)",
       "Bash(python3 -c ' *)",
-      "Bash(grep -n \"^\\\\s*//\" C:/repos/cpp/EasyJNI/Injector/src/main.cpp)"
+      "Bash(grep -n \"^\\\\s*//\" C:/repos/cpp/EasyJNI/Injector/src/main.cpp)",
+      "Bash(git rm *)",
+      "PowerShell(Start-Process \"C:\\\\repos\\\\cpp\\\\EasyJNI\\\\launch_minecraft.bat\")",
+      "Bash(git mv *)",
+      "Bash(mkdir -p VMHook/ext/vmhook)",
+      "Bash(rmdir VMHook/ext/easy_jni)",
+      "Bash(gh repo *)",
+      "Bash(git remote *)"
     ]
   }
 }

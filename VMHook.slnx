@@ -3,6 +3,6 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="EasyJNI/EasyJNI.vcxproj" Id="91f2f0f8-1398-4de8-abc7-f9f5371fbf5d" />
+  <Project Path="VMHook/VMHook.vcxproj" Id="91f2f0f8-1398-4de8-abc7-f9f5371fbf5d" />
   <Project Path="Injector/Injector.vcxproj" Id="f3c45678-9012-4abc-def0-123456789abc" />
 </Solution>

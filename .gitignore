@@ -1,10 +1,11 @@
 .vs/
 .git/
-
 build/
+etc/
+VMHook/build/
+Injector/build/
 etc_easyjni/
 etc_injector/
-EasyJNI/build/
-Injector/build/
 *.user
 log.txt
+logs/

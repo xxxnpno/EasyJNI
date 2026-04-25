@@ -123,28 +123,15 @@ static auto inject_dll(const DWORD pid, const std::wstring& dll_path) -> bool
 // --- DLL path resolution -----------------------------------------------------
 
 /*
-    Resolves the EasyJNI.dll path relative to this executable.
-
-    Layout on disk:
-        <solution>\Injector\build\Injector.exe   ← this exe
-        <solution>\EasyJNI\build\EasyJNI.dll     ← target DLL
-
-    So go: exe → parent (build\) → parent (Injector\) → parent (solution\)
-           then append EasyJNI\build\EasyJNI.dll
+    Both Injector.exe and VMHook.dll share the same output directory (build\).
+    The DLL is therefore always next to this executable.
 */
 static auto resolve_dll_path() -> std::wstring
 {
     wchar_t exe_buf[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
 
-    const std::filesystem::path solution_dir{
-        std::filesystem::path{ exe_buf }
-            .parent_path()  // up from build dir
-            .parent_path()  // up from Injector dir
-            .parent_path()  // solution root
-    };
-
-    return (solution_dir / L"EasyJNI" / L"build" / L"EasyJNI.dll").wstring();
+    return (std::filesystem::path{ exe_buf }.parent_path() / L"VMHook.dll").wstring();
 }
 
 // --- Entry point -------------------------------------------------------------
@@ -163,7 +150,7 @@ int main()
     if (!std::filesystem::exists(dll_path))
     {
         std::cerr <<
-            "[ERROR] EasyJNI.dll not found.\n"
+            "[ERROR] VMHook.dll not found.\n"
             "        Build the EasyJNI project (Release|x64) first.\n";
         std::cout << "\nPress ENTER to exit...\n";
         std::cin.get();
