@@ -17,6 +17,7 @@
 #include <tuple>
 #include <cstring>
 #include <optional>
+#include <variant>
 
 #include <windows.h>
 
@@ -2116,7 +2117,7 @@ namespace jni
 
             if (entry->is_static)
             {
-                throw jni_exception{ std::format("'{}' is a static field; use get_static_field().", name) };
+                throw jni_exception{ std::format("'{}' is a static field; use jni::get_static_field<T>().", name) };
             }
 
             T result{};
@@ -2266,53 +2267,86 @@ namespace jni
     /*
         @brief Lightweight proxy to a single Java field value in memory.
         @details
-        Returned by jni::object::get_field() and jni::object::get_static_field().
-        Holds a direct pointer to the field's storage location (object or mirror)
-        so that get() and set() are a single memcpy with no further lookups.
+        Returned by jni::object::get_field().  Reads the field value on demand,
+        dispatches the correct C++ type from the JVM type descriptor (signature),
+        and returns a typed copy — not a raw-pointer alias.
 
-        Usage:
-            bool ok  = obj.get_field("connected")->get();   // implicit conversion
-            int  hp  = obj.get_field("health"  )->get();
-            obj.get_field("health")->set(100);
+        Usage inside a wrapper class:
+
+            // No trailing return type needed — auto deduces field_proxy::value,
+            // which converts implicitly to the target type at the call site.
+            auto is_connected() { return get_field("isConnected")->get(); }
+            auto get_health()   { return get_field("health")->get(); }
+
+            // If you want a concrete type inside the method, cast before returning:
+            auto get_max_hp()   { return static_cast<int>(get_field("maxHp")->get()); }
+
+        Usage at the call site:
+            bool ok  = client.is_connected();   // operator bool()  fires
+            int  hp  = client.get_health();     // operator int()   fires
+            if  (client.is_connected()) { ... } // contextual bool conversion
+
+        Writing:
+            obj.get_field("health")->set(100);  // T = int, deduced
+            obj.get_field("flag"  )->set(true); // T = bool, deduced
     */
     class field_proxy final
     {
     public:
         /*
-            @brief Value proxy returned by get().
+            @brief A typed copy of the field's value.
             @details
-            Implicitly converts to any trivially-copyable type T. The caller
-            selects T through the assignment or return context:
+            Holds one alternative from a variant whose alternatives cover every JVM
+            primitive type and compressed-OOP references.  get() selects the
+            alternative that matches the field's JVM type descriptor before returning,
+            so the value is already correctly cast.
 
-                bool b = proxy->get();          // T = bool, reads 1 byte
-                int  n = proxy->get();          // T = int,  reads 4 bytes
-                if  (proxy->get()) { ... }      // T = bool via contextual conversion
+            Implicitly converts to any type T via std::visit + static_cast, which
+            means you can write:
 
-            The field signature stored in the parent field_proxy is not consulted;
-            sizeof(T) determines how many bytes are read. Ensure T matches the
-            actual Java field type to avoid reading garbage.
+                bool b  = proxy->get();   // contextual / assignment conversion
+                int  i  = proxy->get();
+                float f = proxy->get();
+                auto  v = proxy->get();   // type is field_proxy::value; converts lazily
+
+            For reference-type fields (signature starts with 'L' or '[') the stored
+            alternative is uint32_t (the raw compressed OOP).  Pass it to
+            hotspot::decode_oop_ptr() to recover the real 64-bit address.
         */
         struct value
         {
-            const void* ptr;
+            std::variant<
+                bool,
+                std::int8_t,
+                std::int16_t,
+                std::int32_t,
+                std::int64_t,
+                float,
+                double,
+                std::uint16_t,
+                std::uint32_t   // reference / array (compressed OOP)
+            > data;
 
+            /*
+                @brief Converts the stored value to T via static_cast.
+                Works for any combination of the nine stored types and any
+                numeric or bool target type.
+            */
             template<typename T>
             operator T() const noexcept
             {
-                static_assert(std::is_trivially_copyable_v<T>,
-                    "field_proxy::value: target type must be trivially copyable.");
-                T result{};
-                std::memcpy(&result, ptr, sizeof(T));
-                return result;
+                return std::visit([](auto v) noexcept -> T {
+                    return static_cast<T>(v);
+                }, data);
             }
         };
 
         /*
-            @param ptr       Direct pointer to the field's value in memory
-                             (object + offset for instance fields,
-                              mirror  + offset for static fields).
+            @param ptr       Direct pointer to the field's bytes in JVM memory
+                             (decoded object address + offset for instance fields;
+                              java.lang.Class mirror + offset for static fields).
             @param signature JVM type descriptor, e.g. "I", "Z", "Ljava/lang/String;"
-            @param is_static true when the field carries JVM_ACC_STATIC.
+            @param is_static true when JVM_ACC_STATIC is set on the field.
         */
         field_proxy(void* ptr, std::string signature, const bool is_static) noexcept
             : ptr_{ ptr }
@@ -2322,27 +2356,45 @@ namespace jni
         }
 
         /*
-            @brief Returns a value proxy pointing to the field's storage.
-            @details The returned value converts implicitly to the expected C++ type.
+            @brief Reads the field and returns a typed copy.
+            @details
+            Dispatches on the JVM type descriptor to determine how many bytes to
+            read and which variant alternative to populate:
+              "Z" → bool       "B" → int8_t    "S" → int16_t   "I" → int32_t
+              "J" → int64_t    "F" → float     "D" → double    "C" → uint16_t
+              "L…"/"[…" → uint32_t (compressed OOP)
+            The returned value is a copy — safe to store and return from methods.
         */
         auto get() const noexcept -> value
         {
-            return value{ ptr_ };
+            if (!ptr_) return value{ std::int32_t{} };
+
+            if (signature_ == "Z") { bool           v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+            if (signature_ == "B") { std::int8_t    v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+            if (signature_ == "S") { std::int16_t   v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+            if (signature_ == "I") { std::int32_t   v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+            if (signature_ == "J") { std::int64_t   v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+            if (signature_ == "F") { float          v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+            if (signature_ == "D") { double         v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+            if (signature_ == "C") { std::uint16_t  v{}; std::memcpy(&v, ptr_, sizeof(v)); return value{ v }; }
+
+            // Reference or array type — store compressed OOP
+            std::uint32_t v{};
+            std::memcpy(&v, ptr_, sizeof(v));
+            return value{ v };
         }
 
         /*
-            @brief Writes val directly into the field's storage.
+            @brief Writes val into the field's storage.
             @tparam T Must be trivially copyable; sizeof(T) must match the field width.
-            @note For reference-type fields (signature starts with 'L' or '['),
-                  T should be uint32_t and the value must be a valid compressed OOP.
-                  Use hotspot::encode_oop_ptr() (not yet implemented) or write 0 to null it.
+            @note For reference-type fields T should be uint32_t (compressed OOP).
         */
         template<typename T>
         auto set(const T val) const noexcept -> void
         {
             static_assert(std::is_trivially_copyable_v<T>,
                 "field_proxy::set: value type must be trivially copyable.");
-            std::memcpy(ptr_, &val, sizeof(T));
+            if (ptr_) std::memcpy(ptr_, &val, sizeof(T));
         }
 
         /*
@@ -2380,7 +2432,12 @@ namespace jni
     /*
         @brief Base class for C++ wrappers around live Java objects.
         @details
-        Derive from this class to create a typed façade for a Java class:
+        Derive from this class to create a typed façade for a Java class.
+        get_field() handles both instance and static fields automatically —
+        the library reads JVM_ACC_STATIC from the InstanceKlass._fields array
+        so there is no need for a separate get_static_field().
+
+        Example:
 
             class http_client : public jni::object
             {
@@ -2389,23 +2446,31 @@ namespace jni
                     : jni::object{ instance }
                 {}
 
-                auto is_connected() -> bool
-                {
-                    return get_field("isConnected")->get();
-                }
+                // auto return — field_proxy::value converts implicitly at the call site
+                auto is_connected() { return get_field("isConnected")->get(); }
+                auto get_health()   { return get_field("health")->get(); }
+
+                // Cast inside the method if you want a concrete return type
+                auto get_timeout()  { return static_cast<int>(get_field("timeout")->get()); }
+
+                // Static field — get_field detects JVM_ACC_STATIC automatically
+                auto get_version()  { return get_field("VERSION")->get(); }
+
+                // Writing a field
+                auto set_health(int hp) { get_field("health")->set(hp); }
             };
 
-            // Register once before hooking:
             jni::register_class<http_client>("com/example/HttpClient");
 
             // Inside a hook detour:
             auto [self] = frame->get_arguments<jni::oop>();
             http_client client{ self };
-            client.get_field("health")->set(100);
+            bool ok  = client.is_connected(); // operator bool()  fires
+            int  hp  = client.get_health();   // operator int()   fires
+            client.set_health(100);
 
         @note The wrapped pointer is a raw decoded OOP, not a JNI global reference.
               It is valid for the duration of the hook invocation only.
-              Copy and move operations copy the raw pointer; no GC handle management occurs.
     */
     class object
     {
@@ -2450,30 +2515,30 @@ namespace jni
         }
 
         /*
-            @brief Returns a field proxy for an instance field declared on this class.
+            @brief Returns a field proxy for any field declared on this class.
             @param name Exact Java field name.
-            @return Optional holding the field proxy, or nullopt if the field is not
-                    found or the type has not been registered with register_class<T>().
+            @return Optional holding the field proxy, or nullopt on failure.
             @details
+            Works for both instance and static fields.  The JVM_ACC_STATIC flag is
+            read from InstanceKlass._fields so no static/instance distinction is
+            needed at the call site.
+
+            Instance fields:  value lives at decoded_object_ptr + field_offset.
+            Static fields:    value lives at java.lang.Class mirror + field_offset.
+
             The klass is resolved from class_map via typeid(*this) (dynamic type),
-            so the derived class must have been registered before this is called.
-            The field is resolved once and cached; subsequent calls for the same
-            name return the cached entry.
+            so the derived C++ class must have been registered with register_class<T>()
+            before this is called.  Field entries are cached after the first lookup.
+
             @note Dereferencing a nullopt with -> is undefined behaviour.
-                  Always check the optional in production code or ensure the field
-                  name is correct at development time.
+                  In production code always check the optional, or assert field names
+                  are correct at development time.
         */
         auto get_field(const std::string_view name) const -> std::optional<field_proxy>
         {
             hotspot::klass* const k{ resolve_klass() };
             if (!k)
             {
-                return std::nullopt;
-            }
-
-            if (!instance_)
-            {
-                std::println("{} object::get_field('{}') instance pointer is null.", easy_jni_error, name);
                 return std::nullopt;
             }
 
@@ -2485,51 +2550,24 @@ namespace jni
 
             if (entry->is_static)
             {
-                std::println("{} object::get_field('{}') is a static field; use get_static_field().", easy_jni_error, name);
+                void* const mirror{ k->get_java_mirror() };
+                if (!mirror || !hotspot::is_valid_ptr(mirror))
+                {
+                    std::println("{} object::get_field('{}') failed to get java.lang.Class mirror.", easy_jni_error, name);
+                    return std::nullopt;
+                }
+                void* const ptr{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
+                return field_proxy{ ptr, entry->signature, true };
+            }
+
+            if (!instance_)
+            {
+                std::println("{} object::get_field('{}') instance pointer is null.", easy_jni_error, name);
                 return std::nullopt;
             }
 
             void* const ptr{ reinterpret_cast<std::uint8_t*>(instance_) + entry->offset };
             return field_proxy{ ptr, entry->signature, false };
-        }
-
-        /*
-            @brief Returns a field proxy for a static field declared on this class.
-            @param name Exact Java field name.
-            @return Optional holding the field proxy, or nullopt on failure.
-            @details
-            Static field values reside inside the java.lang.Class mirror object,
-            obtained via Klass::_java_mirror.  No instance pointer is needed.
-        */
-        auto get_static_field(const std::string_view name) const -> std::optional<field_proxy>
-        {
-            hotspot::klass* const k{ resolve_klass() };
-            if (!k)
-            {
-                return std::nullopt;
-            }
-
-            const auto entry{ jni::find_field(k, name) };
-            if (!entry)
-            {
-                return std::nullopt;
-            }
-
-            if (!entry->is_static)
-            {
-                std::println("{} object::get_static_field('{}') is an instance field; use get_field().", easy_jni_error, name);
-                return std::nullopt;
-            }
-
-            void* const mirror{ k->get_java_mirror() };
-            if (!mirror || !hotspot::is_valid_ptr(mirror))
-            {
-                std::println("{} object::get_static_field('{}') failed to get java.lang.Class mirror.", easy_jni_error, name);
-                return std::nullopt;
-            }
-
-            void* const ptr{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-            return field_proxy{ ptr, entry->signature, true };
         }
 
     protected:
