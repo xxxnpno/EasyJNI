@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(python3 -c ' *)",
+      "Bash(grep -n \"^\\\\s*//\" C:/repos/cpp/EasyJNI/Injector/src/main.cpp)"
+    ]
+  }
+}

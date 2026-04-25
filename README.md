@@ -1,329 +1,169 @@
-# EasyJNI
+# EasyJNI — dev/jni-refactor
 
-A C++23 header-only library that wraps the JNI API to make interacting with a running JVM straightforward. No manual environment management, no raw Java signatures, no boilerplate.
+A C++23 **header-only** library for interacting with a running HotSpot JVM from an injected DLL — **without including any JNI or JVMTI headers**. All struct offsets, type sizes and entry points are discovered at runtime by reading `gHotSpotVMStructs` and `gHotSpotVMTypes`, two symbol tables exported by `jvm.dll`, making the library version-agnostic across HotSpot builds.
 
-## Features
+## Why no JNI headers?
 
-- **Automatic thread management** : threads are attached to the JVM on demand
-- **No Java signatures** : types are inferred from your C++ template parameters
-- **Field access** : get and set instance and static fields with a single call
-- **Method calls** : call Java methods as if they were C++ functions
-- **Constructor support** : create Java objects from C++ with `jni::make_unique`
-- **C++ polymorphism** : inheritance works naturally across wrapper classes
-- **Collection support** : built-in wrappers for `java.util.Collection` and `java.util.List`
-- **Method hooking** : intercept Java method calls at the JVM level with C++ lambdas
+The standard JNI API requires `jni.h` and a call to `JNI_GetCreatedJavaVMs`. This branch removes that dependency entirely: every field offset and type size the library needs is read from HotSpot's own introspection tables at startup. The result is a single header with no external dependencies beyond `windows.h`.
 
-## Requirements
+---
 
-- C++23 compiler
-- Windows (the hooking subsystem uses the Win32 API)
-- A running JVM (the library attaches to it via `JNI_GetCreatedJavaVMs`)
+## Build
 
-## Setup
+Open `EasyJNI.slnx` in **Visual Studio 2022**. Build **Release|x64**.
+
+| Configuration | Output | Notes |
+|---|---|---|
+| Release\|x64 | `EasyJNI\build\EasyJNI.dll` | No external deps |
+| Debug\|x64   | `EasyJNI\build\EasyJNI.dll` | Requires `EasyJNI\ext\jni\jvm.lib` (copy from `%JAVA_HOME%\lib`) |
+
+Intermediate files go to `etc_easyjni\` (EasyJNI) and `etc_injector\` (Injector) at the solution root.
+
+---
+
+## Injector
+
+`Injector\build\Injector.exe` is a console tool that finds all `javaw.exe` processes, injects `EasyJNI.dll`, and reports status. If exactly one `javaw.exe` is running it injects automatically; otherwise it lists the candidates and asks you to choose.
+
+Typical workflow:
+1. Build **Release|x64** — produces both `EasyJNI.dll` and `Injector.exe`
+2. Launch Minecraft with `launch_minecraft.bat`
+3. Wait until the main menu is visible
+4. Run `Injector.exe` — a console appears inside the Minecraft process
+5. Follow the on-screen instructions and watch `C:\repos\cpp\EasyJNI\log.txt`
+6. Press **DELETE** inside the game window to unload the DLL
+
+---
+
+## API
+
+### Class registration
 
 ```cpp
-#include <easy_jni/easy_jni.hpp>
-
-// 1. Initialize before using anything else
-jni::init();
-
-// 2. Register your Java class wrappers
-jni::register_class<MyClass>("com/example/MyClass");
-
-// 3. Call shutdown before unloading your DLL
-jni::shutdown();
+// Associate a C++ type with a Java class name (call once at startup).
+// Required before get_field() or hook<T>() can be used on that type.
+jni::register_class<my_class>("com/example/MyClass");
 ```
 
-## Core API
+### Object wrappers
 
-```cpp
-// Initialize EasyJNI. Call once before using any other function.
-auto jni::init() -> bool;
-
-// Shut down EasyJNI. Cleans up all global refs, hooks, and cached environments.
-auto jni::shutdown() -> void;
-
-// Detach the current thread from the JVM.
-// Call this when a thread you manage yourself exits after using EasyJNI.
-// You do NOT need to call this inside hook detours.
-auto jni::exit_thread() -> void;
-```
-
-## Wrapping Java Classes
-
-For every Java class you want to interact with, create a C++ class that inherits from `jni::object` and register it.
+Derive from `jni::object`. The constructor takes a `jni::oop` (decoded Java object pointer, obtained from hook frame arguments):
 
 ```cpp
 class http_client : public jni::object
 {
 public:
-    explicit http_client(jobject instance)
+    explicit http_client(jni::oop instance)
         : jni::object{ instance }
-    {
-    }
+    {}
 
-    auto get_base_url() -> std::string
-    {
-        return get_method<std::string>("getBaseUrl")->call();
-    }
+    // get_field() handles both instance and static fields automatically —
+    // JVM_ACC_STATIC is read from the klass, no separate call needed.
+    auto is_connected() { return get_field("isConnected")->get(); }
+    auto get_health()   { return get_field("health")->get(); }
 
-    auto set_timeout(int milliseconds) -> void
-    {
-        get_method<void, int>("setTimeout")->call(milliseconds);
-    }
+    // Cast inside the method if you want a concrete return type:
+    auto get_timeout()  { return static_cast<int>(get_field("timeout")->get()); }
 
-    auto is_connected() -> bool
-    {
-        return get_method<bool>("isConnected")->call();
-    }
+    // Static field — same call, routed to the java.lang.Class mirror automatically:
+    auto get_version()  { return get_field("VERSION")->get(); }
+
+    // Writing:
+    auto set_health(int hp) { get_field("health")->set(hp); }
 };
 
 jni::register_class<http_client>("com/example/HttpClient");
 ```
 
-Inheritance works naturally. Inherit from your wrapper class rather than directly from `jni::object`:
+### Field proxy (`field_proxy`)
+
+`get_field(name)` returns `std::optional<field_proxy>`. The proxy's `.get()` reads the field and returns a `field_proxy::value` that implicitly converts to any numeric or bool type via `std::visit` + `static_cast`:
 
 ```cpp
-class secure_http_client : public http_client
-{
-public:
-    explicit secure_http_client(jobject instance)
-        : http_client{ instance }
+bool ok = client.get_field("connected")->get();  // implicit bool
+int  hp = client.get_field("health"  )->get();   // implicit int
+float x = client.get_field("posX"    )->get();   // implicit float
+
+if (client.get_field("alive")->get()) { ... }    // contextual bool
+
+// Writing
+client.get_field("health")->set(100);
+client.get_field("flag"  )->set(true);
+```
+
+For **reference-type** fields (signature `L…` or `[…`) the value is returned as `uint32_t` (the raw 32-bit compressed OOP). Pass it to `hotspot::decode_oop_ptr()` to recover the real address.
+
+### Low-level field access
+
+```cpp
+jni::hotspot::klass* k = jni::find_class("com/example/Foo");
+
+// Instance field
+int  v = jni::get_field<int>(object_ptr, k, "fieldName");
+         jni::set_field<int>(object_ptr, k, "fieldName", 42);
+
+// Static field
+int  s = jni::get_static_field<int>(k, "STATIC_FIELD");
+         jni::set_static_field<int>(k, "STATIC_FIELD", 0);
+```
+
+### Class lookup
+
+```cpp
+// Walks ClassLoaderDataGraph on first call; subsequent calls return the cached klass*.
+jni::hotspot::klass* k = jni::find_class("java/lang/String");
+```
+
+### Method hooking
+
+Hooks patch the **interpreter-to-interpreter (i2i) entry stub** of the target method. Any method that has already been JIT-compiled will not be intercepted — hook before the method is first called.
+
+```cpp
+jni::hook<http_client>("sendRequest",
+    [](jni::hotspot::frame* f, jni::hotspot::java_thread*, bool* cancel)
     {
-    }
+        auto [self] = f->get_arguments<jni::oop>();
+        http_client client{ self };
+        int hp = client.get_field("health")->get();
+        std::println("[HOOK] sendRequest — health = {}", hp);
+    });
 
-    auto get_certificate_path() -> std::string
-    {
-        return get_method<std::string>("getCertificatePath")->call();
-    }
-};
-
-jni::register_class<secure_http_client>("com/example/SecureHttpClient");
+jni::shutdown_hooks(); // restore all patched bytes
 ```
 
-## Fields
+---
 
-Use `get_field<T>(name)` to get a field accessor, then call `.get()` or `.set()` on it.
+## Field encoding (internals)
 
-```cpp
-// Instance field (read)
-auto get_max_retries() -> int
-{
-    return get_field<int>("maxRetries")->get();
-}
+Fields are parsed from `InstanceKlass._fields` (an `Array<u2>`, 6 u2 slots per field, JDK 8–21). The byte offset is recovered as `((high_packed << 16) | low_packed) >> 2`. Static fields live in the `java.lang.Class` mirror at their stored offset; instance fields live at `decoded_oop + offset`.
 
-// Object field (read)
-auto get_inner_client() -> std::unique_ptr<http_client>
-{
-    return get_field<http_client>("innerClient")->get();
-}
+## JVM type → C++ mapping
 
-// Primitive field (write)
-auto set_max_retries(int value) -> void
-{
-    get_field<int>("maxRetries")->set(value);
-}
+| JVM sig | `get()` returns |
+|---------|-----------------|
+| `Z` | `bool` |
+| `B` | `int8_t` |
+| `S` | `int16_t` |
+| `I` | `int32_t` |
+| `J` | `int64_t` |
+| `F` | `float` |
+| `D` | `double` |
+| `C` | `uint16_t` |
+| `L…` / `[…` | `uint32_t` (compressed OOP) |
 
-// String field (write)
-auto set_config_path(const std::string& path) -> void
-{
-    get_field<std::string>("configPath")->set(path);
-}
-```
+## HotSpot internals namespace (`jni::hotspot::`)
 
-### Static fields
-
-There is no special C++ static method involved. Just add a regular method that passes `jni::field_type::STATIC`, and call it on a null instance when you need it from outside the class:
-
-```cpp
-class config_manager : public jni::object
-{
-public:
-    explicit config_manager(jobject instance)
-        : jni::object{ instance }
-    {
-    }
-
-    // Reading a static field: same as an instance field, just pass field_type::STATIC.
-    auto get_default_timeout() -> int
-    {
-        return get_field<int>("DEFAULT_TIMEOUT", jni::field_type::STATIC)->get();
-    }
-
-    // Writing a static field works the same way.
-    auto set_default_timeout(int value) -> void
-    {
-        get_field<int>("DEFAULT_TIMEOUT", jni::field_type::STATIC)->set(value);
-    }
-};
-```
-
-To call a static field accessor from outside the class, construct a temporary null instance:
-
-```cpp
-int timeout = config_manager{ nullptr }.get_default_timeout();
-```
-
-## Methods
-
-Use `get_method<ReturnType, ArgTypes...>(name)` to get a method accessor, then call `.call(args...)` on it.
-
-```cpp
-// No arguments
-auto get_connection_string() -> std::string
-{
-    return get_method<std::string>("getConnectionString")->call();
-}
-
-// Primitive argument
-auto set_pool_size(int size) -> void
-{
-    get_method<void, int>("setPoolSize")->call(size);
-}
-
-// Object argument, pass the unique_ptr directly
-auto execute_query(const std::unique_ptr<sql_query>& query) -> std::unique_ptr<result_set>
-{
-    return get_method<result_set, sql_query>("executeQuery")->call(query);
-}
-```
-
-### Static methods
-
-Same pattern as static fields: a regular method with `method_type::STATIC`, called on a null instance from outside the class.
-
-```cpp
-class session_manager : public jni::object
-{
-public:
-    explicit session_manager(jobject instance)
-        : jni::object{ instance }
-    {
-    }
-
-    // Reading a static field that returns the singleton instance.
-    auto get_instance() -> std::unique_ptr<session_manager>
-    {
-        return get_field<session_manager>("instance", jni::field_type::STATIC)->get();
-    }
-
-    // Calling a static method.
-    auto create_session(const std::string& user_id) -> std::unique_ptr<session_manager>
-    {
-        return get_method<session_manager, std::string>("createSession", jni::method_type::STATIC)->call(user_id);
-    }
-};
-```
-
-To use from outside the class:
-
-```cpp
-auto session = session_manager{ nullptr }.get_instance();
-auto new_session = session_manager{ nullptr }.create_session("user-42");
-```
-
-### Supported types
-
-| C++ type          | Java type |
-|-------------------|-----------|
-| `void`            | `void`    |
-| `short`           | `short`   |
-| `int`             | `int`     |
-| `long long`       | `long`    |
-| `float`           | `float`   |
-| `double`          | `double`  |
-| `bool`            | `boolean` |
-| `char`            | `char`    |
-| `std::byte`       | `byte`    |
-| `std::string`     | `String`  |
-| `T : jni::object` | any class |
-
-## Constructors
-
-Use `jni::make_unique<T, ArgTypes...>(args...)` (not `std::make_unique`) to call a Java constructor and get back a managed C++ wrapper.
-
-```cpp
-// Single argument constructor
-auto query = jni::make_unique<sql_query, std::string>("SELECT * FROM users WHERE id = ?");
-
-// Multi-argument constructor
-auto request = jni::make_unique<http_request, std::string, int>("https://api.example.com", 5000);
-
-// Pass the result directly to a method
-auto results = db->execute_query(query);
-```
-
-## Collections
-
-`jni::list` and `jni::collection` are built-in wrappers. Call `to_vector<T>()` to convert them to a `std::vector`.
-
-```cpp
-// Returns std::vector<std::unique_ptr<user>>
-auto get_all_users() -> std::vector<std::unique_ptr<user>>
-{
-    return get_field<jni::list>("users")->get()->to_vector<user>();
-}
-
-// Returns std::vector<std::string>
-auto get_user_names() -> std::vector<std::string>
-{
-    return get_field<jni::list>("userNames")->get()->to_vector<std::string>();
-}
-```
-
-## Null Checking
-
-`std::unique_ptr` wrappers are never null themselves, but the underlying Java object might be. Always check `get_instance()` before using a wrapped object:
-
-```cpp
-auto connection = database_connection{ nullptr }.get_instance();
-
-if (not connection->get_instance())
-{
-    std::println("[ERROR] Failed to get database connection.");
-    return;
-}
-
-auto pool_size = connection->get_pool_size();
-```
-
-## Method Hooking
-
-Use `jni::hook<T>(method_name, detour)` to intercept calls to a Java method before they execute.
-
-The detour receives:
-- `frame*` : the current stack frame, used to read arguments
-- `java_thread*` : the calling Java thread
-- `bool* cancel` : set to `true` (via `jni::set_return_value`) to suppress the original method and return a custom value
-
-Use `frame->get_arguments<Types...>()` to unpack arguments. **The first type is always `self`**, the instance the method was called on.
-
-```cpp
-// Observe a call without intercepting it
-auto on_request = [](jni::hotspot::frame* frame, jni::hotspot::java_thread* thread, bool* cancel)
-{
-    auto [self, url, timeout] = frame->get_arguments<http_client, std::string, int>();
-    std::println("[HOOK] request to {} (timeout: {}ms)", url, timeout);
-};
-
-jni::hook<http_client>("sendRequest", on_request);
-```
-
-```cpp
-// Suppress the original call and return a custom value
-auto on_get_status = [](jni::hotspot::frame* frame, jni::hotspot::java_thread* thread, bool* cancel)
-{
-    auto [self] = frame->get_arguments<http_client>();
-    jni::set_return_value(cancel, 200);
-};
-
-jni::hook<http_client>("getStatusCode", on_get_status);
-```
-
-Hooks are cleaned up automatically when `jni::shutdown()` is called. You do **not** need to call `jni::exit_thread()` inside a hook detour. Hooks run on Java threads that are already attached to and managed by the JVM.
-
-`jni::exit_thread()` is only needed for threads **you create yourself** that call into EasyJNI and then exit without going through `jni::shutdown()`.
-
-## Full Example
-
-A complete working example targeting Minecraft 1.8.9 (MCP deobfuscated names) can be found in [EasyJNI/src/main.cpp](./EasyJNI/src/main.cpp). It covers wrappers, inheritance, field access (instance and static), method calls, constructors, collections and hooks.
+| Type | Purpose |
+|------|---------|
+| `VMStructEntry` / `VMTypeEntry` | Raw entries from `gHotSpotVMStructs` / `gHotSpotVMTypes` |
+| `symbol` | Interned JVM string (class/method/field names) |
+| `klass` | Java class metadata; `find_field()`, `get_java_mirror()` |
+| `method` | Java method; i2i entry, access flags, name, signature |
+| `constant_pool` | Per-class constant pool |
+| `class_loader_data_graph` | Root of all class loaders; `find_klass()` |
+| `java_thread` | Current JVM thread; thread state |
+| `frame` | Interpreter stack frame; `get_arguments<Types...>()` |
+| `midi2i_hook` | 5-byte JMP patch at the i2i stub |
+| `field_entry` | Field offset + signature + `is_static` |
+| `decode_oop_ptr()` | Compressed OOP → real 64-bit address |
+| `decode_klass_ptr()` | Compressed klass ptr → real 64-bit address |

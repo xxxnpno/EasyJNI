@@ -2,3 +2,9 @@
 .git/
 
 build/
+etc_easyjni/
+etc_injector/
+EasyJNI/build/
+Injector/build/
+*.user
+log.txt
