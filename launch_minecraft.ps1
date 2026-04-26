@@ -1,17 +1,30 @@
 # launch_minecraft.ps1
-# Extracts native libraries if needed, then launches Minecraft 1.8.9 offline.
+# Replicates MultiMC's LauncherPart method:
+#   1. Launch java.exe with NewLaunch.jar (org.multimc.EntryPoint)
+#   2. Feed the launch protocol via stdin (BOM-free ASCII temp file)
+#
+# Uses java.exe (not javaw.exe) so the process keeps running correctly
+# when launched from a script context. A minimized console window will
+# appear briefly and disappear once Minecraft takes over. Minimize it.
+#
+# Fixes applied during development:
+#   - natives/ dir missing        -> extracted from the four native JARs
+#   - path-with-spaces arg split  -> .bat handles quoting + 0< redirect
+#   - UTF-8 BOM corrupts first key -> written with ASCII encoding (no BOM)
+#   - duplicate --width/--height  -> removed from param list; windowParams handles them
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$java    = 'C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin\javaw.exe'
-$lib     = 'C:\Program Files\mmc-develop-win32\MultiMC\libraries'
-$inst    = 'C:\Program Files\mmc-develop-win32\MultiMC\instances\clean vanilla 1.8.9'
-$assets  = 'C:\Program Files\mmc-develop-win32\MultiMC\assets'
+$java    = 'C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin\java.exe'
+$mmc     = 'C:\Program Files\mmc-develop-win32\MultiMC'
+$lib     = "$mmc\libraries"
+$inst    = "$mmc\instances\clean vanilla 1.8.9"
+$assets  = "$mmc\assets"
 $natives = "$inst\natives"
 $gameDir = "$inst\.minecraft"
 
-# ── Extract native JARs ───────────────────────────────────────────────────────
+# ── Extract native JARs once ──────────────────────────────────────────────────
 $nativeJars = @(
     "$lib\net\java\jinput\jinput-platform\2.0.5\jinput-platform-2.0.5-natives-windows.jar",
     "$lib\org\lwjgl\lwjgl\lwjgl-platform\2.9.4-nightly-20150209\lwjgl-platform-2.9.4-nightly-20150209-natives-windows.jar",
@@ -19,10 +32,7 @@ $nativeJars = @(
     "$lib\tv\twitch\twitch-external-platform\4.5\twitch-external-platform-4.5-natives-windows-64.jar"
 )
 
-if (-not (Test-Path $natives)) {
-    Write-Host "[*] Creating natives directory..."
-    New-Item -ItemType Directory -Path $natives -Force | Out-Null
-}
+if (-not (Test-Path $natives)) { New-Item -ItemType Directory -Path $natives -Force | Out-Null }
 
 if (-not (Test-Path "$natives\lwjgl.dll")) {
     Write-Host "[*] Extracting native libraries..."
@@ -32,27 +42,23 @@ if (-not (Test-Path "$natives\lwjgl.dll")) {
             try {
                 $zip = [System.IO.Compression.ZipFile]::OpenRead($jar)
                 foreach ($entry in $zip.Entries) {
-                    # Only extract .dll / .so / .dylib — skip META-INF
                     if ($entry.Name -match '\.(dll|so|dylib)$') {
-                        $dest = Join-Path $natives $entry.Name
-                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
+                            $entry, (Join-Path $natives $entry.Name), $true)
                     }
                 }
                 $zip.Dispose()
-            } catch {
-                Write-Warning "  Could not extract $jar : $_"
-            }
-        } else {
-            Write-Warning "  Native JAR not found: $jar"
+            } catch { Write-Warning "Could not extract $([System.IO.Path]::GetFileName($jar)): $_" }
         }
     }
     Write-Host "[OK] Natives extracted."
 } else {
-    Write-Host "[*] Natives already present, skipping extraction."
+    Write-Host "[*] Natives already present."
 }
 
-# ── Build classpath ───────────────────────────────────────────────────────────
+# ── Classpath ─────────────────────────────────────────────────────────────────
 $jars = @(
+    "$mmc\jars\NewLaunch.jar",
     "$lib\net\java\jinput\jinput\2.0.5\jinput-2.0.5.jar",
     "$lib\net\java\jutils\jutils\1.0.0\jutils-1.0.0.jar",
     "$lib\org\lwjgl\lwjgl\lwjgl\2.9.4-nightly-20150209\lwjgl-2.9.4-nightly-20150209.jar",
@@ -85,29 +91,50 @@ $jars = @(
     "$lib\tv\twitch\twitch\6.5\twitch-6.5.jar",
     "$lib\com\mojang\minecraft\1.8.9\minecraft-1.8.9-client.jar"
 )
-
 $cp = $jars -join ';'
 
-# ── Launch ────────────────────────────────────────────────────────────────────
-$mcArgs = @(
-    '-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump',
-    '-Xms512m', '-Xmx1024m',
-    '-Duser.language=en',
-    "-Djava.library.path=$natives",
-    '-cp', $cp,
-    'net.minecraft.client.main.Main',
+# ── Write stdin protocol (ASCII, no BOM) ──────────────────────────────────────
+$proto = "$env:TEMP\mc189_stdin.txt"
+$ascii = [System.Text.Encoding]::ASCII
+
+$lines = [System.Collections.Generic.List[string]]::new()
+$lines.Add("launcher onesix")
+$lines.Add("cp $cp")
+@(
     '--username', 'nonoooooooo',
-    '--version', '1.8.9',
-    '--gameDir', $gameDir,
+    '--version',  '1.8.9',
+    '--gameDir',  $gameDir,
     '--assetsDir', $assets,
     '--assetIndex', '1.8',
-    '--uuid', '00000000-0000-0000-0000-000000000001',
+    '--uuid',     '00000000-0000-0000-0000-000000000001',
     '--accessToken', '0',
     '--userProperties', '{}',
-    '--userType', 'legacy',
-    '--width', '854', '--height', '480'
-)
+    '--userType', 'legacy'
+) | ForEach-Object { $lines.Add("param $_") }
+$lines.Add("mainClass net.minecraft.client.main.Main")
+$lines.Add("appletClass net.minecraft.client.MinecraftApplet")
+$lines.Add("natives $natives")
+$lines.Add("userName nonoooooooo")
+$lines.Add("sessionId token:0:00000000-0000-0000-0000-000000000001")
+$lines.Add("windowTitle Minecraft 1.8.9")
+$lines.Add("windowParams 854x480")
+$lines.Add("instanceTitle clean vanilla 1.8.9")
+$lines.Add("instanceIconId default")
+$lines.Add("launch")
+[System.IO.File]::WriteAllLines($proto, [string[]]$lines, $ascii)
+
+# ── Write launcher .bat ───────────────────────────────────────────────────────
+$bat = "$env:TEMP\mc189_launch.bat"
+$batContent  = "@echo off`r`n"
+# start /min launches in a minimized window so the console doesn't intrude
+$batContent += "start /min `"`" `"$java`" "
+$batContent += "-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump "
+$batContent += "-Xms512m -Xmx1024m -Duser.language=en "
+$batContent += "`"-Djava.library.path=$natives`" "
+$batContent += "-cp `"$cp`" "
+$batContent += "org.multimc.EntryPoint 0<`"$proto`"`r`n"
+[System.IO.File]::WriteAllText($bat, $batContent, $ascii)
 
 Write-Host "[*] Launching Minecraft 1.8.9 (offline)..."
-Start-Process -FilePath $java -ArgumentList $mcArgs
-Write-Host "[OK] Process started. Wait for the main menu before injecting."
+Start-Process cmd -ArgumentList "/C `"$bat`""
+Write-Host "[OK] Done. Wait for the Minecraft main menu before injecting."
