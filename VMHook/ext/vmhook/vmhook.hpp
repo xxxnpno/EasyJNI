@@ -950,8 +950,10 @@ namespace jni
                         return nullptr;
                     }
 
-                    const std::uint32_t compressed{ *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
-                    klass* const result{ reinterpret_cast<klass*>(decode_oop_ptr(compressed)) };
+                    // _klasses is a Klass* (full 8-byte native pointer), not a compressed OOP.
+                    klass* const result{ *reinterpret_cast<klass**>(
+                        reinterpret_cast<std::uint8_t*>(const_cast<class_loader_data*>(this)) + entry->offset
+                    ) };
 
                     return is_valid_ptr(result) ? result : nullptr;
                 }
@@ -1132,20 +1134,22 @@ namespace jni
             */
             auto find_klass(const std::string_view class_name) const -> klass*
             {
+                // Walk every CLD's _klasses linked list.
+                // The Dictionary-based approach is not used because
+                // ClassLoaderData::_dictionary is absent from VMStructs in JDK 21+.
                 class_loader_data* cld{ this->get_head() };
 
                 while (is_valid_ptr(cld) && cld)
                 {
-                    dictionary* const dict{ cld->get_dictionary() };
-
-                    if (is_valid_ptr(dict))
+                    klass* k{ cld->get_klasses() };
+                    while (k && is_valid_ptr(k))
                     {
-                        klass* const k{ dict->find_klass(class_name) };
-
-                        if (k)
+                        const symbol* const sym{ k->get_name() };
+                        if (is_valid_ptr(sym) && sym->to_string() == class_name)
                         {
                             return k;
                         }
+                        k = k->get_next_link();
                     }
 
                     class_loader_data* const next{ cld->get_next() };

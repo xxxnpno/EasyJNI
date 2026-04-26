@@ -158,14 +158,18 @@ int main()
     }
     std::cout << "[OK]  DLL found.\n\n";
 
-    // 2. Find javaw.exe processes
-    std::cout << "[*] Scanning for javaw.exe...\n";
-    const auto processes{ find_processes(L"javaw.exe") };
+    // 2. Find javaw.exe or java.exe processes
+    std::cout << "[*] Scanning for javaw.exe / java.exe...\n";
+    auto processes{ find_processes(L"javaw.exe") };
+    if (processes.empty())
+    {
+        processes = find_processes(L"java.exe");
+    }
 
     if (processes.empty())
     {
         std::cerr <<
-            "[ERROR] No javaw.exe found.\n"
+            "[ERROR] No javaw.exe or java.exe found.\n"
             "        Launch Minecraft first, then run this tool.\n";
         std::cout << "\nPress ENTER to exit...\n";
         std::cin.get();
