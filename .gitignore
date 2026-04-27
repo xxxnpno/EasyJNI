@@ -2,8 +2,11 @@
 .git/
 build/
 etc/
+log.txt
 .claude/
 CLAUDE.md
+launch_minecraft.bat
+launch_minecraft.ps1
 
 # Example Java build output
 example/out/
