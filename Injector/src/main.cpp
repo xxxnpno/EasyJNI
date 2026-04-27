@@ -140,7 +140,7 @@ int main()
 {
     std::cout <<
         "================================================\n"
-        "  EasyJNI Injector\n"
+        "  VMHook Injector\n"
         "================================================\n\n";
 
     // 1. Verify the DLL exists
@@ -151,7 +151,7 @@ int main()
     {
         std::cerr <<
             "[ERROR] VMHook.dll not found.\n"
-            "        Build the EasyJNI project (Release|x64) first.\n";
+            "        Build the VMHook project (Release|x64) first.\n";
         std::cout << "\nPress ENTER to exit...\n";
         std::cin.get();
         return 1;
@@ -214,8 +214,8 @@ int main()
             "[OK]  Injection successful!\n\n"
             "================================================\n"
             "  A console window should appear inside\n"
-            "  the Minecraft process with instructions.\n\n"
-            "  Logs: C:\\repos\\cpp\\EasyJNI\\log.txt\n"
+            "  the target process with instructions.\n\n"
+            "  Logs: C:\\repos\\cpp\\VMHook\\log.txt\n"
             "================================================\n";
     }
     else

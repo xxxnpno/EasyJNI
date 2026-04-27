@@ -2,10 +2,8 @@
 .git/
 build/
 etc/
-VMHook/build/
-Injector/build/
-etc_easyjni/
-etc_injector/
-*.user
-log.txt
-logs/
+.claude/
+CLAUDE.md
+
+# Example Java build output
+example/out/

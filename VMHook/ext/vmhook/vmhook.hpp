@@ -21,31 +21,38 @@
 
 #include <windows.h>
 
-namespace jni
+namespace vmhook
 {
-    inline constexpr std::string_view easy_jni_error{ "[EasyJNI ERROR]" };
-    inline constexpr std::string_view easy_jni_warning{ "[EasyJNI WARNING]" };
-    inline constexpr std::string_view easy_jni_info{ "[EasyJNI INFO]" };
+    /*
+        @brief Log-prefix tags used in all diagnostic messages printed by this library.
+        @details  These are prepended to every std::println() call so that output from
+        VMHook can be filtered in the host process console.
+    */
+    inline constexpr std::string_view k_error_tag  { "[VMHook ERROR]"   };
+    inline constexpr std::string_view k_warning_tag{ "[VMHook WARNING]" };
+    inline constexpr std::string_view k_info_tag   { "[VMHook INFO]"    };
 
     /*
-        @brief Custom exception for EasyJNI errors.
+        @brief Exception type thrown internally by VMHook to report unrecoverable errors.
+        @details  All public API functions catch vmhook::exception and log the message
+        via std::println before returning a safe default value, so callers never see
+        uncaught exceptions escaping the library boundary.
     */
-    class jni_exception final : public std::exception
+    class exception final : public std::exception
     {
     public:
-        explicit jni_exception(const std::string_view msg)
-            : message{ msg }
+        explicit exception(const std::string_view msg)
+            : message_{ msg }
         {
-
         }
 
         auto what() const noexcept -> const char* override
         {
-            return this->message.c_str();
+            return this->message_.c_str();
         }
 
     private:
-        std::string message;
+        std::string message_;
     };
 
     namespace hotspot
@@ -73,14 +80,14 @@ namespace jni
     /*
         @brief Maps C++ wrapper types to their corresponding internal Java class names.
         @details
-        Populated by register_class() when a C++ wrapper type is associated with
-        a Java class name. Used by hook() and other APIs that need to look up the
-        Java class corresponding to a given C++ wrapper type at runtime.
-        Keys are std::type_index values derived from typeid() of the C++ wrapper type.
-        Values are the internal JVM class names using '/' separators.
-        @see register_class, hook
+        Populated by vmhook::register_class() when a C++ wrapper type is associated
+        with a Java class name.  Used by vmhook::hook() and other APIs that need to
+        look up the Java class corresponding to a given C++ wrapper type at runtime.
+        Keys   — std::type_index values derived from typeid() of the C++ wrapper type.
+        Values — internal JVM class names using '/' separators (e.g. "java/lang/String").
+        @see vmhook::register_class, vmhook::hook
     */
-    inline std::unordered_map<std::type_index, std::string> class_map{};
+    inline std::unordered_map<std::type_index, std::string> type_to_class_map{};
 
     template<class T>
     static auto register_class(std::string_view class_name) noexcept -> bool;
@@ -296,15 +303,15 @@ namespace jni
                 {
                     if (!length_entry)
                     {
-                        throw jni_exception{ "Failed to find Symbol._length entry." };
+                        throw vmhook::exception{ "Failed to find Symbol._length entry." };
                     }
 
                     if (!body_entry)
                     {
-                        throw jni_exception{ "Failed to find Symbol._body entry." };
+                        throw vmhook::exception{ "Failed to find Symbol._body entry." };
                     }
 
-                    if (!safe_read_ptr(this))
+                    if (!vmhook::hotspot::safe_read_ptr(this))
                     {
                         return std::string{};
                     }
@@ -312,7 +319,7 @@ namespace jni
                     const std::uint16_t length{ *reinterpret_cast<const std::uint16_t*>(reinterpret_cast<const std::uint8_t*>(this) + length_entry->offset) };
                     const char* const body{ reinterpret_cast<const char*>(reinterpret_cast<const std::uint8_t*>(this) + body_entry->offset) };
 
-                    if (!is_valid_ptr(body) || length == 0 || length > 0x1000)
+                    if (!vmhook::hotspot::is_valid_ptr(body) || length == 0 || length > 0x1000)
                     {
                         return std::string{};
                     }
@@ -321,7 +328,7 @@ namespace jni
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} symbol.to_string() {}", easy_jni_error, e.what());
+                    std::println("{} symbol.to_string() {}", vmhook::k_error_tag, e.what());
                     return std::string{};
                 }
             }
@@ -339,25 +346,31 @@ namespace jni
             /*
                 @brief Returns a pointer to the base of the constant pool entries array.
                 @details
-                The entries are stored immediately after the ConstantPool header.
-                The base is computed by adding the size of the ConstantPool type to this.
+                ConstantPool entries are stored immediately after the fixed-size ConstantPool
+                header in memory (no separate heap allocation):
+                  [ ConstantPool header (size from gHotSpotVMTypes) ][ entry[0] ][ entry[1] ] ...
+                Entry indices are 1-based: index 0 is unused, valid indices start at 1.
+                Each entry is pointer-sized (8 bytes on x64): it may hold a Symbol*, a primitive
+                constant, or other data depending on the tag byte in _tags.
+                The size of the header is read at runtime from gHotSpotVMTypes so this works
+                across all JDK versions regardless of header size changes.
             */
             auto get_base() const -> void**
             {
-                static const VMTypeEntry* const entry{ iterate_type_entries("ConstantPool") };
+                static const VMTypeEntry* const entry{ vmhook::hotspot::iterate_type_entries("ConstantPool") };
 
                 try
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ConstantPool entry." };
+                        throw vmhook::exception{ "Failed to find ConstantPool entry." };
                     }
 
                     return reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<constant_pool*>(this)) + entry->size);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} constant_pool.get_base() {}", easy_jni_error, e.what());
+                    std::println("{} constant_pool.get_base() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -383,14 +396,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ConstMethod._constants entry." };
+                        throw vmhook::exception{ "Failed to find ConstMethod._constants entry." };
                     }
 
                     return *reinterpret_cast<constant_pool**>(reinterpret_cast<std::uint8_t*>(const_cast<const_method*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} const_method.get_constants() {}", easy_jni_error, e.what());
+                    std::println("{} const_method.get_constants() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -406,7 +419,7 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ConstMethod._name_index entry." };
+                        throw vmhook::exception{ "Failed to find ConstMethod._name_index entry." };
                     }
 
                     const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<const_method*>(this)) + entry->offset) };
@@ -414,7 +427,7 @@ namespace jni
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} const_method.get_name() {}", easy_jni_error, e.what());
+                    std::println("{} const_method.get_name() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -430,7 +443,7 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ConstMethod._signature_index entry." };
+                        throw vmhook::exception{ "Failed to find ConstMethod._signature_index entry." };
                     }
 
                     const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<const_method*>(this)) + entry->offset) };
@@ -438,7 +451,7 @@ namespace jni
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} const_method.get_signature() {}", easy_jni_error, e.what());
+                    std::println("{} const_method.get_signature() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -470,14 +483,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find Method._i2i_entry entry." };
+                        throw vmhook::exception{ "Failed to find Method._i2i_entry entry." };
                     }
 
                     return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} method.get_i2i_entry() {}", easy_jni_error, e.what());
+                    std::println("{} method.get_i2i_entry() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -493,14 +506,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find Method._from_interpreted_entry entry." };
+                        throw vmhook::exception{ "Failed to find Method._from_interpreted_entry entry." };
                     }
 
                     return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} method.get_from_interpreted_entry() {}", easy_jni_error, e.what());
+                    std::println("{} method.get_from_interpreted_entry() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -519,14 +532,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find Method._access_flags entry." };
+                        throw vmhook::exception{ "Failed to find Method._access_flags entry." };
                     }
 
                     return reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} method.get_access_flags() {}", easy_jni_error, e.what());
+                    std::println("{} method.get_access_flags() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -544,14 +557,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find Method._flags entry." };
+                        throw vmhook::exception{ "Failed to find Method._flags entry." };
                     }
 
                     return reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} method.get_flags() {}", easy_jni_error, e.what());
+                    std::println("{} method.get_flags() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -567,14 +580,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find Method._constMethod entry." };
+                        throw vmhook::exception{ "Failed to find Method._constMethod entry." };
                     }
 
                     return *reinterpret_cast<const_method**>(reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} method.get_const_method() {}", easy_jni_error, e.what());
+                    std::println("{} method.get_const_method() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -590,20 +603,20 @@ namespace jni
                 {
                     if (!cm)
                     {
-                        throw jni_exception{ "ConstMethod is nullptr." };
+                        throw vmhook::exception{ "ConstMethod is nullptr." };
                     }
 
                     const symbol* const sym{ cm->get_name() };
                     if (!sym)
                     {
-                        throw jni_exception{ "Symbol is nullptr." };
+                        throw vmhook::exception{ "Symbol is nullptr." };
                     }
 
                     return sym->to_string();
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} method.get_name() {}", easy_jni_error, e.what());
+                    std::println("{} method.get_name() {}", vmhook::k_error_tag, e.what());
                     return std::string{};
                 }
             }
@@ -619,20 +632,20 @@ namespace jni
                 {
                     if (!cm)
                     {
-                        throw jni_exception{ "ConstMethod is nullptr." };
+                        throw vmhook::exception{ "ConstMethod is nullptr." };
                     }
 
                     const symbol* const sym{ cm->get_signature() };
                     if (!sym)
                     {
-                        throw jni_exception{ "Symbol is nullptr." };
+                        throw vmhook::exception{ "Symbol is nullptr." };
                     }
 
                     return sym->to_string();
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} method.get_signature() {}", easy_jni_error, e.what());
+                    std::println("{} method.get_signature() {}", vmhook::k_error_tag, e.what());
                     return std::string{};
                 }
             }
@@ -674,22 +687,22 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find Klass._name entry." };
+                        throw vmhook::exception{ "Failed to find Klass._name entry." };
                     }
 
-                    if (!is_valid_ptr(this))
+                    if (!vmhook::hotspot::is_valid_ptr(this))
                     {
                         return nullptr;
                     }
 
-                    const void* const raw{ safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
-                    symbol* const sym{ reinterpret_cast<symbol*>(const_cast<void*>(untag_ptr(raw))) };
+                    const void* const raw{ vmhook::hotspot::safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
+                    symbol* const sym{ reinterpret_cast<symbol*>(const_cast<void*>(vmhook::hotspot::untag_ptr(raw))) };
 
-                    return is_valid_ptr(sym) ? sym : nullptr;
+                    return vmhook::hotspot::is_valid_ptr(sym) ? sym : nullptr;
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} klass.get_name() {}", easy_jni_error, e.what());
+                    std::println("{} klass.get_name() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -705,21 +718,21 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find Klass._next_link entry." };
+                        throw vmhook::exception{ "Failed to find Klass._next_link entry." };
                     }
 
-                    if (!is_valid_ptr(this))
+                    if (!vmhook::hotspot::is_valid_ptr(this))
                     {
                         return nullptr;
                     }
 
                     klass* const next{ *reinterpret_cast<klass**>(reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + entry->offset) };
 
-                    return is_valid_ptr(next) ? next : nullptr;
+                    return vmhook::hotspot::is_valid_ptr(next) ? next : nullptr;
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} klass.get_next_link() {}", easy_jni_error, e.what());
+                    std::println("{} klass.get_next_link() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -735,14 +748,14 @@ namespace jni
             {
                 static const VMStructEntry* const entry{ iterate_struct_entries("InstanceKlass", "_methods") };
 
-                if (!entry || !is_valid_ptr(this))
+                if (!entry || !vmhook::hotspot::is_valid_ptr(this))
                 {
                     return 0;
                 }
 
                 void* const array{ *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + entry->offset) };
 
-                if (!is_valid_ptr(array))
+                if (!vmhook::hotspot::is_valid_ptr(array))
                 {
                     return 0;
                 }
@@ -762,18 +775,22 @@ namespace jni
             {
                 static const VMStructEntry* const entry{ iterate_struct_entries("InstanceKlass", "_methods") };
 
-                if (!entry || !is_valid_ptr(this))
+                if (!entry || !vmhook::hotspot::is_valid_ptr(this))
                 {
                     return nullptr;
                 }
 
                 void* const array{ *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + entry->offset) };
 
-                if (!is_valid_ptr(array))
+                if (!vmhook::hotspot::is_valid_ptr(array))
                 {
                     return nullptr;
                 }
 
+                // HotSpot Array<T> layout on x64:
+                //   +0  int32_t _length   (4 bytes)
+                //   +4  int32_t _padding  (4 bytes alignment padding)
+                //   +8  T       _data[0]  ← first element starts here
                 return reinterpret_cast<method**>(reinterpret_cast<std::uint8_t*>(array) + 8);
             }
 
@@ -790,23 +807,28 @@ namespace jni
             {
                 static const VMStructEntry* const entry{ iterate_struct_entries("Klass", "_java_mirror") };
 
-                if (!entry || !is_valid_ptr(this))
+                if (!entry || !vmhook::hotspot::is_valid_ptr(this))
                 {
                     return nullptr;
                 }
 
-                // At entry->offset within the klass there is an OopHandle, which is
-                // simply { oop* _obj; }.  Read the oop* stored there, then dereference
-                // it to get the actual oop (full 64-bit pointer — OopStorage is not compressed).
+                // Klass::_java_mirror is an OopHandle (since JDK 17). Its layout is simply:
+                //   struct OopHandle { oop* _obj; };   // one pointer wide
+                //
+                // Pointer chain:
+                //   klass + entry->offset  →  OopHandle._obj  (an oop*, points into OopStorage)
+                //   *OopHandle._obj        →  the actual java.lang.Class oop (full 64-bit)
+                //
+                // OopStorage slots hold full 64-bit oops (not compressed), so no decoding needed.
                 const void* const oop_handle_addr{ reinterpret_cast<const std::uint8_t*>(this) + entry->offset };
-                const void* const oop_storage_slot{ safe_read_ptr(oop_handle_addr) };
+                const void* const oop_storage_slot{ vmhook::hotspot::safe_read_ptr(oop_handle_addr) };
 
-                if (!is_valid_ptr(oop_storage_slot))
+                if (!vmhook::hotspot::is_valid_ptr(oop_storage_slot))
                 {
                     return nullptr;
                 }
 
-                return const_cast<void*>(safe_read_ptr(oop_storage_slot));
+                return const_cast<void*>(vmhook::hotspot::safe_read_ptr(oop_storage_slot));
             }
 
             /*
@@ -826,91 +848,224 @@ namespace jni
                       chain manually to locate inherited fields.
                 @note Covers JDK 8–21.  JDK 22+ uses a different FieldInfoStream encoding.
             */
+            /*
+                @brief Decodes one UNSIGNED5 value from a byte stream (JDK 21+ FieldInfoStream).
+                @details
+                Algorithm (from src/hotspot/share/utilities/unsigned5.hpp):
+                  sum = sum of (b_i - 1) * 64^i   for i = 0, 1, 2, ...
+                  Stop after the first byte b_i where b_i < 192 (a "low byte").
+                  Byte 0 is never emitted; it marks the stream End and returns ~0u.
+            */
+            static auto decode_u5(const std::uint8_t* data, int& stream_pos) noexcept -> std::uint32_t
+            {
+                std::uint32_t sum{ 0 };
+                for (int byte_position{ 0 }; byte_position < 5; ++byte_position)
+                {
+                    const std::uint8_t current_byte{ data[stream_pos++] };
+                    if (current_byte == 0) { --stream_pos; return ~0u; }  // End marker — never a valid value
+                    sum += static_cast<std::uint32_t>(current_byte - 1) << (6 * byte_position);
+                    if (current_byte < 192) return sum;                   // Low byte — sequence complete
+                }
+                return sum;
+            }
+
+            /*
+                @brief Looks up a field by name from an InstanceKlass._fieldinfo_stream
+                       (JDK 21+ FieldInfoStream format, Array<u1>).
+                @details
+                Stream grammar (from fieldInfo.hpp):
+                  FieldInfoStream := j(num_java) k(num_injected) Field[j+k] End(0)
+                  Field := name_idx sig_idx offset access_flags field_flags
+                           [initval_idx  if field_flags & 0x01]
+                           [gsig_idx     if field_flags & 0x04]
+                           [group        if field_flags & 0x10]
+                All integers encoded with UNSIGNED5 (see decode_u5).
+            */
+            auto find_field_in_stream(const std::string_view name,
+                                      void** cp_base) const noexcept -> std::optional<field_entry>
+            {
+                static const VMStructEntry* const fis_entry{
+                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
+
+                if (!fis_entry || !vmhook::hotspot::is_valid_ptr(this) || !vmhook::hotspot::is_valid_ptr(cp_base))
+                    return std::nullopt;
+
+                // Read Array<u1>* pointer from InstanceKlass
+                const void* const arr_ptr{ *reinterpret_cast<void* const*>(
+                    reinterpret_cast<const std::uint8_t*>(this) + fis_entry->offset) };
+
+                if (!vmhook::hotspot::is_valid_ptr(arr_ptr)) return std::nullopt;
+
+                // Array<u1> layout on x64 HotSpot:
+                //   +0  int32_t _length   (4 bytes)
+                //   +4  u1      _data[0]  ← data starts here (no padding: u1 has alignment 1)
+                // Note: Array<Method*> uses +8 because 8-byte pointers need 8-byte alignment,
+                // requiring 4 bytes of padding after _length.  u1 and u2 arrays do NOT need this.
+                const std::int32_t len{ *reinterpret_cast<const std::int32_t*>(arr_ptr) };
+                if (len <= 0 || len > 0x4000) return std::nullopt;
+
+                const std::uint8_t* const data{
+                    reinterpret_cast<const std::uint8_t*>(arr_ptr) + 4 };
+
+                int stream_pos{ 0 };
+
+                // Header: number of Java-declared fields, then number of VM-injected fields.
+                const std::uint32_t num_java_fields    { decode_u5(data, stream_pos) };
+                const std::uint32_t num_injected_fields{ decode_u5(data, stream_pos) };
+                if (num_java_fields == ~0u || num_injected_fields == ~0u
+                    || num_java_fields + num_injected_fields > 4096u) return std::nullopt;
+
+                for (std::uint32_t field_index{ 0 };
+                     field_index < num_java_fields + num_injected_fields && stream_pos < len;
+                     ++field_index)
+                {
+                    const std::uint32_t name_index{ decode_u5(data, stream_pos) };
+                    if (name_index == ~0u) break;  // End marker
+
+                    const std::uint32_t sig_index   { decode_u5(data, stream_pos) };
+                    const std::uint32_t field_offset { decode_u5(data, stream_pos) };
+                    const std::uint32_t access_flags { decode_u5(data, stream_pos) };
+                    const std::uint32_t field_flags  { decode_u5(data, stream_pos) };
+
+                    // Consume optional trailing entries whose presence is signalled by field_flags bits:
+                    //   bit 0 (0x01): initval_index  — compile-time constant initialiser value
+                    //   bit 2 (0x04): generic_sig_index — generic type signature (e.g. List<T>)
+                    //   bit 4 (0x10): contended_group — @Contended padding group id
+                    if (field_flags & 0x01u) decode_u5(data, stream_pos);  // initval_index
+                    if (field_flags & 0x04u) decode_u5(data, stream_pos);  // generic_sig_index
+                    if (field_flags & 0x10u) decode_u5(data, stream_pos);  // contended_group
+
+                    // Resolve the field name from the constant pool and compare.
+                    if (name_index && vmhook::hotspot::is_valid_ptr(cp_base[name_index]))
+                    {
+                        const symbol* const name_sym{
+                            reinterpret_cast<const symbol*>(cp_base[name_index]) };
+                        if (vmhook::hotspot::is_valid_ptr(name_sym) && name_sym->to_string() == name)
+                        {
+                            const bool is_static{ (access_flags & 0x0008u) != 0u };
+                            std::string signature;
+                            if (sig_index && vmhook::hotspot::is_valid_ptr(cp_base[sig_index]))
+                            {
+                                const symbol* const sig_sym{
+                                    reinterpret_cast<const symbol*>(cp_base[sig_index]) };
+                                if (vmhook::hotspot::is_valid_ptr(sig_sym)) signature = sig_sym->to_string();
+                            }
+                            return field_entry{ field_offset, is_static, signature };
+                        }
+                    }
+                }
+                return std::nullopt;
+            }
+
+            /*
+                @brief Searches the InstanceKlass field metadata for a field by name.
+                @details
+                Automatically selects the correct field storage format based on what
+                is exported in gHotSpotVMStructs for this JDK build:
+
+                JDK 8 – early JDK 21:
+                  InstanceKlass._fields  →  Array<u2>, 6 slots per field
+                  Byte offset = ((high_packed << 16) | low_packed) >> FIELDINFO_TAG_SIZE(2)
+
+                JDK 21.0.x+ and JDK 22+:
+                  InstanceKlass._fieldinfo_stream  →  Array<u1>, UNSIGNED5 compressed
+                  Stream grammar: j(num_java) k(num_injected) Field[j+k] End(0)
+                  Per field: name_idx sig_idx offset access_flags field_flags [optionals]
+
+                @note Searches only fields declared directly on this class.
+                      Walk the superclass chain to find inherited fields.
+            */
             auto find_field(const std::string_view name) const noexcept -> std::optional<field_entry>
             {
-                static const VMStructEntry* const fields_entry{ iterate_struct_entries("InstanceKlass", "_fields") };
-                static const VMStructEntry* const constants_entry{ iterate_struct_entries("InstanceKlass", "_constants") };
+                static const VMStructEntry* const fields_entry{
+                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields") };
+                static const VMStructEntry* const fis_entry{
+                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
+                static const VMStructEntry* const constants_entry{
+                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_constants") };
 
-                if (!fields_entry || !constants_entry || !is_valid_ptr(this))
+                if (!vmhook::hotspot::is_valid_ptr(this) || !constants_entry) return std::nullopt;
+
+                // Resolve constant pool (needed by both paths)
+                constant_pool* const cp{ *reinterpret_cast<constant_pool**>(
+                    reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this))
+                    + constants_entry->offset) };
+
+                if (!vmhook::hotspot::is_valid_ptr(cp)) return std::nullopt;
+
+                void** const cp_base{ cp->get_base() };
+                if (!vmhook::hotspot::is_valid_ptr(cp_base)) return std::nullopt;
+
+                // ── JDK 21+ path: FieldInfoStream ────────────────────────────
+                if (fis_entry)
                 {
-                    return std::nullopt;
+                    return find_field_in_stream(name, cp_base);
                 }
 
-                void* const fields_array{
-                    *reinterpret_cast<void**>(
-                        reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + fields_entry->offset)
-                };
+                // ── JDK 8–17 path: Array<u2> with 6-slot FieldInfo records ──
+                if (!fields_entry) return std::nullopt;
 
-                if (!is_valid_ptr(fields_array))
-                {
-                    return std::nullopt;
-                }
+                void* const fields_array{ *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this))
+                    + fields_entry->offset) };
 
-                // Array<u2> layout: int32_t _length at +0, 4 bytes padding, data at +8
-                const std::int32_t array_length{ *reinterpret_cast<const std::int32_t*>(fields_array) };
+                if (!vmhook::hotspot::is_valid_ptr(fields_array)) return std::nullopt;
+
+                // Array<u2>: int32_t _length at +0, data at +8
+                const std::int32_t array_length{
+                    *reinterpret_cast<const std::int32_t*>(fields_array) };
 
                 static const std::int32_t field_slots{ 6 };
 
-                if (array_length <= 0 || array_length % field_slots != 0)
-                {
+                // In JDK 8, the _fields Array<u2> may include a trailing u2
+                // storing _java_fields_count after all the 6-slot field records.
+                // Use integer division to safely ignore any trailing partial slot.
+                if (array_length <= 0 || array_length < field_slots)
                     return std::nullopt;
-                }
 
-                const std::uint16_t* const data{
-                    reinterpret_cast<const std::uint16_t*>(
-                        reinterpret_cast<const std::uint8_t*>(fields_array) + 8)
-                };
+                // Array<u2> layout on x64 HotSpot:
+                //   +0  int32_t _length   (4 bytes)
+                //   +4  u2      _data[0]  ← data starts here (u2 needs 2-byte alignment;
+                //                           offset 4 is already 2-byte aligned, no padding needed)
+                const std::uint16_t* const data{ reinterpret_cast<const std::uint16_t*>(
+                    reinterpret_cast<const std::uint8_t*>(fields_array) + 4) };
 
-                constant_pool* const cp{
-                    *reinterpret_cast<constant_pool**>(
-                        reinterpret_cast<std::uint8_t*>(const_cast<klass*>(this)) + constants_entry->offset)
-                };
-
-                if (!is_valid_ptr(cp))
+                // FieldInfo::field_slots layout for each field record (JDK 8–20):
+                //   slot 0  u16  access_flags   — JVM_ACC_* flags (static flag = bit 3 / 0x0008)
+                //   slot 1  u16  name_index     — constant-pool index of the field's name Symbol
+                //   slot 2  u16  signature_index— constant-pool index of the type descriptor Symbol
+                //   slot 3  u16  initval_index  — cp index of compile-time constant value (or 0)
+                //   slot 4  u16  low_packed     — bits [1:0] FIELDINFO_TAG, bits [15:2] offset_low
+                //   slot 5  u16  high_packed    — offset_high (upper 16 bits of the packed offset)
+                for (std::int32_t field_slot_index{ 0 }; field_slot_index < array_length / field_slots; ++field_slot_index)
                 {
-                    return std::nullopt;
-                }
-
-                void** const cp_base{ cp->get_base() };
-
-                if (!is_valid_ptr(cp_base))
-                {
-                    return std::nullopt;
-                }
-
-                const std::int32_t field_count{ array_length / field_slots };
-
-                for (std::int32_t i{ 0 }; i < field_count; ++i)
-                {
-                    const std::uint16_t name_index{ data[i * field_slots + 1] };
-
-                    if (!name_index)
-                    {
-                        continue;
-                    }
+                    const std::uint16_t name_index{ data[field_slot_index * field_slots + 1] };
+                    if (!name_index) continue;  // slot 1: name_index == 0 means VM-injected field, skip
 
                     const symbol* const name_sym{
-                        reinterpret_cast<const symbol*>(cp_base[name_index])
-                    };
-
-                    if (!is_valid_ptr(name_sym) || name_sym->to_string() != name)
-                    {
+                        reinterpret_cast<const symbol*>(cp_base[name_index]) };
+                    if (!vmhook::hotspot::is_valid_ptr(name_sym) || name_sym->to_string() != name)
                         continue;
-                    }
 
-                    const std::uint16_t access_flags{ data[i * field_slots + 0] };
-                    const std::uint16_t sig_index  { data[i * field_slots + 2] };
-                    const std::uint16_t low_packed { data[i * field_slots + 4] };
-                    const std::uint16_t high_packed{ data[i * field_slots + 5] };
+                    const std::uint16_t access_flags{ data[field_slot_index * field_slots + 0] };  // slot 0
+                    const std::uint16_t sig_index   { data[field_slot_index * field_slots + 2] };  // slot 2
+                    const std::uint16_t low_packed  { data[field_slot_index * field_slots + 4] };  // slot 4
+                    const std::uint16_t high_packed { data[field_slot_index * field_slots + 5] };  // slot 5
 
-                    // Strip the 2-bit FIELDINFO_TAG to recover the byte offset
-                    const std::uint32_t packed{ (static_cast<std::uint32_t>(high_packed) << 16) | low_packed };
+                    // Reconstruct the byte offset from the packed representation:
+                    //   packed = (high_packed << 16) | low_packed
+                    //   offset = packed >> FIELDINFO_TAG_SIZE   (FIELDINFO_TAG_SIZE = 2)
+                    // The 2 lowest bits of packed are the FIELDINFO_TAG and carry no offset data.
+                    const std::uint32_t packed{
+                        (static_cast<std::uint32_t>(high_packed) << 16) | low_packed };
                     const std::uint32_t offset{ packed >> 2 };
 
-                    const bool is_static{ (access_flags & 0x0008u) != 0u };  // JVM_ACC_STATIC
+                    const bool is_static{ (access_flags & 0x0008u) != 0u };
 
-                    const symbol* const sig_sym{ reinterpret_cast<const symbol*>(cp_base[sig_index]) };
-                    const std::string  signature{ is_valid_ptr(sig_sym) ? sig_sym->to_string() : std::string{} };
+                    const symbol* const sig_sym{
+                        reinterpret_cast<const symbol*>(cp_base[sig_index]) };
+                    const std::string signature{
+                        vmhook::hotspot::is_valid_ptr(sig_sym) ? sig_sym->to_string() : std::string{} };
 
                     return field_entry{ offset, is_static, signature };
                 }
@@ -942,10 +1097,10 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ClassLoaderData._klasses entry." };
+                        throw vmhook::exception{ "Failed to find ClassLoaderData._klasses entry." };
                     }
 
-                    if (!is_valid_ptr(this))
+                    if (!vmhook::hotspot::is_valid_ptr(this))
                     {
                         return nullptr;
                     }
@@ -955,11 +1110,11 @@ namespace jni
                         reinterpret_cast<std::uint8_t*>(const_cast<class_loader_data*>(this)) + entry->offset
                     ) };
 
-                    return is_valid_ptr(result) ? result : nullptr;
+                    return vmhook::hotspot::is_valid_ptr(result) ? result : nullptr;
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} class_loader_data.get_klasses() {}", easy_jni_error, e.what());
+                    std::println("{} class_loader_data.get_klasses() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -975,21 +1130,21 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ClassLoaderData._next entry." };
+                        throw vmhook::exception{ "Failed to find ClassLoaderData._next entry." };
                     }
 
-                    if (!is_valid_ptr(this))
+                    if (!vmhook::hotspot::is_valid_ptr(this))
                     {
                         return nullptr;
                     }
 
-                    class_loader_data* const next{ reinterpret_cast<class_loader_data*>(const_cast<void*>(safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
+                    class_loader_data* const next{ reinterpret_cast<class_loader_data*>(const_cast<void*>(vmhook::hotspot::safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
 
-                    return is_valid_ptr(next) ? next : nullptr;
+                    return vmhook::hotspot::is_valid_ptr(next) ? next : nullptr;
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} class_loader_data.get_next() {}", easy_jni_error, e.what());
+                    std::println("{} class_loader_data.get_next() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -1005,21 +1160,21 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ClassLoaderData._dictionary entry." };
+                        throw vmhook::exception{ "Failed to find ClassLoaderData._dictionary entry." };
                     }
 
-                    if (!is_valid_ptr(this))
+                    if (!vmhook::hotspot::is_valid_ptr(this))
                     {
                         return nullptr;
                     }
 
-                    dictionary* const dict{ reinterpret_cast<dictionary*>(const_cast<void*>(safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
+                    dictionary* const dict{ reinterpret_cast<dictionary*>(const_cast<void*>(vmhook::hotspot::safe_read_ptr(reinterpret_cast<const std::uint8_t*>(this) + entry->offset))) };
 
-                    return is_valid_ptr(dict) ? dict : nullptr;
+                    return vmhook::hotspot::is_valid_ptr(dict) ? dict : nullptr;
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} class_loader_data.get_dictionary() {}", easy_jni_error, e.what());
+                    std::println("{} class_loader_data.get_dictionary() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -1041,13 +1196,30 @@ namespace jni
         */
         struct dictionary
         {
+            /*
+                @brief Returns the number of hash buckets in this dictionary.
+                @details
+                BasicHashtable<mtInternal> layout (x64):
+                  +0  int32_t _table_size  — number of buckets  ← this offset
+                  +4  (4 bytes alignment padding)
+                  +8  HashtableBucket* _buckets
+            */
             inline auto get_table_size() const noexcept -> std::int32_t
             {
+                // _table_size is the first field of BasicHashtable at offset 0.
                 return *reinterpret_cast<const std::int32_t*>(this);
             }
 
+            /*
+                @brief Returns a pointer to the bucket array of this dictionary.
+                @details
+                _buckets is the second field of BasicHashtable at offset +8 (after
+                _table_size int32 + 4 bytes padding on x64).
+                Each element is a pointer to the head of a singly-linked DictionaryEntry chain.
+            */
             inline auto get_buckets() const noexcept -> const std::uint8_t*
             {
+                // +8 bytes = sizeof(int32_t _table_size) + 4 bytes alignment padding.
                 return *reinterpret_cast<const std::uint8_t* const*>(reinterpret_cast<const std::uint8_t*>(this) + 8);
             }
 
@@ -1059,30 +1231,34 @@ namespace jni
                 const std::int32_t table_size{ get_table_size() };
                 const std::uint8_t* const buckets{ get_buckets() };
 
-                if (!is_valid_ptr(buckets) || table_size <= 0 || table_size > 0x186A0)
+                if (!vmhook::hotspot::is_valid_ptr(buckets) || table_size <= 0 || table_size > 0x186A0)
                 {
                     return nullptr;
                 }
 
-                for (std::int32_t i{ 0 }; i < table_size; ++i)
+                for (std::int32_t bucket_index{ 0 }; bucket_index < table_size; ++bucket_index)
                 {
-                    const std::uint8_t* entry{ reinterpret_cast<const std::uint8_t*>(untag_ptr(safe_read_ptr(buckets + i * 8))) };
+                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_ptr(vmhook::hotspot::safe_read_ptr(buckets + bucket_index * 8))) };
 
-                    while (is_valid_ptr(entry))
+                    while (vmhook::hotspot::is_valid_ptr(dict_entry))
                     {
-                        const void* const raw_klass{ safe_read_ptr(entry + 16) };
-                        const klass* const k{ reinterpret_cast<const klass*>(untag_ptr(raw_klass)) };
+                        // DictionaryEntry (extends HashtableEntry<InstanceKlass*, mtClass>) layout:
+                        //   +0   void*       _next    (next entry in the chain)
+                        //   +8   uint32_t    _hash    (pre-computed hash, 4 bytes + 4 padding)
+                        //   +16  Klass*      _literal ← the actual class pointer
+                        const void* const raw_klass{ vmhook::hotspot::safe_read_ptr(dict_entry + 16) };
+                        const klass* const candidate_klass{ reinterpret_cast<const klass*>(vmhook::hotspot::untag_ptr(raw_klass)) };
 
-                        if (is_valid_ptr(k))
+                        if (vmhook::hotspot::is_valid_ptr(candidate_klass))
                         {
-                            const symbol* const sym{ k->get_name() };
-                            if (is_valid_ptr(sym) && sym->to_string() == class_name)
+                            const symbol* const sym{ candidate_klass->get_name() };
+                            if (vmhook::hotspot::is_valid_ptr(sym) && sym->to_string() == class_name)
                             {
-                                return const_cast<klass*>(k);
+                                return const_cast<klass*>(candidate_klass);
                             }
                         }
 
-                        entry = reinterpret_cast<const std::uint8_t*>(untag_ptr(safe_read_ptr(entry)));
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_ptr(vmhook::hotspot::safe_read_ptr(dict_entry)));
                     }
                 }
 
@@ -1109,16 +1285,16 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find ClassLoaderDataGraph._head entry." };
+                        throw vmhook::exception{ "Failed to find ClassLoaderDataGraph._head entry." };
                     }
 
                     class_loader_data* const head{ *reinterpret_cast<class_loader_data* const*>(entry->address) };
 
-                    return is_valid_ptr(head) ? head : nullptr;
+                    return vmhook::hotspot::is_valid_ptr(head) ? head : nullptr;
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} class_loader_data_graph.get_head() {}", easy_jni_error, e.what());
+                    std::println("{} class_loader_data_graph.get_head() {}", vmhook::k_error_tag, e.what());
                     return nullptr;
                 }
             }
@@ -1134,26 +1310,61 @@ namespace jni
             */
             auto find_klass(const std::string_view class_name) const -> klass*
             {
-                // Walk every CLD's _klasses linked list.
-                // The Dictionary-based approach is not used because
-                // ClassLoaderData::_dictionary is absent from VMStructs in JDK 21+.
+                // Adaptive strategy — detected once at startup via VMStructs presence:
+                //   JDK 21+  exports _klasses  but not _dictionary
+                //   JDK 8-17 exports _dictionary but not _klasses
+                static const bool use_klasses{
+                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_klasses") != nullptr };
+
                 class_loader_data* cld{ this->get_head() };
 
-                while (is_valid_ptr(cld) && cld)
+                while (vmhook::hotspot::is_valid_ptr(cld) && cld)
                 {
-                    klass* k{ cld->get_klasses() };
-                    while (k && is_valid_ptr(k))
+                    if (use_klasses)
                     {
-                        const symbol* const sym{ k->get_name() };
-                        if (is_valid_ptr(sym) && sym->to_string() == class_name)
+                        // JDK 21+: walk the _klasses linked list
+                        klass* current_klass{ cld->get_klasses() };
+                        while (current_klass && vmhook::hotspot::is_valid_ptr(current_klass))
                         {
-                            return k;
+                            const symbol* const sym{ current_klass->get_name() };
+                            if (vmhook::hotspot::is_valid_ptr(sym) && sym->to_string() == class_name)
+                                return current_klass;
+                            current_klass = current_klass->get_next_link();
                         }
-                        k = k->get_next_link();
+                    }
+                    else
+                    {
+                        // JDK 8-17: search via per-CLD Dictionary hashtable
+                        // (may return null if _dictionary not in VMStructs for this JDK build)
+                        dictionary* const dict{ cld->get_dictionary() };
+                        if (vmhook::hotspot::is_valid_ptr(dict))
+                        {
+                            klass* const found_klass{ dict->find_klass(class_name) };
+                            if (found_klass) return found_klass;
+                        }
                     }
 
                     class_loader_data* const next{ cld->get_next() };
-                    cld = is_valid_ptr(next) ? next : nullptr;
+                    cld = vmhook::hotspot::is_valid_ptr(next) ? next : nullptr;
+                }
+
+                // JDK 8 fallback: ClassLoaderData._dictionary not in VMStructs,
+                // but SystemDictionary._dictionary (bootstrap CL) and
+                // SystemDictionary._shared_dictionary (CDS) ARE exported as statics.
+                // These cover all bootstrap-loaded classes (java.*, javax.*, sun.*, etc.)
+                // and most Minecraft client classes (loaded by the same classloader chain).
+                static const VMStructEntry* const sd_main{
+                    vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_dictionary") };
+                static const VMStructEntry* const sd_shared{
+                    vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_shared_dictionary") };
+
+                for (const VMStructEntry* sde : { sd_main, sd_shared })
+                {
+                    if (!sde || !sde->address) continue;
+                    dictionary* const dict{ *reinterpret_cast<dictionary**>(sde->address) };
+                    if (!vmhook::hotspot::is_valid_ptr(dict)) continue;
+                    klass* const found_klass{ dict->find_klass(class_name) };
+                    if (found_klass) return found_klass;
                 }
 
                 return nullptr;
@@ -1204,14 +1415,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find JavaThread._thread_state entry." };
+                        throw vmhook::exception{ "Failed to find JavaThread._thread_state entry." };
                     }
 
                     return *reinterpret_cast<java_thread_state*>(reinterpret_cast<std::uint8_t*>(const_cast<java_thread*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} java_thread.get_thread_state() {}", easy_jni_error, e.what());
+                    std::println("{} java_thread.get_thread_state() {}", vmhook::k_error_tag, e.what());
                     return java_thread_state::_thread_uninitialized;
                 }
             }
@@ -1228,14 +1439,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find JavaThread._thread_state entry." };
+                        throw vmhook::exception{ "Failed to find JavaThread._thread_state entry." };
                     }
 
                     *reinterpret_cast<java_thread_state*>(reinterpret_cast<std::uint8_t*>(const_cast<java_thread*>(this)) + entry->offset) = state;
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} java_thread.set_thread_state() {}", easy_jni_error, e.what());
+                    std::println("{} java_thread.set_thread_state() {}", vmhook::k_error_tag, e.what());
                 }
             }
 
@@ -1250,14 +1461,14 @@ namespace jni
                 {
                     if (!entry)
                     {
-                        throw jni_exception{ "Failed to find JavaThread._suspend_flags entry." };
+                        throw vmhook::exception{ "Failed to find JavaThread._suspend_flags entry." };
                     }
 
                     return *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(const_cast<java_thread*>(this)) + entry->offset);
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} java_thread.get_suspend_flags() {}", easy_jni_error, e.what());
+                    std::println("{} java_thread.get_suspend_flags() {}", vmhook::k_error_tag, e.what());
                     return 0;
                 }
             }
@@ -1268,9 +1479,17 @@ namespace jni
             @param compressed The 32-bit compressed OOP value read from a JVM structure.
             @return The decoded real pointer, or nullptr if compressed is 0.
             @details
-            HotSpot compresses heap pointers to 32 bits using a base+shift scheme.
-            The real address is recovered as: base + (compressed << shift).
-            Both base and shift are read from CompressedOops::_narrow_oop via VMStructs.
+            HotSpot stores heap object pointers in 32-bit "compressed OOP" form to reduce
+            memory usage. The formula to recover the real 64-bit address is:
+              real_address = narrow_oop_base + (compressed << narrow_oop_shift)
+
+            - narrow_oop_base  — base address of the Java heap (0 when -Xmx < 4 GB and
+                                  heap starts at address 0, otherwise the heap start).
+            - narrow_oop_shift — how many bits to left-shift the compressed value (typically
+                                  0 for heap < 4 GB, 3 for heap up to 32 GB with 8-byte aligned oops).
+
+            Both values are read from CompressedOops::_narrow_oop.{_base,_shift} via
+            gHotSpotVMStructs so this works across all JDK versions.
         */
         static auto decode_oop_ptr(const std::uint32_t compressed) noexcept -> void*
         {
@@ -1279,25 +1498,27 @@ namespace jni
                 return nullptr;
             }
 
-            static const VMStructEntry* const base_entry{ iterate_struct_entries("CompressedOops", "_narrow_oop._base") };
-            static const VMStructEntry* const shift_entry{ iterate_struct_entries("CompressedOops", "_narrow_oop._shift") };
+            static const VMStructEntry* const base_entry { vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._base")  };
+            static const VMStructEntry* const shift_entry{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._shift") };
 
             if (!base_entry || !shift_entry)
             {
                 return nullptr;
             }
 
-            const std::uint64_t base{ *reinterpret_cast<const std::uint64_t*>(base_entry->address) };
-            const std::uint32_t shift{ *reinterpret_cast<const std::uint32_t*>(shift_entry->address) };
+            const std::uint64_t narrow_oop_base { *reinterpret_cast<const std::uint64_t*>(base_entry->address)  };
+            const std::uint32_t narrow_oop_shift{ *reinterpret_cast<const std::uint32_t*>(shift_entry->address) };
 
-            return reinterpret_cast<void*>(base + (static_cast<std::uint64_t>(compressed) << shift));
+            // real_address = narrow_oop_base + (compressed << narrow_oop_shift)
+            return reinterpret_cast<void*>(narrow_oop_base + (static_cast<std::uint64_t>(compressed) << narrow_oop_shift));
         }
 
         /*
             @brief Decodes a compressed Klass pointer to a real 64-bit pointer.
             @details
-            HotSpot compresses Klass pointers separately from OOPs using their own
-            base+shift scheme stored in CompressedKlassPointers::_narrow_klass.
+            Klass pointers use a separate compressed-pointer scheme from object OOPs,
+            stored in CompressedKlassPointers::_narrow_klass.{_base,_shift}.
+            The decoding formula is identical: real_address = base + (compressed << shift).
         */
         static auto decode_klass_ptr(const std::uint32_t compressed) noexcept -> void*
         {
@@ -1327,10 +1548,10 @@ namespace jni
         */
         inline static auto match_pattern(const std::uint8_t* const address, const std::uint8_t* const pattern, const std::size_t size) -> bool
         {
-            for (std::size_t i{ 0 }; i < size; ++i)
+            for (std::size_t byte_index{ 0 }; byte_index < size; ++byte_index)
             {
-                if (pattern[i] == 0x00) continue;
-                if (address[i] != pattern[i]) return false;
+                if (pattern[byte_index] == 0x00) continue;
+                if (address[byte_index] != pattern[byte_index]) return false;
             }
             return true;
         }
@@ -1347,11 +1568,11 @@ namespace jni
             const std::size_t size
         ) -> std::uint8_t*
         {
-            for (std::size_t i{ 0 }; i < range; ++i)
+            for (std::size_t scan_offset{ 0 }; scan_offset < range; ++scan_offset)
             {
-                if (match_pattern(start + i, pattern, size))
+                if (vmhook::hotspot::match_pattern(start + scan_offset, pattern, size))
                 {
-                    return const_cast<std::uint8_t*>(start + i);
+                    return const_cast<std::uint8_t*>(start + scan_offset);
                 }
             }
             return nullptr;
@@ -1408,20 +1629,20 @@ namespace jni
             };
 
             const std::uint8_t* const current{ reinterpret_cast<const std::uint8_t*>(i2i_entry) };
-            const std::size_t scan_size{ find_stub_size(current) };
+            const std::size_t scan_size{ vmhook::hotspot::find_stub_size(current) };
 
-            std::uint8_t* const hook_location{ scan(current, scan_size, pattern, sizeof(pattern)) };
+            std::uint8_t* const hook_location{ vmhook::hotspot::scan(current, scan_size, pattern, sizeof(pattern)) };
 
             try
             {
                 if (!hook_location)
                 {
-                    throw jni_exception{ "Failed to find hook pattern." };
+                    throw vmhook::exception{ "Failed to find hook pattern." };
                 }
 
                 for (std::uint8_t* p{ hook_location }; p > current; --p)
                 {
-                    if (match_pattern(p, locals_pattern, sizeof(locals_pattern)))
+                    if (vmhook::hotspot::match_pattern(p, locals_pattern, sizeof(locals_pattern)))
                     {
                         locals_offset = static_cast<std::int8_t>(p[3]);
                         break;
@@ -1432,7 +1653,7 @@ namespace jni
             }
             catch (const std::exception& e)
             {
-                std::println("{} find_hook_location() {}", easy_jni_error, e.what());
+                std::println("{} find_hook_location() {}", vmhook::k_error_tag, e.what());
                 return nullptr;
             }
         }
@@ -1447,12 +1668,12 @@ namespace jni
         */
         static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect) noexcept -> std::uint8_t*
         {
-            for (std::int64_t i{ 65536 }; i < 0x7FFFFFFF; i += 65536)
+            for (std::int64_t distance_step{ 65536 }; distance_step < 0x7FFFFFFF; distance_step += 65536)
             {
-                std::uint8_t* allocated{ reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr + i, size, MEM_COMMIT | MEM_RESERVE, protect)) };
+                std::uint8_t* allocated{ reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr + distance_step, size, MEM_COMMIT | MEM_RESERVE, protect)) };
                 if (allocated) return allocated;
 
-                allocated = reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr - i, size, MEM_COMMIT | MEM_RESERVE, protect));
+                allocated = reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr - distance_step, size, MEM_COMMIT | MEM_RESERVE, protect));
                 if (allocated) return allocated;
             }
 
@@ -1474,17 +1695,34 @@ namespace jni
         public:
             /*
                 @brief Returns a pointer to the Method object of the currently executing method.
+                @details
+                On x64 HotSpot, `this` is rbp (the interpreter frame base pointer).
+                The x64 interpreter frame layout relative to rbp is:
+                  rbp + 0   saved caller rbp
+                  rbp - 8   return address (pushed by call instruction)
+                  rbp - 16  last_sp / expression stack bottom
+                  rbp - 24  Method* pointer  ← this offset
+                This corresponds to interpreter_frame_method_offset = -3 words = -24 bytes
+                as defined in frame_x86.hpp.
             */
             inline auto get_method() const noexcept -> method*
             {
+                // -24 bytes = -3 * sizeof(void*): the Method* slot in the interpreter frame.
                 return *reinterpret_cast<method**>(reinterpret_cast<std::uint8_t*>(const_cast<frame*>(this)) - 24);
             }
 
             /*
                 @brief Returns a pointer to the local variables array of the currently executing method.
+                @details
+                The locals pointer is stored in the interpreter frame at a JDK-version-dependent
+                offset from rbp.  The actual offset is determined at runtime by
+                vmhook::hotspot::find_hook_location(), which scans backwards through the i2i stub
+                for the instruction `mov r14, QWORD PTR [rbp+??]` and reads the displacement byte.
+                The default is -56 bytes (fits most JDK 8-21 builds).
             */
             inline auto get_locals() const noexcept -> void**
             {
+                // locals_offset is discovered at hook time; typically -56 on JDK 8-21 x64.
                 return *reinterpret_cast<void***>(reinterpret_cast<std::uint8_t*>(const_cast<frame*>(this)) + locals_offset);
             }
 
@@ -1511,10 +1749,15 @@ namespace jni
                 @param index Zero-based index into the local variables array.
                 @return The argument value, or a default-constructed value on failure.
                 @details
-                Arguments are stored at locals[-index].
-                - Pointer types: the slot value is treated as a compressed OOP and decoded
-                  via decode_oop_ptr(), then cast to the requested pointer type.
-                - Primitive types (sizeof <= sizeof(void*)): bit-copied via memcpy.
+                HotSpot lays out the locals array in reverse order relative to the frame:
+                  locals[0]  = argument 0  (this for instance methods)
+                  locals[-1] = argument 1
+                  locals[-2] = argument 2, ...
+                So the slot for argument `index` is at locals[-index].
+                - Pointer types: the slot holds a 32-bit compressed OOP (zero-extended to 64 bits
+                  by the interpreter). vmhook::hotspot::decode_oop_ptr() reconstructs the real
+                  address using narrow_oop_base + (compressed << narrow_oop_shift).
+                - Primitive types (sizeof <= 8): the bits are copied verbatim via std::memcpy.
             */
             template<typename type>
             auto get_argument(const std::int32_t index) const noexcept -> type
@@ -1522,12 +1765,13 @@ namespace jni
                 void** const locals{ get_locals() };
                 if (!locals) return type{};
 
+                // locals[-index]: arguments are stored in descending slot order.
                 void* raw{ locals[-index] };
 
                 if constexpr (std::is_pointer_v<type>)
                 {
                     if (!raw) return nullptr;
-                    return reinterpret_cast<type>(decode_oop_ptr(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(raw))));
+                    return reinterpret_cast<type>(vmhook::hotspot::decode_oop_ptr(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(raw))));
                 }
                 else if constexpr (sizeof(type) <= sizeof(void*))
                 {
@@ -1630,18 +1874,18 @@ namespace jni
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
 
-                this->allocated = allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
+                this->allocated = vmhook::hotspot::allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
 
                 try
                 {
                     if (!this->allocated)
                     {
-                        throw jni_exception{ "Failed to allocate memory for hook." };
+                        throw vmhook::exception{ "Failed to allocate memory for hook." };
                     }
                 }
                 catch (const std::exception& e)
                 {
-                    std::println("{} midi2i_hook::midi2i_hook {}", easy_jni_error, e.what());
+                    std::println("{} midi2i_hook::midi2i_hook {}", vmhook::k_error_tag, e.what());
                     return;
                 }
 
@@ -1720,12 +1964,12 @@ namespace jni
         /*
             @brief Global list of all currently hooked Java methods and their detour functions.
         */
-        inline std::vector<hooked_method> hooked_methods{};
+        inline std::vector<hooked_method> g_hooked_methods{};
 
         /*
             @brief Global list of all i2i entry points that have been patched and their hooks.
         */
-        inline std::vector<i2i_hook_data> hooked_i2i_entries{};
+        inline std::vector<i2i_hook_data> g_hooked_i2i_entries{};
 
         /*
             @brief Common detour function invoked by the trampoline stub for every intercepted method call.
@@ -1734,26 +1978,26 @@ namespace jni
             @param cancel Pointer to the cancel flag on the trampoline stack.
             @details
             Single entry point for all midi2i_hook trampolines. Verifies thread state,
-            finds the matching per-method detour in hooked_methods, dispatches it, then
+            finds the matching per-method detour in g_hooked_methods, dispatches it, then
             restores thread state to _thread_in_Java.
         */
         static auto common_detour(frame* const f, java_thread* const thread, bool* const cancel) -> void
         {
             try
             {
-                if (!thread || !is_valid_ptr(thread))
+                if (!thread || !vmhook::hotspot::is_valid_ptr(thread))
                 {
-                    throw jni_exception{ "JavaThread pointer is null or invalid." };
+                    throw vmhook::exception{ "JavaThread pointer is null or invalid." };
                 }
 
                 if (thread->get_thread_state() != java_thread_state::_thread_in_Java)
                 {
-                    throw jni_exception{ "JavaThread is not in _thread_in_Java state." };
+                    throw vmhook::exception{ "JavaThread is not in _thread_in_Java state." };
                 }
 
                 const method* const current_method{ f->get_method() };
 
-                for (const hooked_method& hook : hooked_methods)
+                for (const hooked_method& hook : g_hooked_methods)
                 {
                     if (hook.method == current_method)
                     {
@@ -1765,7 +2009,7 @@ namespace jni
             }
             catch (const std::exception& e)
             {
-                std::println("{} common_detour() {}", easy_jni_error, e.what());
+                std::println("{} common_detour() {}", vmhook::k_error_tag, e.what());
             }
         }
 
@@ -1815,7 +2059,7 @@ namespace jni
         Subsequent calls return the cached klass* directly without repeating
         the full ClassLoaderDataGraph walk.
     */
-    inline std::unordered_map<std::string, hotspot::klass*> classes_hs{};
+    inline std::unordered_map<std::string, hotspot::klass*> klass_lookup_cache{};
 
     /*
         @brief Finds a loaded Java class by its internal name using HotSpot internals only.
@@ -1829,7 +2073,7 @@ namespace jni
     */
     static auto find_class(const std::string_view class_name) -> hotspot::klass*
     {
-        if (const auto it{ classes_hs.find(std::string{ class_name }) }; it != classes_hs.end())
+        if (const auto it{ klass_lookup_cache.find(std::string{ class_name }) }; it != klass_lookup_cache.end())
         {
             return it->second;
         }
@@ -1837,19 +2081,19 @@ namespace jni
         try
         {
             const hotspot::class_loader_data_graph graph{};
-            hotspot::klass* const k{ graph.find_klass(class_name) };
+            hotspot::klass* const found_klass{ graph.find_klass(class_name) };
 
-            if (!k)
+            if (!found_klass)
             {
                 return nullptr;
             }
 
-            classes_hs.insert({ std::string{ class_name }, k });
-            return k;
+            klass_lookup_cache.insert({ std::string{ class_name }, found_klass });
+            return found_klass;
         }
         catch (const std::exception& e)
         {
-            std::println("{} jni::find_class() for {}: {}", easy_jni_error, class_name, e.what());
+            std::println("{} vmhook::find_class() for {}: {}", vmhook::k_error_tag, class_name, e.what());
             return nullptr;
         }
     }
@@ -1861,22 +2105,22 @@ namespace jni
         @return true if the class was found in the JVM and successfully registered,
                 false if the class could not be found.
         @details
-        Stores the mapping from the C++ type_index of T to class_name in class_map,
+        Stores the mapping from the C++ type_index of T to class_name in type_to_class_map,
         then verifies the class exists in the JVM by calling find_class().
         Registration is required before calling hook<T>().
     */
     template<class T>
     static auto register_class(const std::string_view class_name) noexcept -> bool
     {
-        hotspot::klass* const k{ find_class(class_name) };
+        hotspot::klass* const verified_klass{ find_class(class_name) };
 
-        if (!k)
+        if (!verified_klass)
         {
-            std::println("{} register_class() for {}: class not found in JVM.", easy_jni_error, class_name);
+            std::println("{} register_class() for {}: class not found in JVM.", vmhook::k_error_tag, class_name);
             return false;
         }
 
-        class_map.insert_or_assign(std::type_index{ typeid(T) }, std::string{ class_name });
+        type_to_class_map.insert_or_assign(std::type_index{ typeid(T) }, std::string{ class_name });
         return true;
     }
 
@@ -1896,10 +2140,10 @@ namespace jni
         2. Walk the InstanceKlass::_methods array to locate the target method by name.
         3. Disable JIT compilation by setting NO_COMPILE in Method._access_flags
            and _dont_inline in Method._flags.
-        4. Register the method and its detour in hooked_methods for dispatch by common_detour.
+        4. Register the method and its detour in g_hooked_methods for dispatch by common_detour.
         5. Check whether the i2i entry point has already been patched; if so, reuse it.
         6. If the i2i entry is new, locate the injection point via find_hook_location(),
-           allocate a trampoline via midi2i_hook, and register it in hooked_i2i_entries.
+           allocate a trampoline via midi2i_hook, and register it in g_hooked_i2i_entries.
 
         @note Unlike the JNI/JVMTI version, this implementation does not force a class
               retransformation to flush existing JIT-compiled code. Hooking a method that
@@ -1914,46 +2158,46 @@ namespace jni
         {
             if (!detour)
             {
-                throw jni_exception{ "Detour function pointer is null." };
+                throw vmhook::exception{ "Detour function pointer is null." };
             }
 
-            const auto it{ class_map.find(std::type_index{ typeid(T) }) };
-            if (it == class_map.end())
+            const auto it{ type_to_class_map.find(std::type_index{ typeid(T) }) };
+            if (it == type_to_class_map.end())
             {
-                throw jni_exception{ std::format("Class not registered for type {}. Did you call register_class<T>()?", typeid(T).name()) };
+                throw vmhook::exception{ std::format("Class not registered for type {}. Did you call register_class<T>()?", typeid(T).name()) };
             }
 
-            hotspot::klass* const k{ find_class(it->second) };
-            if (!k)
+            hotspot::klass* const target_klass{ find_class(it->second) };
+            if (!target_klass)
             {
-                throw jni_exception{ std::format("Class '{}' not found in JVM.", it->second) };
+                throw vmhook::exception{ std::format("Class '{}' not found in JVM.", it->second) };
             }
 
-            const std::int32_t count{ k->get_methods_count() };
-            hotspot::method** const methods_ptr{ k->get_methods_ptr() };
+            const std::int32_t method_count{ target_klass->get_methods_count() };
+            hotspot::method** const methods_array{ target_klass->get_methods_ptr() };
 
-            if (!methods_ptr || count <= 0)
+            if (!methods_array || method_count <= 0)
             {
-                throw jni_exception{ std::format("No methods found on class '{}'.", it->second) };
+                throw vmhook::exception{ std::format("No methods found on class '{}'.", it->second) };
             }
 
             hotspot::method* found_method{ nullptr };
-            for (std::int32_t i{ 0 }; i < count; ++i)
+            for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
             {
-                hotspot::method* const m{ methods_ptr[i] };
-                if (m && hotspot::is_valid_ptr(m) && m->get_name() == method_name)
+                hotspot::method* const method_ptr{ methods_array[method_index] };
+                if (method_ptr && vmhook::hotspot::is_valid_ptr(method_ptr) && method_ptr->get_name() == method_name)
                 {
-                    found_method = m;
+                    found_method = method_ptr;
                     break;
                 }
             }
 
             if (!found_method)
             {
-                throw jni_exception{ std::format("Method '{}' not found in class '{}'.", method_name, it->second) };
+                throw vmhook::exception{ std::format("Method '{}' not found in class '{}'.", method_name, it->second) };
             }
 
-            for (const hotspot::hooked_method& hm : hotspot::hooked_methods)
+            for (const hotspot::hooked_method& hm : hotspot::g_hooked_methods)
             {
                 if (hm.method == found_method)
                 {
@@ -1961,24 +2205,24 @@ namespace jni
                 }
             }
 
-            hotspot::set_dont_inline(found_method, true);
+            vmhook::hotspot::set_dont_inline(found_method, true);
 
             std::uint32_t* const flags{ found_method->get_access_flags() };
             if (!flags)
             {
-                throw jni_exception{ "Failed to retrieve access flags." };
+                throw vmhook::exception{ "Failed to retrieve access flags." };
             }
-            *flags |= hotspot::NO_COMPILE;
+            *flags |= vmhook::hotspot::NO_COMPILE;
 
-            hotspot::hooked_methods.push_back({ found_method, detour });
+            hotspot::g_hooked_methods.push_back({ found_method, detour });
 
             void* const i2i{ found_method->get_i2i_entry() };
             if (!i2i)
             {
-                throw jni_exception{ "Failed to retrieve i2i entry." };
+                throw vmhook::exception{ "Failed to retrieve i2i entry." };
             }
 
-            for (const hotspot::i2i_hook_data& hd : hotspot::hooked_i2i_entries)
+            for (const hotspot::i2i_hook_data& hd : hotspot::g_hooked_i2i_entries)
             {
                 if (hd.i2i_entry == i2i)
                 {
@@ -1986,25 +2230,25 @@ namespace jni
                 }
             }
 
-            std::uint8_t* const target{ reinterpret_cast<std::uint8_t*>(hotspot::find_hook_location(i2i)) };
+            std::uint8_t* const target{ reinterpret_cast<std::uint8_t*>(vmhook::hotspot::find_hook_location(i2i)) };
             if (!target)
             {
-                throw jni_exception{ "Failed to find hook location in i2i stub." };
+                throw vmhook::exception{ "Failed to find hook location in i2i stub." };
             }
 
-            hotspot::midi2i_hook* const hook_instance{ new hotspot::midi2i_hook(target, hotspot::common_detour) };
+            vmhook::hotspot::midi2i_hook* const hook_instance{ new vmhook::hotspot::midi2i_hook(target, vmhook::hotspot::common_detour) };
             if (hook_instance->has_error())
             {
                 delete hook_instance;
-                throw jni_exception{ "midi2i_hook installation failed." };
+                throw vmhook::exception{ "midi2i_hook installation failed." };
             }
 
-            hotspot::hooked_i2i_entries.push_back({ i2i, hook_instance });
+            hotspot::g_hooked_i2i_entries.push_back({ i2i, hook_instance });
             return true;
         }
         catch (const std::exception& e)
         {
-            std::println("{} jni::hook() for {}: {}", easy_jni_error, method_name, e.what());
+            std::println("{} vmhook::hook() for {}: {}", vmhook::k_error_tag, method_name, e.what());
             return false;
         }
     }
@@ -2018,24 +2262,24 @@ namespace jni
     */
     static auto shutdown_hooks() noexcept -> void
     {
-        for (const hotspot::i2i_hook_data& hd : hotspot::hooked_i2i_entries)
+        for (const hotspot::i2i_hook_data& hd : hotspot::g_hooked_i2i_entries)
         {
             delete hd.hook;
         }
 
-        for (const hotspot::hooked_method& hm : hotspot::hooked_methods)
+        for (const hotspot::hooked_method& hm : hotspot::g_hooked_methods)
         {
-            hotspot::set_dont_inline(hm.method, false);
+            vmhook::hotspot::set_dont_inline(hm.method, false);
 
             std::uint32_t* const flags{ hm.method->get_access_flags() };
             if (flags)
             {
-                *flags &= static_cast<std::uint32_t>(~hotspot::NO_COMPILE);
+                *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
             }
         }
 
-        hotspot::hooked_methods.clear();
-        hotspot::hooked_i2i_entries.clear();
+        hotspot::g_hooked_methods.clear();
+        hotspot::g_hooked_i2i_entries.clear();
     }
 
     // ─── Field access ─────────────────────────────────────────────────────────
@@ -2047,7 +2291,7 @@ namespace jni
         Raw klass pointers are safe as keys for process-lifetime injection; class unloading
         would invalidate them, but that is not a concern for the typical use case here.
     */
-    inline std::unordered_map<hotspot::klass*, std::unordered_map<std::string, hotspot::field_entry>> field_cache{};
+    inline std::unordered_map<hotspot::klass*, std::unordered_map<std::string, hotspot::field_entry>> g_field_cache{};
 
     /*
         @brief Looks up and caches a field entry for a named field on a klass.
@@ -2059,15 +2303,15 @@ namespace jni
         On the first call for a given (k, name) pair the full InstanceKlass._fields
         array is walked; subsequent calls return the cached result directly.
     */
-    static auto find_field(hotspot::klass* const k, const std::string_view name) -> std::optional<hotspot::field_entry>
+    static auto find_field(hotspot::klass* const target_klass, const std::string_view name) -> std::optional<hotspot::field_entry>
     {
-        if (!k || !hotspot::is_valid_ptr(k))
+        if (!target_klass || !vmhook::hotspot::is_valid_ptr(target_klass))
         {
-            std::println("{} jni::find_field() for '{}': klass pointer is null.", easy_jni_error, name);
+            std::println("{} vmhook::find_field() for '{}': klass pointer is null.", vmhook::k_error_tag, name);
             return std::nullopt;
         }
 
-        auto& class_fields{ field_cache[k] };
+        auto& class_fields{ g_field_cache[target_klass] };
         const std::string name_str{ name };
 
         if (const auto it{ class_fields.find(name_str) }; it != class_fields.end())
@@ -2075,11 +2319,11 @@ namespace jni
             return it->second;
         }
 
-        const auto entry{ k->find_field(name) };
+        const auto entry{ target_klass->find_field(name) };
 
         if (!entry)
         {
-            std::println("{} jni::find_field() for '{}': field not declared on klass.", easy_jni_error, name);
+            std::println("{} vmhook::find_field() for '{}': field not declared on klass.", vmhook::k_error_tag, name);
             return std::nullopt;
         }
 
@@ -2101,27 +2345,27 @@ namespace jni
               compressed OOP, then pass it to hotspot::decode_oop_ptr() yourself.
     */
     template<typename T>
-    static auto get_field(void* const object, hotspot::klass* const k, const std::string_view name) -> T
+    static auto get_field(void* const object, hotspot::klass* const target_klass, const std::string_view name) -> T
     {
         static_assert(std::is_trivially_copyable_v<T>, "get_field<T>: T must be trivially copyable.");
 
         try
         {
-            if (!object || !hotspot::is_valid_ptr(object))
+            if (!object || !vmhook::hotspot::is_valid_ptr(object))
             {
-                throw jni_exception{ "Object pointer is null or invalid." };
+                throw vmhook::exception{ "Object pointer is null or invalid." };
             }
 
-            const auto entry{ find_field(k, name) };
+            const auto entry{ find_field(target_klass, name) };
 
             if (!entry)
             {
-                throw jni_exception{ std::format("Instance field '{}' not found.", name) };
+                throw vmhook::exception{ std::format("Instance field '{}' not found.", name) };
             }
 
             if (entry->is_static)
             {
-                throw jni_exception{ std::format("'{}' is a static field; use jni::get_static_field<T>().", name) };
+                throw vmhook::exception{ std::format("'{}' is a static field; use vmhook::get_static_field<T>().", name) };
             }
 
             T result{};
@@ -2130,7 +2374,7 @@ namespace jni
         }
         catch (const std::exception& e)
         {
-            std::println("{} jni::get_field<{}>('{}') {}", easy_jni_error, typeid(T).name(), name, e.what());
+            std::println("{} vmhook::get_field<{}>('{}') {}", vmhook::k_error_tag, typeid(T).name(), name, e.what());
             return T{};
         }
     }
@@ -2146,34 +2390,34 @@ namespace jni
               Encoding is: (real_address - narrow_oop_base) >> narrow_oop_shift.
     */
     template<typename T>
-    static auto set_field(void* const object, hotspot::klass* const k, const std::string_view name, const T value) -> void
+    static auto set_field(void* const object, hotspot::klass* const target_klass, const std::string_view name, const T value) -> void
     {
         static_assert(std::is_trivially_copyable_v<T>, "set_field<T>: T must be trivially copyable.");
 
         try
         {
-            if (!object || !hotspot::is_valid_ptr(object))
+            if (!object || !vmhook::hotspot::is_valid_ptr(object))
             {
-                throw jni_exception{ "Object pointer is null or invalid." };
+                throw vmhook::exception{ "Object pointer is null or invalid." };
             }
 
-            const auto entry{ find_field(k, name) };
+            const auto entry{ find_field(target_klass, name) };
 
             if (!entry)
             {
-                throw jni_exception{ std::format("Instance field '{}' not found.", name) };
+                throw vmhook::exception{ std::format("Instance field '{}' not found.", name) };
             }
 
             if (entry->is_static)
             {
-                throw jni_exception{ std::format("'{}' is a static field; use set_static_field().", name) };
+                throw vmhook::exception{ std::format("'{}' is a static field; use set_static_field().", name) };
             }
 
             std::memcpy(reinterpret_cast<std::uint8_t*>(object) + entry->offset, &value, sizeof(T));
         }
         catch (const std::exception& e)
         {
-            std::println("{} jni::set_field<{}>('{}') {}", easy_jni_error, typeid(T).name(), name, e.what());
+            std::println("{} vmhook::set_field<{}>('{}') {}", vmhook::k_error_tag, typeid(T).name(), name, e.what());
         }
     }
 
@@ -2189,29 +2433,29 @@ namespace jni
         Klass::_java_mirror (an OopHandle — JDK 17+).
     */
     template<typename T>
-    static auto get_static_field(hotspot::klass* const k, const std::string_view name) -> T
+    static auto get_static_field(hotspot::klass* const target_klass, const std::string_view name) -> T
     {
         static_assert(std::is_trivially_copyable_v<T>, "get_static_field<T>: T must be trivially copyable.");
 
         try
         {
-            const auto entry{ find_field(k, name) };
+            const auto entry{ find_field(target_klass, name) };
 
             if (!entry)
             {
-                throw jni_exception{ std::format("Static field '{}' not found.", name) };
+                throw vmhook::exception{ std::format("Static field '{}' not found.", name) };
             }
 
             if (!entry->is_static)
             {
-                throw jni_exception{ std::format("'{}' is an instance field; use get_field().", name) };
+                throw vmhook::exception{ std::format("'{}' is an instance field; use get_field().", name) };
             }
 
-            void* const mirror{ k->get_java_mirror() };
+            void* const mirror{ target_klass->get_java_mirror() };
 
-            if (!mirror || !hotspot::is_valid_ptr(mirror))
+            if (!mirror || !vmhook::hotspot::is_valid_ptr(mirror))
             {
-                throw jni_exception{ "Failed to retrieve java.lang.Class mirror." };
+                throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
             }
 
             T result{};
@@ -2220,7 +2464,7 @@ namespace jni
         }
         catch (const std::exception& e)
         {
-            std::println("{} jni::get_static_field<{}>('{}') {}", easy_jni_error, typeid(T).name(), name, e.what());
+            std::println("{} vmhook::get_static_field<{}>('{}') {}", vmhook::k_error_tag, typeid(T).name(), name, e.what());
             return T{};
         }
     }
@@ -2233,36 +2477,36 @@ namespace jni
         @param value The value to write.
     */
     template<typename T>
-    static auto set_static_field(hotspot::klass* const k, const std::string_view name, const T value) -> void
+    static auto set_static_field(hotspot::klass* const target_klass, const std::string_view name, const T value) -> void
     {
         static_assert(std::is_trivially_copyable_v<T>, "set_static_field<T>: T must be trivially copyable.");
 
         try
         {
-            const auto entry{ find_field(k, name) };
+            const auto entry{ find_field(target_klass, name) };
 
             if (!entry)
             {
-                throw jni_exception{ std::format("Static field '{}' not found.", name) };
+                throw vmhook::exception{ std::format("Static field '{}' not found.", name) };
             }
 
             if (!entry->is_static)
             {
-                throw jni_exception{ std::format("'{}' is an instance field; use set_field().", name) };
+                throw vmhook::exception{ std::format("'{}' is an instance field; use set_field().", name) };
             }
 
-            void* const mirror{ k->get_java_mirror() };
+            void* const mirror{ target_klass->get_java_mirror() };
 
-            if (!mirror || !hotspot::is_valid_ptr(mirror))
+            if (!mirror || !vmhook::hotspot::is_valid_ptr(mirror))
             {
-                throw jni_exception{ "Failed to retrieve java.lang.Class mirror." };
+                throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
             }
 
             std::memcpy(reinterpret_cast<std::uint8_t*>(mirror) + entry->offset, &value, sizeof(T));
         }
         catch (const std::exception& e)
         {
-            std::println("{} jni::set_static_field<{}>('{}') {}", easy_jni_error, typeid(T).name(), name, e.what());
+            std::println("{} vmhook::set_static_field<{}>('{}') {}", vmhook::k_error_tag, typeid(T).name(), name, e.what());
         }
     }
 
@@ -2271,7 +2515,7 @@ namespace jni
     /*
         @brief Lightweight proxy to a single Java field value in memory.
         @details
-        Returned by jni::object::get_field().  Reads the field value on demand,
+        Returned by vmhook::object::get_field().  Reads the field value on demand,
         dispatches the correct C++ type from the JVM type descriptor (signature),
         and returns a typed copy — not a raw-pointer alias.
 
@@ -2425,8 +2669,8 @@ namespace jni
     /*
         @brief Alias for a decoded (uncompressed) Java object pointer.
         @details
-        This is the type passed to jni::object constructors. Obtain it from a
-        hook frame via frame->get_arguments<jni::oop>(), which internally calls
+        This is the type passed to vmhook::object constructors. Obtain it from a
+        hook frame via frame->get_arguments<vmhook::oop>(), which internally calls
         hotspot::decode_oop_ptr() to convert the 32-bit compressed OOP to a full
         64-bit address.  It is NOT a JNI global reference — no GC handles are
         created and the pointer remains valid only for the duration of the hook.
@@ -2443,11 +2687,11 @@ namespace jni
 
         Example:
 
-            class http_client : public jni::object
+            class http_client : public vmhook::object
             {
             public:
-                explicit http_client(jni::oop instance)
-                    : jni::object{ instance }
+                explicit http_client(vmhook::oop instance)
+                    : vmhook::object{ instance }
                 {}
 
                 // auto return — field_proxy::value converts implicitly at the call site
@@ -2464,10 +2708,10 @@ namespace jni
                 auto set_health(int hp) { get_field("health")->set(hp); }
             };
 
-            jni::register_class<http_client>("com/example/HttpClient");
+            vmhook::register_class<http_client>("com/example/HttpClient");
 
             // Inside a hook detour:
-            auto [self] = frame->get_arguments<jni::oop>();
+            auto [self] = frame->get_arguments<vmhook::oop>();
             http_client client{ self };
             bool ok  = client.is_connected(); // operator bool()  fires
             int  hp  = client.get_health();   // operator int()   fires
@@ -2481,7 +2725,7 @@ namespace jni
     public:
         /*
             @brief Wraps a decoded Java object pointer.
-            @param instance Decoded OOP from frame->get_arguments<jni::oop>().
+            @param instance Decoded OOP from frame->get_arguments<vmhook::oop>().
                             May be nullptr if the Java reference is null.
         */
         explicit object(oop instance = nullptr) noexcept
@@ -2530,7 +2774,7 @@ namespace jni
             Instance fields:  value lives at decoded_object_ptr + field_offset.
             Static fields:    value lives at java.lang.Class mirror + field_offset.
 
-            The klass is resolved from class_map via typeid(*this) (dynamic type),
+            The klass is resolved from type_to_class_map via typeid(*this) (dynamic type),
             so the derived C++ class must have been registered with register_class<T>()
             before this is called.  Field entries are cached after the first lookup.
 
@@ -2540,13 +2784,13 @@ namespace jni
         */
         auto get_field(const std::string_view name) const -> std::optional<field_proxy>
         {
-            hotspot::klass* const k{ resolve_klass() };
-            if (!k)
+            hotspot::klass* const resolved_klass{ resolve_klass() };
+            if (!resolved_klass)
             {
                 return std::nullopt;
             }
 
-            const auto entry{ jni::find_field(k, name) };
+            const auto entry{ vmhook::find_field(resolved_klass, name) };
             if (!entry)
             {
                 return std::nullopt;
@@ -2554,10 +2798,10 @@ namespace jni
 
             if (entry->is_static)
             {
-                void* const mirror{ k->get_java_mirror() };
-                if (!mirror || !hotspot::is_valid_ptr(mirror))
+                void* const mirror{ resolved_klass->get_java_mirror() };
+                if (!mirror || !vmhook::hotspot::is_valid_ptr(mirror))
                 {
-                    std::println("{} object::get_field('{}') failed to get java.lang.Class mirror.", easy_jni_error, name);
+                    std::println("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::k_error_tag, name);
                     return std::nullopt;
                 }
                 void* const ptr{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
@@ -2566,7 +2810,7 @@ namespace jni
 
             if (!instance_)
             {
-                std::println("{} object::get_field('{}') instance pointer is null.", easy_jni_error, name);
+                std::println("{} object::get_field('{}') instance pointer is null.", vmhook::k_error_tag, name);
                 return std::nullopt;
             }
 
@@ -2584,28 +2828,28 @@ namespace jni
         /*
             @brief Resolves the HotSpot klass for the dynamic type of this object.
             @details
-            Uses typeid(*this) to look up the class name in class_map, then
+            Uses typeid(*this) to look up the class name in type_to_class_map, then
             calls find_class() which walks the ClassLoaderDataGraph (cached after
             the first call).
             @return Pointer to the klass, or nullptr if the type is not registered.
         */
         auto resolve_klass() const -> hotspot::klass*
         {
-            const auto it{ class_map.find(std::type_index{ typeid(*this) }) };
-            if (it == class_map.end())
+            const auto it{ type_to_class_map.find(std::type_index{ typeid(*this) }) };
+            if (it == type_to_class_map.end())
             {
                 std::println("{} object::resolve_klass() type '{}' not registered via register_class<T>().",
-                    easy_jni_error, typeid(*this).name());
+                    vmhook::k_error_tag, typeid(*this).name());
                 return nullptr;
             }
 
-            hotspot::klass* const k{ find_class(it->second) };
-            if (!k)
+            hotspot::klass* const found_klass{ find_class(it->second) };
+            if (!found_klass)
             {
-                std::println("{} object::resolve_klass() class '{}' not found in JVM.", easy_jni_error, it->second);
+                std::println("{} object::resolve_klass() class '{}' not found in JVM.", vmhook::k_error_tag, it->second);
             }
 
-            return k;
+            return found_klass;
         }
     };
 }

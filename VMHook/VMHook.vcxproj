@@ -71,12 +71,12 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <OutDir>$(SolutionDir)build\</OutDir>
-    <IntDir>$(SolutionDir)etc\vmhook\Debug\</IntDir>
+    <OutDir>$(ProjectDir)..\build\</OutDir>
+    <IntDir>$(ProjectDir)..\etc\vmhook\Debug\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <OutDir>$(SolutionDir)build\</OutDir>
-    <IntDir>$(SolutionDir)etc\vmhook\Release\</IntDir>
+    <OutDir>$(ProjectDir)..\build\</OutDir>
+    <IntDir>$(ProjectDir)..\etc\vmhook\Release\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
