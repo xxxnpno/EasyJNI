@@ -1,74 +1,71 @@
 #include <vmhook/vmhook.hpp>
+#include "test.hpp"
+
 #include <chrono>
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <thread>
 
-// ---- Logger -----------------------------------------------------------------
+// ─── Logger ──────────────────────────────────────────────────────────────────
 
 static std::ofstream g_log{};
 
 static void log(const std::string_view msg)
 {
     const auto now{ std::chrono::system_clock::now() };
-    const std::time_t timestamp{ std::chrono::system_clock::to_time_t(now) };
-    char time_string[16]{};
+    const std::time_t ts{ std::chrono::system_clock::to_time_t(now) };
+    char time_buf[16]{};
     std::tm tm_buf{};
-    localtime_s(&tm_buf, &timestamp);
-    std::strftime(time_string, sizeof(time_string), "%H:%M:%S", &tm_buf);
-    const std::string line{ std::format("[{}]  {}\n", time_string, msg) };
+    localtime_s(&tm_buf, &ts);
+    std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &tm_buf);
+    const std::string line{ std::format("[{}]  {}\n", time_buf, msg) };
     std::cout << line;
     if (g_log.is_open()) { g_log << line; g_log.flush(); }
 }
 
-// ---- Worker thread ----------------------------------------------------------
+// ─── Worker thread ───────────────────────────────────────────────────────────
 
 static DWORD WINAPI thread_entry(HMODULE module)
 {
     FILE* console_handle{ nullptr };
     AllocConsole();
     SetConsoleOutputCP(CP_UTF8);
-    SetConsoleTitleA("VMHook  --  Example target");
+    SetConsoleTitleA("VMHook  --  Unit tests");
     freopen_s(&console_handle, "CONOUT$", "w", stdout);
     freopen_s(&console_handle, "CONOUT$", "w", stderr);
 
     g_log.open(R"(C:\repos\cpp\VMHook\log.txt)", std::ios::out | std::ios::trunc);
 
-    std::println("================================================");
-    std::println("  VMHook  --  JDK compatibility test");
-    std::println("  Target: vmhook.example (example\\build_and_run.bat)");
-    std::println("================================================");
+    std::println("════════════════════════════════════════════════════════");
+    std::println("  VMHook  —  injection successful");
+    std::println("════════════════════════════════════════════════════════");
     std::println("");
-
-    // ---- jvm.dll + VMStructs ------------------------------------------------
-
     log("DLL injected.");
+
+    // ── 1. jvm.dll + VMStructs ───────────────────────────────────────────────
 
     const HMODULE jvm_module{ vmhook::hotspot::get_jvm_module() };
     if (!jvm_module) { log("[FAIL] jvm.dll not found."); goto wait_for_delete; }
-    log(std::format("jvm.dll base : 0x{:016X}", reinterpret_cast<std::uintptr_t>(jvm_module)));
+    log(std::format("jvm.dll base  : 0x{:016X}", reinterpret_cast<std::uintptr_t>(jvm_module)));
+
+    if (!vmhook::hotspot::get_vm_structs() || !vmhook::hotspot::get_vm_types())
+    { log("[FAIL] VMStructs not resolved."); goto wait_for_delete; }
+    log("VMStructs     : OK");
 
     {
-        if (!vmhook::hotspot::get_vm_structs() || !vmhook::hotspot::get_vm_types())
-        { log("[FAIL] VMStructs not resolved."); goto wait_for_delete; }
-        log("VMStructs OK.");
-
-        // Report which field storage format this JDK uses.
-        const bool has_legacy_fields{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields") != nullptr };
-        const bool has_field_stream { vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") != nullptr };
-        log(std::format("  _fields           : {}", has_legacy_fields ? "PRESENT (JDK 8-20 layout)"   : "absent"));
-        log(std::format("  _fieldinfo_stream : {}", has_field_stream  ? "PRESENT (JDK 21+ UNSIGNED5)"  : "absent"));
+        const bool has_fields{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields")           != nullptr };
+        const bool has_fis   { vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") != nullptr };
+        log(std::format("Field storage : {} ({})",
+            has_fis ? "_fieldinfo_stream (JDK 21+)" : "_fields (JDK 8-20)",
+            has_fields ? "legacy present" : "legacy absent"));
     }
 
-    // ---- Class enumeration --------------------------------------------------
+    // ── 2. Walk ClassLoaderDataGraph + log all classes ────────────────────────
     {
         log("Walking ClassLoaderDataGraph...");
-
         const bool use_klasses_list{
             vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_klasses") != nullptr };
-        log(std::format("  Enumeration strategy: {}", use_klasses_list
-            ? "_klasses list (JDK 21+)"
-            : "Dictionary (JDK 8-20)"));
 
         const vmhook::hotspot::class_loader_data_graph graph{};
         vmhook::hotspot::class_loader_data* cld{ graph.get_head() };
@@ -104,7 +101,6 @@ static DWORD WINAPI thread_entry(HMODULE module)
             }
             else
             {
-                // JDK 8-20: search via per-CLD Dictionary hashtable.
                 const vmhook::hotspot::dictionary* dict{ cld->get_dictionary() };
                 if (vmhook::hotspot::is_valid_ptr(dict))
                 {
@@ -130,11 +126,10 @@ static DWORD WINAPI thread_entry(HMODULE module)
                     }
                 }
             }
-
             cld = cld->get_next();
         }
 
-        // JDK 8 fallback: use SystemDictionary._dictionary if the CLD walk yielded nothing.
+        // JDK 8 fallback via SystemDictionary static fields
         if (class_count == 0 && !use_klasses_list)
         {
             auto walk_system_dictionary = [&](const char* entry_name)
@@ -180,99 +175,70 @@ static DWORD WINAPI thread_entry(HMODULE module)
         }
 
         if (g_log.is_open()) g_log.flush();
-        log(std::format("{} CLDs, {} classes total. Full list in log.txt.", cld_count, class_count));
+        log(std::format("{} CLDs, {} classes. Full list in log.txt.", cld_count, class_count));
     }
 
-    // ---- Field lookup on standard JDK classes (works on all JDK versions) ---
+    // ── 3. Install hook on TestTarget::onTick ────────────────────────────────
     {
-        std::println("");
-        std::println("================================================");
-        std::println("  find_class + find_field verification");
-        std::println("================================================");
-
-        struct test_case
+        if (!vmhook::register_class<TestTargetWrapper>("vmhook/example/TestTarget"))
         {
-            std::string class_name;
-            std::string field_name;
-            std::string expected_signature;
-            bool        expected_static;
-        };
-
-        const std::vector<test_case> test_cases
+            log("[WARN] TestTarget not found — hook + instance tests will be skipped.");
+        }
+        else
         {
-            // Standard JDK classes — present on every Java version.
-            { "java/lang/String",  "hash",     "I",                  false },
-            { "java/lang/Thread",  "priority", "I",                  false },
-            { "java/lang/Integer", "TYPE",     "Ljava/lang/Class;",  true  },
-            // Example application classes — present when example\build_and_run.bat is running.
-            { "vmhook/example/Player", "health", "F",                 false },
-            { "vmhook/example/Player", "x",      "D",                 false },
-            { "vmhook/example/Player", "name",   "Ljava/lang/String;",false },
-            { "vmhook/example/Player", "count",  "I",                 true  },
-        };
-
-        for (const auto& test_case : test_cases)
-        {
-            vmhook::hotspot::klass* const target_klass{ vmhook::find_class(test_case.class_name) };
-            if (!target_klass) { log(std::format("  [NOT FOUND]  {}", test_case.class_name)); continue; }
-            log(std::format("  [FOUND]  {}  ({} methods)", test_case.class_name, target_klass->get_methods_count()));
-
-            if (test_case.field_name.empty()) continue;
-
-            const auto field_entry{ target_klass->find_field(test_case.field_name) };
-            if (!field_entry)
-            {
-                log(std::format("    field '{}' -- NOT FOUND", test_case.field_name));
-                continue;
-            }
-
-            const bool signature_ok = field_entry->signature == test_case.expected_signature
-                                   || test_case.expected_signature.empty();
-            const bool static_ok    = field_entry->is_static == test_case.expected_static;
-            const char* verdict     = (signature_ok && static_ok) ? "OK" : "MISMATCH";
-
-            log(std::format("    field '{}' -- offset={} sig='{}' static={}  [{}]",
-                test_case.field_name,
-                field_entry->offset,
-                field_entry->signature,
-                field_entry->is_static,
-                verdict));
+            if (vmhook::hook<TestTargetWrapper>("onTick", on_tick_detour))
+                log("Hook installed: TestTarget::onTick");
+            else
+                log("[WARN] Failed to install hook on TestTarget::onTick.");
         }
     }
 
-    // ---- VMStruct offset summary --------------------------------------------
+    // ── 4. Wait up to 3 s for the hook to fire at least once ─────────────────
+    {
+        log("Waiting for hook to fire...");
+        const auto deadline{ std::chrono::steady_clock::now() + std::chrono::seconds{ 3 } };
+        while (g_hook_call_count.load() == 0
+            && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 20 });
+        }
+        log(std::format("Hook calls observed: {}", g_hook_call_count.load()));
+    }
+
+    // ── 5. Run full test suite ────────────────────────────────────────────────
+    {
+        const int failed_count{ run_all_tests(log) };
+        log(std::format("Test run complete: {} failures.", failed_count));
+    }
+
+    // ── 6. VMStruct offset summary ────────────────────────────────────────────
     {
         std::println("");
-        std::println("================================================");
-        std::println("  VMStruct offsets");
-        std::println("================================================");
-
+        std::println("── VMStruct offsets ──");
         const auto* flds   = vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields");
         const auto* consts = vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_constants");
         const auto* fis    = vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream");
-        const auto* cp_type_entry = vmhook::hotspot::iterate_type_entries("ConstantPool");
-
-        log(std::format("  InstanceKlass._fields offset            = {}",
-            flds   ? std::to_string(flds->offset)   : "N/A (JDK 21+: replaced by _fieldinfo_stream)"));
-        log(std::format("  InstanceKlass._constants offset         = {}",
-            consts ? std::to_string(consts->offset) : "N/A"));
-        log(std::format("  InstanceKlass._fieldinfo_stream offset  = {}",
-            fis    ? std::to_string(fis->offset)    : "N/A (JDK 8-20: uses _fields instead)"));
-        log(std::format("  sizeof(ConstantPool)                    = {}",
-            cp_type_entry ? std::to_string(cp_type_entry->size) : "N/A"));
+        const auto* cp_tp  = vmhook::hotspot::iterate_type_entries("ConstantPool");
+        log(std::format("  InstanceKlass._fields            = {}", flds   ? std::to_string(flds->offset)   : "N/A"));
+        log(std::format("  InstanceKlass._constants         = {}", consts ? std::to_string(consts->offset) : "N/A"));
+        log(std::format("  InstanceKlass._fieldinfo_stream  = {}", fis    ? std::to_string(fis->offset)    : "N/A"));
+        log(std::format("  sizeof(ConstantPool)             = {}", cp_tp  ? std::to_string(cp_tp->size)    : "N/A"));
     }
 
     std::println("");
-    std::println("================================================");
-    std::println("  Full class list -> log.txt");
-    std::println("  Press DELETE to unload.");
-    std::println("================================================");
+    std::println("════════════════════════════════════════════════════════");
+    std::println("  Full class list  →  log.txt");
+    std::println("  Press DELETE to unload VMHook.");
+    std::println("════════════════════════════════════════════════════════");
 
 wait_for_delete:
     while (!(GetAsyncKeyState(VK_DELETE) & 0x8000))
         std::this_thread::sleep_for(std::chrono::milliseconds{ 5 });
 
-    log("Unloading.");
+    log("Unloading: removing hooks...");
+    vmhook::shutdown_hooks();
+    log("Unloaded.");
+
     if (g_log.is_open()) g_log.close();
     FreeConsole();
     FreeLibraryAndExitThread(module, 0);

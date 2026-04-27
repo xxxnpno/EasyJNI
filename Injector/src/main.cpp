@@ -152,8 +152,6 @@ int main()
         std::cerr <<
             "[ERROR] VMHook.dll not found.\n"
             "        Build the VMHook project (Release|x64) first.\n";
-        std::cout << "\nPress ENTER to exit...\n";
-        std::cin.get();
         return 1;
     }
     std::cout << "[OK]  DLL found.\n\n";
@@ -171,8 +169,6 @@ int main()
         std::cerr <<
             "[ERROR] No javaw.exe or java.exe found.\n"
             "        Launch Minecraft first, then run this tool.\n";
-        std::cout << "\nPress ENTER to exit...\n";
-        std::cin.get();
         return 1;
     }
 
@@ -223,8 +219,5 @@ int main()
         std::cerr << "[ERROR] Injection failed. Try running as Administrator.\n";
     }
 
-    std::cout << "\nPress ENTER to exit...\n";
-    std::cin.ignore(10000, '\n');
-    std::cin.get();
     return 0;
 }

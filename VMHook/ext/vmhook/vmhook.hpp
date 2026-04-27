@@ -1609,18 +1609,40 @@ namespace vmhook
             location across JVM builds, immediately before the interpreter begins executing
             the actual Java bytecode. All method arguments are fully set up at this point.
             Also scans backwards to find and cache the locals_offset value.
-            @note The hook is installed 8 bytes before the end of the matched pattern,
-                  at the position of the mov BYTE PTR [r15+??], 0x0 instruction.
+            @note Two patterns are tried in order:
+                  1. Full pattern (JDK 8 – early JDK 21): 4×mov-spill + mov BYTE PTR [r15+??],??
+                     Hook injected at the thread-state-write instruction (last 8 bytes).
+                  2. Fallback (JDK 21 release / JDK 22+): just mov BYTE PTR [r15+??],??
+                     Hook injected at the start of that instruction directly.
         */
         static auto find_hook_location(const void* i2i_entry) -> void*
         {
-            static const constexpr std::uint8_t pattern[]
+            /*
+                Primary pattern (JDK 8 – early JDK 21 builds):
+                  Four consecutive `mov [rsp+imm32], eax` instructions that spill the first
+                  four Windows x64 integer arguments to the shadow area, followed by
+                  `mov BYTE PTR [r15+imm32], imm8` which writes a thread-status byte.
+                  Wildcard bytes (0x00) match any value.
+            */
+            static const constexpr std::uint8_t pattern_full[]
             {
                 0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
                 0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
                 0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
                 0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, // mov [rsp+??], eax
-                0x41, 0xC6, 0x87, 0x00, 0x00, 0x00, 0x00, 0x00 // mov BYTE PTR [r15+??], 0x0
+                0x41, 0xC6, 0x87, 0x00, 0x00, 0x00, 0x00, 0x00 // mov BYTE PTR [r15+??], ??
+            };
+
+            /*
+                Fallback pattern (JDK 21 release builds, JDK 22+):
+                  The 4×mov spill block is absent or different, but the
+                  `mov BYTE PTR [r15+imm32], imm8` thread-status write is always present.
+                  0x41 0xC6 0x87 = REX.B MOV r/m8,imm8 with ModRM selecting [r15+disp32].
+                  All four displacement bytes and the imm8 are wildcards.
+            */
+            static const constexpr std::uint8_t pattern_fallback[]
+            {
+                0x41, 0xC6, 0x87, 0x00, 0x00, 0x00, 0x00, 0x00 // mov BYTE PTR [r15+??], ??
             };
 
             static const constexpr std::uint8_t locals_pattern[]
@@ -1631,25 +1653,50 @@ namespace vmhook
             const std::uint8_t* const current{ reinterpret_cast<const std::uint8_t*>(i2i_entry) };
             const std::size_t scan_size{ vmhook::hotspot::find_stub_size(current) };
 
-            std::uint8_t* const hook_location{ vmhook::hotspot::scan(current, scan_size, pattern, sizeof(pattern)) };
+            // Try the full 4×spill + thread-state-write pattern first (JDK 8 – early JDK 21).
+            // The injection point is at the START of the thread-state-write instruction,
+            // which sits at the END of the full pattern (offset = sizeof - 8).
+            std::uint8_t* injection_point{ nullptr };
+            std::uint8_t* const full_match{
+                vmhook::hotspot::scan(current, scan_size, pattern_full, sizeof(pattern_full)) };
+            if (full_match)
+            {
+                // The thread-state instruction is the last 8 bytes of the full match.
+                injection_point = full_match + sizeof(pattern_full) - 8;
+            }
+            else
+            {
+                // Fallback: scan directly for `mov BYTE PTR [r15+??], ??` (JDK 21+).
+                // The injection point is at the START of the matched instruction.
+                std::uint8_t* const fallback_match{
+                    vmhook::hotspot::scan(current, scan_size, pattern_fallback, sizeof(pattern_fallback)) };
+                if (fallback_match)
+                {
+                    injection_point = fallback_match;
+                }
+            }
 
             try
             {
-                if (!hook_location)
+                if (!injection_point)
                 {
-                    throw vmhook::exception{ "Failed to find hook pattern." };
+                    throw vmhook::exception{ "Failed to find hook pattern (tried full and fallback)." };
                 }
 
-                for (std::uint8_t* p{ hook_location }; p > current; --p)
+                // Scan backwards from the injection point to find the locals pointer load:
+                //   mov r14, QWORD PTR [rbp+disp8]  ; ret
+                // The displacement byte is the rbp-relative offset of the locals pointer.
+                for (std::uint8_t* scan_ptr{ injection_point }; scan_ptr > current; --scan_ptr)
                 {
-                    if (vmhook::hotspot::match_pattern(p, locals_pattern, sizeof(locals_pattern)))
+                    if (vmhook::hotspot::match_pattern(scan_ptr, locals_pattern, sizeof(locals_pattern)))
                     {
-                        locals_offset = static_cast<std::int8_t>(p[3]);
+                        // Byte [3] of `4C 8B 75 ??` is the signed 8-bit displacement.
+                        locals_offset = static_cast<std::int8_t>(scan_ptr[3]);
                         break;
                     }
                 }
 
-                return hook_location + sizeof(pattern) - 8;
+                return injection_point;
             }
             catch (const std::exception& e)
             {
@@ -1973,13 +2020,19 @@ namespace vmhook
 
         /*
             @brief Common detour function invoked by the trampoline stub for every intercepted method call.
-            @param f      Pointer to the current HotSpot interpreter frame.
-            @param thread Pointer to the current HotSpot JavaThread.
+            @param f      Pointer to the current HotSpot interpreter frame (rbp at hook site).
+            @param thread Pointer to the current HotSpot JavaThread (r15).
             @param cancel Pointer to the cancel flag on the trampoline stack.
             @details
-            Single entry point for all midi2i_hook trampolines. Verifies thread state,
-            finds the matching per-method detour in g_hooked_methods, dispatches it, then
-            restores thread state to _thread_in_Java.
+            Single entry point for all midi2i_hook trampolines.  Finds the matching
+            per-method detour in g_hooked_methods and dispatches it.
+
+            The thread-state precondition check was removed because the injection point
+            (the `mov BYTE PTR [r15+X], Y` instruction) is reached while the thread may
+            still be in a transition state on JDK 21+ builds — the state is not
+            necessarily _thread_in_Java yet at that exact instruction.  After the user
+            detour returns we force the state to _thread_in_Java so the bytecode
+            dispatch that follows finds the correct state.
         */
         static auto common_detour(frame* const f, java_thread* const thread, bool* const cancel) -> void
         {
@@ -1990,11 +2043,6 @@ namespace vmhook
                     throw vmhook::exception{ "JavaThread pointer is null or invalid." };
                 }
 
-                if (thread->get_thread_state() != java_thread_state::_thread_in_Java)
-                {
-                    throw vmhook::exception{ "JavaThread is not in _thread_in_Java state." };
-                }
-
                 const method* const current_method{ f->get_method() };
 
                 for (const hooked_method& hook : g_hooked_methods)
@@ -2002,6 +2050,8 @@ namespace vmhook
                     if (hook.method == current_method)
                     {
                         hook.detour(f, thread, cancel);
+                        // Ensure the thread state is _thread_in_Java after the detour
+                        // so the bytecode dispatcher finds a consistent state.
                         thread->set_thread_state(java_thread_state::_thread_in_Java);
                         return;
                     }

@@ -5,8 +5,10 @@ etc/
 log.txt
 .claude/
 CLAUDE.md
-launch_minecraft.bat
-launch_minecraft.ps1
 
 # Example Java build output
 example/out/
+
+# Diagnostic dumps created at runtime
+i2i_dump.txt
+hs_err_pid*.log
