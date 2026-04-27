@@ -812,23 +812,45 @@ namespace vmhook
                     return nullptr;
                 }
 
-                // Klass::_java_mirror is an OopHandle (since JDK 17). Its layout is simply:
-                //   struct OopHandle { oop* _obj; };   // one pointer wide
-                //
-                // Pointer chain:
-                //   klass + entry->offset  →  OopHandle._obj  (an oop*, points into OopStorage)
-                //   *OopHandle._obj        →  the actual java.lang.Class oop (full 64-bit)
-                //
-                // OopStorage slots hold full 64-bit oops (not compressed), so no decoding needed.
-                const void* const oop_handle_addr{ reinterpret_cast<const std::uint8_t*>(this) + entry->offset };
-                const void* const oop_storage_slot{ vmhook::hotspot::safe_read_ptr(oop_handle_addr) };
+                /*
+                    The type and indirection level of _java_mirror changed across JDK versions.
 
-                if (!vmhook::hotspot::is_valid_ptr(oop_storage_slot))
+                    JDK 8 – JDK 16:
+                      _java_mirror is a plain `oop` (a direct 64-bit pointer to the
+                      java.lang.Class object). One read is enough.
+                      VMStructs type_string: "oop"
+
+                    JDK 17+:
+                      _java_mirror was changed to an OopHandle:
+                        struct OopHandle { oop* _obj; };
+                      The value at klass+offset is an oop* pointing into an OopStorage
+                      arena. Dereferencing that slot yields the actual java.lang.Class oop.
+                      VMStructs type_string: "OopHandle"
+
+                    Detection: inspect entry->type_string at runtime so we stay
+                    version-agnostic without any hardcoded JDK version numbers.
+                */
+                static const bool is_oop_handle{
+                    entry->type_string && std::strcmp(entry->type_string, "OopHandle") == 0 };
+
+                const void* const field_addr{ reinterpret_cast<const std::uint8_t*>(this) + entry->offset };
+
+                if (is_oop_handle)
                 {
-                    return nullptr;
+                    // JDK 17+: two-level indirection through OopStorage.
+                    //   klass + offset  →  OopHandle._obj  (oop* into OopStorage)
+                    //   *OopHandle._obj →  java.lang.Class oop  (full 64-bit, not compressed)
+                    const void* const oop_storage_slot{ vmhook::hotspot::safe_read_ptr(field_addr) };
+                    if (!vmhook::hotspot::is_valid_ptr(oop_storage_slot)) return nullptr;
+                    return const_cast<void*>(vmhook::hotspot::safe_read_ptr(oop_storage_slot));
                 }
-
-                return const_cast<void*>(vmhook::hotspot::safe_read_ptr(oop_storage_slot));
+                else
+                {
+                    // JDK 8 – JDK 16: the field is a direct full-width oop pointer.
+                    // Read it as a 64-bit value; no further dereference needed.
+                    const void* const mirror{ vmhook::hotspot::safe_read_ptr(field_addr) };
+                    return vmhook::hotspot::is_valid_ptr(mirror) ? const_cast<void*>(mirror) : nullptr;
+                }
             }
 
             /*

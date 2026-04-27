@@ -1,26 +1,36 @@
 package vmhook.example;
 
+import java.lang.management.ManagementFactory;
+
 /**
  * Entry point for the VMHook example / test target process.
  *
- * What this does:
- *   1. Creates Player instances (field discovery demo).
- *   2. Creates a TestTarget instance whose fields are verified by the C++ test harness.
- *   3. Calls onTick() on TestTarget every loop iteration so the hook gets exercised.
- *   4. Prints status every 5 seconds.
+ * Compatible with JDK 8 through the latest release.
  *
- * Inject VMHook.dll while this process is running.  The DLL console will show
+ * Inject VMHook.dll while this process is running.  The DLL console shows
  * PASS / FAIL for every assertion.  Press DELETE to unload the DLL.
  *
  * Run with:
- *   java -cp out vmhook.example.Main
+ *   java [-Xint] -cp out vmhook.example.Main
+ *
+ * The -Xint flag disables JIT so interpreter hooks always fire regardless of
+ * how long the process has been running.  Required for automated testing via
+ * example\test_all_jdks.ps1; optional for manual experimentation.
  */
 public class Main
 {
     public static void main(final String[] args) throws InterruptedException
     {
         System.out.println("=== VMHook example / test target ===");
-        System.out.println("PID : " + ProcessHandle.current().pid());
+
+        // ManagementFactory.getRuntimeMXBean().getName() returns "PID@hostname"
+        // on every HotSpot version from JDK 8 to JDK 26+.
+        final String runtime_name = ManagementFactory.getRuntimeMXBean().getName();
+        final String pid_string   = runtime_name.contains("@")
+            ? runtime_name.substring(0, runtime_name.indexOf('@'))
+            : runtime_name;
+
+        System.out.println("PID : " + pid_string);
         System.out.println("JVM : " + System.getProperty("java.vm.name")
             + " " + System.getProperty("java.version"));
         System.out.println("Inject VMHook.dll now, then press DELETE in the VMHook console.");
@@ -40,13 +50,12 @@ public class Main
 
         while (true)
         {
-            // Advance players
             for (final Player player : players)
             {
                 player.tick();
             }
 
-            // Call the hookable method on TestTarget
+            // Call the hookable method every iteration.
             target.onTick((int) tick_count);
             ++tick_count;
 
