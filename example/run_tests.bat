@@ -2,14 +2,17 @@
 setlocal
 
 ::
-:: run_tests.bat — compile, launch with -Xint, inject VMHook.dll, read results.
+:: run_tests.bat — compile, launch (with JIT enabled), inject VMHook.dll, read results.
 ::
-:: -Xint disables JIT compilation so every method call goes through the interpreter.
-:: This guarantees that VMHook hooks always fire, regardless of injection timing.
+:: VMHook now deoptimises JIT-compiled methods at hook-install time:
+::   - _code is cleared (dispatch reverts to interpreter)
+::   - _from_interpreted_entry is reset to the patched i2i stub
+::   - _from_compiled_entry is reset to the c2i adapter
+:: Hooks therefore fire even if the target method was already compiled at injection time.
 ::
-:: For production usage (without -Xint) inject BEFORE the target method is called
-:: ~200 times (C1 compilation threshold); after that the JIT takes over and
-:: interpreter hooks are bypassed.
+:: Remaining edge case: compiled callers with stale monomorphic inline caches (ICs) still
+:: call the old nmethod directly until HotSpot repairs the IC at the next safe-point.
+:: In the test loop (100 ticks/s + Thread.sleep) this typically resolves within 1-2 ticks.
 ::
 
 if not exist "out" mkdir out
@@ -23,10 +26,9 @@ if errorlevel 1 ( echo [ERROR] Compilation failed. & pause & exit /b 1 )
 echo [OK] Compiled.
 echo.
 
-echo [*] Launching example target with -Xint (interpreter only)...
+echo [*] Launching example target (JIT enabled)...
 start "VMHook Test Target" ^
     "C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin\java.exe" ^
-    -Xint ^
     -cp out ^
     vmhook.example.Main
 

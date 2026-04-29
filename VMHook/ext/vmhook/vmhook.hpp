@@ -649,6 +649,94 @@ namespace vmhook
                     return std::string{};
                 }
             }
+
+            /*
+                @brief Returns the current nmethod pointer (_code field).
+                @details Non-null when the method has been JIT-compiled; null when interpreted.
+                         Writing null forces HotSpot dispatch to treat the method as uncompiled
+                         without freeing the compiled code.
+            */
+            auto get_code() const noexcept -> void*
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Method", "_code") };
+                if (!entry) return nullptr;
+                return *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+            }
+
+            auto set_code(void* const code) noexcept -> void
+            {
+                static const VMStructEntry* const entry{ iterate_struct_entries("Method", "_code") };
+                if (!entry) return;
+                *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(this) + entry->offset) = code;
+            }
+
+            /*
+                @brief Overwrites _from_interpreted_entry.
+                @details Reset to _i2i_entry during deoptimisation so interpreted callers
+                         route through the interpreter entry stub (which we have patched).
+            */
+            auto set_from_interpreted_entry(void* const ep) noexcept -> void
+            {
+                static const VMStructEntry* const entry{
+                    iterate_struct_entries("Method", "_from_interpreted_entry") };
+                if (!entry) return;
+                *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(this) + entry->offset) = ep;
+            }
+
+            /*
+                @brief Returns the from-compiled entry point.
+                @details The VMStruct field name changed across JDK versions:
+                         JDK ≤ 20  → "_from_compiled_code_entry_point"
+                         JDK 21+   → "_from_compiled_entry"
+                         Both names are tried at first call; the result is cached.
+            */
+            auto get_from_compiled_entry() const noexcept -> void*
+            {
+                static const VMStructEntry* const entry{ []() noexcept -> const VMStructEntry* {
+                    const VMStructEntry* e{
+                        iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
+                    if (!e) e = iterate_struct_entries("Method", "_from_compiled_entry");
+                    return e;
+                }() };
+                if (!entry) return nullptr;
+                return *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+            }
+
+            /*
+                @brief Overwrites the from-compiled entry point.
+                @details Set to the c2i adapter during deoptimisation so compiled callers
+                         transition to the interpreter (and reach our patched i2i stub).
+            */
+            auto set_from_compiled_entry(void* const ep) noexcept -> void
+            {
+                static const VMStructEntry* const entry{ []() noexcept -> const VMStructEntry* {
+                    const VMStructEntry* e{
+                        iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
+                    if (!e) e = iterate_struct_entries("Method", "_from_compiled_entry");
+                    return e;
+                }() };
+                if (!entry) return;
+                *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(this) + entry->offset) = ep;
+            }
+
+            /*
+                @brief Returns the AdapterHandlerEntry* (_adapter field).
+                @details Stores the calling-convention adapters (i2c / c2i) for this method.
+                         Used to obtain the c2i entry when deoptimising a compiled method.
+            */
+            auto get_adapter() const noexcept -> void*
+            {
+                static const VMStructEntry* const entry{
+                    iterate_struct_entries("Method", "_adapter") };
+                if (!entry) return nullptr;
+                return *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(const_cast<method*>(this)) + entry->offset);
+            }
         };
 
         /*
@@ -1783,16 +1871,60 @@ namespace vmhook
             /*
                 @brief Returns a pointer to the local variables array of the currently executing method.
                 @details
-                The locals pointer is stored in the interpreter frame at a JDK-version-dependent
-                offset from rbp.  The actual offset is determined at runtime by
-                vmhook::hotspot::find_hook_location(), which scans backwards through the i2i stub
-                for the instruction `mov r14, QWORD PTR [rbp+??]` and reads the displacement byte.
-                The default is -56 bytes (fits most JDK 8-21 builds).
+                The frame slot at [rbp + locals_offset] encodes the locals pointer in one of two
+                formats depending on the JDK era (see get_locals() implementation comment for
+                the full derivation and proof from the hs_err crash dump).
+                The actual offset within the frame is determined at hook time by scanning the i2i
+                stub backwards for `mov r14, QWORD PTR [rbp+??]; ret`.  Defaults to -56.
             */
             inline auto get_locals() const noexcept -> void**
             {
-                // locals_offset is discovered at hook time; typically -56 on JDK 8-21 x64.
-                return *reinterpret_cast<void***>(reinterpret_cast<std::uint8_t*>(const_cast<frame*>(this)) + locals_offset);
+                /*
+                    How the locals pointer is encoded in the frame differs by JDK era.
+
+                    JDK 8 – 20:
+                      The stub spills r14 (the locals register) directly into the frame
+                      via `mov r14, QWORD PTR [rbp+locals_offset]; ret` in a helper.
+                      So [rbp + locals_offset] IS the locals pointer — a valid stack
+                      address that passes vmhook::hotspot::is_valid_ptr().
+
+                    JDK 21+:
+                      The stub computes and spills an INDEX instead:
+                        mov rax, r14
+                        sub rax, rbp        ; rax = r14 - rbp  (positive, locals are above rbp)
+                        shr rax, 3          ; rax = (r14 - rbp) >> 3
+                        push rax            ; [rbp - 56] = index
+                      The raw value at [rbp + locals_offset] is therefore a small positive
+                      integer (e.g. 3), NOT a pointer.  Recover via: r14 = rbp + index * 8.
+
+                    Detection: if the value at the frame slot is a valid user-space pointer
+                    (> 0xFFFF), treat it as a direct locals pointer (JDK 8-20).
+                    Otherwise treat it as a slot index (JDK 21+).
+
+                    Proof from hs_err crash dump for JDK 21:
+                      RBP = 0x243f888  →  [rbp-56] = 3
+                      R14 = 0x243f8a0  →  rbp + 3*8 = 0x243f8a0  ✓
+                */
+                const void* const frame_slot_value{ *reinterpret_cast<void* const*>(
+                    reinterpret_cast<const std::uint8_t*>(this) + locals_offset) };
+
+                // JDK 8-20: direct pointer stored in the frame slot.
+                if (vmhook::hotspot::is_valid_ptr(frame_slot_value))
+                {
+                    return const_cast<void**>(reinterpret_cast<const void* const*>(frame_slot_value));
+                }
+
+                // JDK 21+: the slot holds (r14 - rbp) >> 3 — a non-negative slot index.
+                // Recover r14 = rbp + index * sizeof(void*).
+                const std::uintptr_t slot_index{ reinterpret_cast<std::uintptr_t>(frame_slot_value) };
+                if (slot_index > 0 && slot_index < 0x1000u)
+                {
+                    return reinterpret_cast<void**>(
+                        reinterpret_cast<std::uint8_t*>(const_cast<frame*>(this))
+                        + slot_index * sizeof(void*));
+                }
+
+                return nullptr;
             }
 
             /*
@@ -2011,11 +2143,18 @@ namespace vmhook
 
         /*
             @brief Stores the association between a HotSpot Method object and its C++ detour function.
+            @details  Also holds the original entry points and _code pointer so shutdown_hooks()
+                      can fully restore the method's state, including re-linking the nmethod if the
+                      method was JIT-compiled when the hook was installed.
         */
         struct hooked_method
         {
             method*  method{ nullptr };
             detour_t detour{ nullptr };
+            void*    original_code{ nullptr };
+            void*    original_from_interpreted_entry{ nullptr };
+            void*    original_from_compiled_entry{ nullptr };
+            bool     was_compiled{ false };
         };
 
         /*
@@ -2119,6 +2258,27 @@ namespace vmhook
             {
                 *flags &= static_cast<std::uint16_t>(~(1 << 2));
             }
+        }
+
+        /*
+            @brief Reads the c2i (compiled-to-interpreter) adapter entry from an AdapterHandlerEntry.
+            @param adapter  AdapterHandlerEntry* stored in Method._adapter.
+            @return The c2i entry address, or nullptr if not available.
+            @details
+            Used when deoptimising a hook to redirect Method._from_compiled_entry to the
+            c2i adapter, so compiled callers that miss their inline cache re-enter the
+            interpreter and reach our patched i2i stub.
+            AdapterHandlerEntry._c2i_entry is exported via gHotSpotVMStructs on all
+            supported JDK versions (8 – 26).
+        */
+        static auto get_c2i_entry_from_adapter(void* const adapter) noexcept -> void*
+        {
+            if (!adapter || !is_valid_ptr(adapter)) return nullptr;
+            static const VMStructEntry* const entry{
+                iterate_struct_entries("AdapterHandlerEntry", "_c2i_entry") };
+            if (!entry) return nullptr;
+            return *reinterpret_cast<void**>(
+                reinterpret_cast<std::uint8_t*>(adapter) + entry->offset);
         }
     }
 
@@ -2286,36 +2446,99 @@ namespace vmhook
             }
             *flags |= vmhook::hotspot::NO_COMPILE;
 
-            hotspot::g_hooked_methods.push_back({ found_method, detour });
-
+            // ── Snapshot original entry points before any modification ──────────
             void* const i2i{ found_method->get_i2i_entry() };
             if (!i2i)
             {
                 throw vmhook::exception{ "Failed to retrieve i2i entry." };
             }
 
+            void* const original_code{ found_method->get_code() };
+            void* const original_from_interpreted{ found_method->get_from_interpreted_entry() };
+            void* const original_from_compiled{ found_method->get_from_compiled_entry() };
+            const bool was_compiled{
+                original_code != nullptr && vmhook::hotspot::is_valid_ptr(original_code) };
+
+            if (was_compiled)
+            {
+                std::println("{} hook(): '{}' is JIT-compiled (_code=0x{:016X}) — deoptimising.",
+                    vmhook::k_info_tag, method_name,
+                    reinterpret_cast<std::uintptr_t>(original_code));
+            }
+            else
+            {
+                std::println("{} hook(): '{}' is interpreted — patching i2i stub.",
+                    vmhook::k_info_tag, method_name);
+            }
+
+            hotspot::g_hooked_methods.push_back(
+                { found_method, detour,
+                  original_code, original_from_interpreted, original_from_compiled, was_compiled });
+
+            // ── Install (or reuse) the i2i stub patch ───────────────────────────
+            bool i2i_already_patched{ false };
             for (const hotspot::i2i_hook_data& hd : hotspot::g_hooked_i2i_entries)
             {
-                if (hd.i2i_entry == i2i)
+                if (hd.i2i_entry == i2i) { i2i_already_patched = true; break; }
+            }
+
+            if (!i2i_already_patched)
+            {
+                std::uint8_t* const target{
+                    reinterpret_cast<std::uint8_t*>(vmhook::hotspot::find_hook_location(i2i)) };
+                if (!target)
                 {
-                    return true;
+                    throw vmhook::exception{ "Failed to find hook location in i2i stub." };
                 }
+
+                vmhook::hotspot::midi2i_hook* const hook_instance{
+                    new vmhook::hotspot::midi2i_hook(target, vmhook::hotspot::common_detour) };
+                if (hook_instance->has_error())
+                {
+                    delete hook_instance;
+                    throw vmhook::exception{ "midi2i_hook installation failed." };
+                }
+                hotspot::g_hooked_i2i_entries.push_back({ i2i, hook_instance });
             }
 
-            std::uint8_t* const target{ reinterpret_cast<std::uint8_t*>(vmhook::hotspot::find_hook_location(i2i)) };
-            if (!target)
+            // ── Deoptimise JIT-compiled methods ─────────────────────────────────
+            // Problem:  when _code != nullptr, _from_interpreted_entry points to the i2c
+            //           adapter (not the i2i stub), so calls bypass our patch entirely.
+            // Fix:      null _code and reset both entry points so the JVM dispatches
+            //           through the interpreter — and therefore through our patched i2i stub.
+            // Limitation: compiled callers with stale monomorphic inline caches still call
+            //             the old nmethod directly.  Those caches will be repaired the next
+            //             time HotSpot reaches a safe point and re-evaluates the IC.
+            if (was_compiled)
             {
-                throw vmhook::exception{ "Failed to find hook location in i2i stub." };
+                void* const adapter{ found_method->get_adapter() };
+                void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+
+                // 1. Redirect interpreted callers to the (now-patched) i2i stub.
+                found_method->set_from_interpreted_entry(i2i);
+
+                // 2. Redirect compiled callers through the c2i adapter → interpreter → i2i stub.
+                if (c2i_entry && vmhook::hotspot::is_valid_ptr(c2i_entry))
+                {
+                    found_method->set_from_compiled_entry(c2i_entry);
+                    std::println("{} hook():   _from_compiled_entry → c2i @ 0x{:016X}",
+                        vmhook::k_info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
+                }
+                else
+                {
+                    // Fallback: no c2i adapter available; point at the i2i stub directly.
+                    // Compiled callers with fresh dispatch will still reach the hook.
+                    found_method->set_from_compiled_entry(i2i);
+                    std::println("{} hook():   _from_compiled_entry → i2i (c2i adapter unavailable)",
+                        vmhook::k_warning_tag);
+                }
+
+                // 3. Clear _code last so the above entry-point writes are visible first.
+                found_method->set_code(nullptr);
+                std::println("{} hook():   _code cleared — method running via interpreter.",
+                    vmhook::k_info_tag);
             }
 
-            vmhook::hotspot::midi2i_hook* const hook_instance{ new vmhook::hotspot::midi2i_hook(target, vmhook::hotspot::common_detour) };
-            if (hook_instance->has_error())
-            {
-                delete hook_instance;
-                throw vmhook::exception{ "midi2i_hook installation failed." };
-            }
-
-            hotspot::g_hooked_i2i_entries.push_back({ i2i, hook_instance });
             return true;
         }
         catch (const std::exception& e)
@@ -2329,8 +2552,11 @@ namespace vmhook
         @brief Removes all active interpreter hooks and restores the JVM to its original state.
         @details
         Phase 1: Deletes each midi2i_hook instance, restoring original bytes and freeing memory.
-        Phase 2: Clears _dont_inline and NO_COMPILE flags on all hooked methods.
-        Both vectors are cleared after cleanup.
+        Phase 2: Clears _dont_inline and NO_COMPILE flags.
+        Phase 3: For methods that were JIT-compiled at hook-install time, restores the original
+                 entry points and re-links _code so the nmethod is active again.
+        Order within phase 3:  entry points first, then _code — this ensures callers have a valid
+        destination before the JVM re-enables compiled dispatch.
     */
     static auto shutdown_hooks() noexcept -> void
     {
@@ -2347,6 +2573,16 @@ namespace vmhook
             if (flags)
             {
                 *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
+            }
+
+            if (hm.was_compiled)
+            {
+                if (hm.original_from_compiled_entry)
+                    hm.method->set_from_compiled_entry(hm.original_from_compiled_entry);
+                if (hm.original_from_interpreted_entry)
+                    hm.method->set_from_interpreted_entry(hm.original_from_interpreted_entry);
+                if (hm.original_code)
+                    hm.method->set_code(hm.original_code);
             }
         }
 

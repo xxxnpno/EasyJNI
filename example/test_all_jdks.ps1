@@ -5,10 +5,15 @@
 .DESCRIPTION
     For each JDK in the $jdks map below:
       1. Compile the Java sources with that JDK's javac.
-      2. Launch java -Xint (interpreter-only — guarantees hooks fire regardless of JIT state).
-      3. Wait for the JVM to finish loading classes (~4 s).
+      2. Launch java with JIT enabled (no -Xint).
+      3. Wait 5 s for the JVM to load classes and run the hook target long enough
+         for JIT compilation to kick in (~200 calls at 100/s = ~2 s).
       4. Run Injector.exe, which exits immediately after injection.
-      5. Wait for the DLL test suite to finish (~8 s).
+         VMHook deoptimises any already-compiled method at hook-install time:
+           - _code is cleared (dispatch reverts to interpreter)
+           - _from_interpreted_entry → i2i stub (our patch)
+           - _from_compiled_entry   → c2i adapter
+      5. Wait 10 s for the DLL test suite to complete.
       6. Parse log.txt for PASS / FAIL / SKIP / RESULTS lines.
       7. Print a colour-coded summary and exit 1 if any version fails.
 
@@ -23,9 +28,9 @@
       4. Re-run this script.
 
     Known limitations:
-      - Instance-field read/write tests (categories 6/7) are SKIPPED on JDK 21+
-        because the locals pointer is held in register r14 and is not spilled to
-        the interpreter frame at the hook injection point.  Tracked as a known gap.
+      - Compiled callers with stale monomorphic inline caches (ICs) may bypass the hook
+        for 1-2 ticks until HotSpot repairs the IC at the next safe-point. In the test
+        loop (Thread.sleep + 100/s) this resolves automatically within the 10 s window.
       - JDK 9 and 10 are not included: Adoptium Temurin does not publish binaries
         for those EOL versions.  They are structurally identical to JDK 11 for the
         purposes of gHotSpotVMStructs, so JDK 11 coverage is sufficient.
@@ -129,10 +134,10 @@ foreach ($entry in $jdks.GetEnumerator()) {
     # 2. Kill any stale java processes
     Kill-Java
 
-    # 3. Launch the target process with -Xint
-    Write-Host "  [2/5] Launching target with -Xint..."
+    # 3. Launch the target process (JIT enabled — no -Xint)
+    Write-Host "  [2/5] Launching target (JIT enabled)..."
     $java_proc = Start-Process -FilePath $java_exe `
-        -ArgumentList @("-Xint", "-cp", $ClasspathOut, "vmhook.example.Main") `
+        -ArgumentList @("-cp", $ClasspathOut, "vmhook.example.Main") `
         -PassThru -WindowStyle Minimized
 
     # Wait up to 10 s for the JVM to appear
