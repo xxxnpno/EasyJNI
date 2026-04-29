@@ -2,9 +2,9 @@
 
 on:
   push:
-    branches: [ "testing" ]
+    branches: ["testing"]
   pull_request:
-    branches: [ "testing" ]
+    branches: ["testing"]
   workflow_dispatch:
 
 jobs:
@@ -25,12 +25,11 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build VMHook (Release|x64)
-        run: msbuild VMHook\VMHook.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
+        run: msbuild VMHook/VMHook.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
 
       - name: Build Injector (Release|x64)
-        run: msbuild Injector\Injector.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
+        run: msbuild Injector/Injector.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
 
       - name: Run integration unit tests
         shell: pwsh
         run: ./example/ci_run_tests.ps1
-
