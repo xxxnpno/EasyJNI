@@ -76,6 +76,9 @@ try {
     $failCount = @($lines | Select-String "\[FAIL\]").Count
     $passCount = @($lines | Select-String "\[PASS\]").Count
 
+    Write-Host "[CI] --- full log.txt ---"
+    $lines | ForEach-Object { Write-Host $_ }
+    Write-Host "[CI] --- end log.txt ---"
     Write-Host "[CI] Summary: $($summary.Line)"
     Write-Host "[CI] PASS lines: $passCount"
     Write-Host "[CI] FAIL lines: $failCount"
