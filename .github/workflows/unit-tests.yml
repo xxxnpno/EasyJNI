@@ -21,14 +21,19 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
-
       - name: Build VMHook (Release|x64)
-        run: msbuild VMHook/VMHook.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
+        shell: pwsh
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+          & $msbuild VMHook/VMHook.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
 
       - name: Build Injector (Release|x64)
-        run: msbuild Injector/Injector.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
+        shell: pwsh
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+          & $msbuild Injector/Injector.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /m /nologo
 
       - name: Run integration unit tests
         shell: pwsh
