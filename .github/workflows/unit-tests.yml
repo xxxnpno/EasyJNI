@@ -1,4 +1,4 @@
-﻿name: Unit Tests
+name: Unit Tests
 
 on:
   push:
@@ -8,18 +8,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  windows-tests:
+  build:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
 
       - name: Build VMHook (Release|x64)
         shell: pwsh
@@ -35,11 +28,42 @@ jobs:
           if (-not $msbuild) { throw "MSBuild not found" }
           & $msbuild Injector/Injector.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /t:Build /m /nologo
 
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmhook-build
+          path: build/
+
+  test:
+    needs: build
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [8, 11, 17, 21, 25, 26]
+
+    name: "JDK ${{ matrix.java }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: vmhook-build
+          path: build/
+
+      - name: Setup Java ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "${{ matrix.java }}"
+
       - name: Disable Windows Defender real-time monitoring
         shell: pwsh
         run: Set-MpPreference -DisableRealtimeMonitoring $true
 
-      - name: Run integration unit tests
+      - name: Run tests (JDK ${{ matrix.java }})
         shell: pwsh
-        run: ./example/ci_run_tests.ps1
-
+        run: ./example/ci_run_tests.ps1 -JavaMajor ${{ matrix.java }}

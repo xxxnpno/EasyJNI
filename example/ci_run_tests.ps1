@@ -1,4 +1,5 @@
 ﻿param(
+    [int]$JavaMajor   = 21,
     [string]$RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 )
 
@@ -26,8 +27,12 @@ if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
 if (Test-Path $logFile) { Remove-Item $logFile -Force }
 New-Item -ItemType Directory -Path $outDir | Out-Null
 
-Write-Host "[CI] Compiling Java sources..."
-& javac --release 21 -d $outDir @javaSources
+Write-Host "[CI] Compiling Java sources (JDK $JavaMajor)..."
+if ($JavaMajor -le 8) {
+    & javac -source 8 -target 8 -d $outDir @javaSources
+} else {
+    & javac --release $JavaMajor -d $outDir @javaSources
+}
 if ($LASTEXITCODE -ne 0) {
     throw "javac failed"
 }
