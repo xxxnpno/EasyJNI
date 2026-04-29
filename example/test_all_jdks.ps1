@@ -134,7 +134,7 @@ foreach ($entry in $jdks.GetEnumerator()) {
     # 2. Kill any stale java processes
     Kill-Java
 
-    # 3. Launch the target process (JIT enabled — no -Xint)
+    # 3. Launch the target process (JIT enabled, no -Xint)
     Write-Host "  [2/5] Launching target (JIT enabled)..."
     $java_proc = Start-Process -FilePath $java_exe `
         -ArgumentList @("-cp", $ClasspathOut, "vmhook.example.Main") `
@@ -161,6 +161,7 @@ foreach ($entry in $jdks.GetEnumerator()) {
 
     # Clear old log
     if (Test-Path $LogFile) { Remove-Item $LogFile -Force }
+    $run_start = Get-Date
 
     Write-Host "  [4/5] Injecting VMHook.dll..."
     & $InjectorExe | Out-Null   # exits immediately now
@@ -173,6 +174,25 @@ foreach ($entry in $jdks.GetEnumerator()) {
     if (-not (Test-Path $LogFile)) {
         Write-Color "  [FAIL] log.txt was not created — injection failed." Red
         $results_table += [pscustomobject]@{ JDK="$major"; Passed=0; Failed=1; Status="INJECT_FAIL" }
+        $overall_pass = $false
+        Kill-Java
+        continue
+    }
+
+    $log_item = Get-Item $LogFile -ErrorAction SilentlyContinue
+    if (-not $log_item) {
+        Write-Color "  [FAIL] log.txt disappeared before parsing." Red
+        $results_table += [pscustomobject]@{ JDK="$major"; Passed=0; Failed=1; Status="LOG_RACE" }
+        $overall_pass = $false
+        Kill-Java
+        continue
+    }
+
+    if ($log_item.LastWriteTime -lt $run_start) {
+        Write-Color "  [FAIL] log.txt is stale (not updated in this run)." Red
+        Write-Host  "         LastWriteTime: $($log_item.LastWriteTime)"
+        Write-Host  "         Run start    : $run_start"
+        $results_table += [pscustomobject]@{ JDK="$major"; Passed=0; Failed=1; Status="STALE_LOG" }
         $overall_pass = $false
         Kill-Java
         continue

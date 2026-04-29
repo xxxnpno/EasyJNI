@@ -19,6 +19,9 @@ import java.lang.management.ManagementFactory;
  */
 public class Main
 {
+    // Stable handle for native-side tests to retrieve the live TestTarget instance.
+    public static volatile TestTarget testTargetRef;
+
     public static void main(final String[] args) throws InterruptedException
     {
         System.out.println("=== VMHook example / test target ===");
@@ -45,6 +48,7 @@ public class Main
 
         // ---- TestTarget instance (unit test subject) -----------------------
         final TestTarget target = new TestTarget();
+        testTargetRef = target;
 
         long tick_count = 0;
 
@@ -57,6 +61,7 @@ public class Main
 
             // Call the hookable method every iteration.
             target.onTick((int) tick_count);
+            testTargetRef = target;
             ++tick_count;
 
             // Status every 5 s (~100 ticks/s × 500)

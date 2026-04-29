@@ -1917,7 +1917,7 @@ namespace vmhook
                 // JDK 21+: the slot holds (r14 - rbp) >> 3 — a non-negative slot index.
                 // Recover r14 = rbp + index * sizeof(void*).
                 const std::uintptr_t slot_index{ reinterpret_cast<std::uintptr_t>(frame_slot_value) };
-                if (slot_index > 0 && slot_index < 0x1000u)
+                if (slot_index < 0x1000u)
                 {
                     return reinterpret_cast<void**>(
                         reinterpret_cast<std::uint8_t*>(const_cast<frame*>(this))
@@ -1972,7 +1972,20 @@ namespace vmhook
                 if constexpr (std::is_pointer_v<type>)
                 {
                     if (!raw) return nullptr;
-                    return reinterpret_cast<type>(vmhook::hotspot::decode_oop_ptr(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(raw))));
+                    const std::uintptr_t raw_bits{ reinterpret_cast<std::uintptr_t>(raw) };
+
+                    // HotSpot can expose object arguments either as:
+                    //  - compressed oops (32-bit narrow value in the slot), or
+                    //  - direct oop pointers (already decoded 64-bit address).
+                    // Prefer decode only for narrow-looking values; otherwise use the
+                    // direct pointer as-is.
+                    if (raw_bits <= 0xFFFFFFFFull)
+                    {
+                        return reinterpret_cast<type>(
+                            vmhook::hotspot::decode_oop_ptr(static_cast<std::uint32_t>(raw_bits)));
+                    }
+
+                    return reinterpret_cast<type>(raw);
                 }
                 else if constexpr (sizeof(type) <= sizeof(void*))
                 {
