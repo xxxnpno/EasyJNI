@@ -62,7 +62,11 @@ jobs:
 
       - name: Disable Windows Defender real-time monitoring
         shell: pwsh
-        run: Set-MpPreference -DisableRealtimeMonitoring $true
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-MpPreference -DisableBehaviorMonitoring $true
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\build"
+          Start-Sleep -Seconds 5
 
       - name: Run tests (JDK ${{ matrix.java }})
         shell: pwsh

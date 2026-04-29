@@ -53,24 +53,34 @@ try {
     if ($javaProc.HasExited) {
         throw "JVM process exited before injection (exit code $($javaProc.ExitCode))"
     }
-    Write-Host "[CI] JVM still running. Injecting VMHook..."
-    & $injector | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "Injector exited with code $LASTEXITCODE"
-    }
+    # Retry injection up to 3 times in case Defender delays the first attempt
+    $injected = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Write-Host "[CI] Injection attempt $attempt..."
+        if (Test-Path $logFile) { Remove-Item $logFile -Force }
 
-    Write-Host "[CI] Waiting up to 60 s for test results..."
-    $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Path $logFile) {
-            $content = Get-Content $logFile -ErrorAction SilentlyContinue
-            if ($content -match "RESULTS:") { break }
+        & $injector | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Injector exited with code $LASTEXITCODE"
         }
-        Start-Sleep -Milliseconds 500
+
+        Write-Host "[CI] Waiting up to 60 s for test results..."
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-Path $logFile) {
+                $content = Get-Content $logFile -ErrorAction SilentlyContinue
+                if ($content -match "RESULTS:") { $injected = $true; break }
+            }
+            Start-Sleep -Milliseconds 500
+        }
+
+        if ($injected) { break }
+        Write-Host "[CI] Attempt $attempt: no results yet — retrying..."
+        Start-Sleep -Seconds 3
     }
 
     if (-not (Test-Path $logFile)) {
-        throw "log.txt not created — injection likely failed or was blocked"
+        throw "log.txt not created after $attempt attempts — injection was blocked"
     }
 
     $lines = Get-Content $logFile
