@@ -75,7 +75,7 @@ try {
         }
 
         if ($injected) { break }
-        Write-Host "[CI] Attempt $attempt: no results yet — retrying..."
+        Write-Host "[CI] Attempt ${attempt}: no results yet — retrying..."
         Start-Sleep -Seconds 3
     }
 
