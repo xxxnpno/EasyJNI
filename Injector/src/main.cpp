@@ -136,7 +136,7 @@ static auto resolve_dll_path() -> std::wstring
 
 // --- Entry point -------------------------------------------------------------
 
-int main()
+int main(int argc, char* argv[])
 {
     std::cout <<
         "================================================\n"
@@ -156,52 +156,55 @@ int main()
     }
     std::cout << "[OK]  DLL found.\n\n";
 
-    // 2. Find javaw.exe or java.exe processes
-    std::cout << "[*] Scanning for javaw.exe / java.exe...\n";
-    auto processes{ find_processes(L"javaw.exe") };
-    if (processes.empty())
-    {
-        processes = find_processes(L"java.exe");
-    }
-
-    if (processes.empty())
-    {
-        std::cerr <<
-            "[ERROR] No javaw.exe or java.exe found.\n"
-            "        Launch Minecraft first, then run this tool.\n";
-        return 1;
-    }
-
-    // 3. Select target
+    // 2. Determine target PID — accept optional PID argument for CI/scripted use
     DWORD target_pid{ 0 };
 
-    if (processes.size() == 1)
+    if (argc >= 2)
     {
-        target_pid = processes[0].pid;
-        std::cout << std::format(
-            "[*] Found 1 javaw.exe - PID {} - injecting automatically.\n",
-            target_pid);
+        // PID provided on command line: skip process scan entirely
+        try { target_pid = static_cast<DWORD>(std::stoul(argv[1])); }
+        catch (...) { std::cerr << "[ERROR] Invalid PID argument.\n"; return 1; }
+        std::cout << std::format("[*] Using provided PID {}.\n", target_pid);
     }
     else
     {
-        std::cout << std::format("[*] Found {} javaw.exe processes:\n", processes.size());
-        for (std::size_t i{ 0 }; i < processes.size(); ++i)
+        // No PID: scan for javaw.exe then java.exe
+        std::cout << "[*] Scanning for javaw.exe / java.exe...\n";
+        auto processes{ find_processes(L"javaw.exe") };
+        if (processes.empty()) processes = find_processes(L"java.exe");
+
+        if (processes.empty())
         {
-            std::cout << std::format("    [{}]  PID {}\n", i + 1, processes[i].pid);
+            std::cerr <<
+                "[ERROR] No javaw.exe or java.exe found.\n"
+                "        Launch the target first, then run this tool.\n";
+            return 1;
         }
 
-        std::size_t choice{ 0 };
-        do
+        if (processes.size() == 1)
         {
-            std::cout << std::format("Choose (1–{}): ", processes.size());
-            std::cin >> choice;
+            target_pid = processes[0].pid;
+            std::cout << std::format("[*] Found 1 process - PID {} - injecting automatically.\n", target_pid);
         }
-        while (choice < 1 || choice > processes.size());
+        else
+        {
+            std::cout << std::format("[*] Found {} java processes:\n", processes.size());
+            for (std::size_t i{ 0 }; i < processes.size(); ++i)
+                std::cout << std::format("    [{}]  PID {}\n", i + 1, processes[i].pid);
 
-        target_pid = processes[choice - 1].pid;
+            std::size_t choice{ 0 };
+            do
+            {
+                std::cout << std::format("Choose (1-{}): ", processes.size());
+                std::cin >> choice;
+            }
+            while (choice < 1 || choice > processes.size());
+
+            target_pid = processes[choice - 1].pid;
+        }
     }
 
-    // 4. Inject
+    // 3. Inject
     std::cout << std::format("\n[*] Injecting into PID {}...\n", target_pid);
 
     if (inject_dll(target_pid, dll_path))

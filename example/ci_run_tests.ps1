@@ -56,10 +56,10 @@ try {
     # Retry injection up to 3 times in case Defender delays the first attempt
     $injected = $false
     for ($attempt = 1; $attempt -le 3; $attempt++) {
-        Write-Host "[CI] Injection attempt $attempt..."
+        Write-Host "[CI] Injection attempt $attempt (PID $($javaProc.Id))..."
         if (Test-Path $logFile) { Remove-Item $logFile -Force }
 
-        & $injector | Out-Host
+        & $injector $javaProc.Id | Out-Host
         if ($LASTEXITCODE -ne 0) {
             throw "Injector exited with code $LASTEXITCODE"
         }
