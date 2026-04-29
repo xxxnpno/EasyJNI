@@ -1608,8 +1608,24 @@ namespace vmhook
                 return nullptr;
             }
 
-            static const VMStructEntry* const base_entry { vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._base")  };
-            static const VMStructEntry* const shift_entry{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._shift") };
+            // VMStruct field names for the narrow OOP base/shift changed across versions:
+            //   JDK  8-16: Universe::_narrow_oop._base/shift
+            //   JDK 17-24: CompressedOops::_narrow_oop._base/shift
+            //   JDK 25+  : CompressedOops::_base/shift  (_narrow_oop. prefix dropped)
+            static const VMStructEntry* const base_entry{
+                []() -> const VMStructEntry* {
+                    if (auto* e{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._base") }) return e;
+                    if (auto* e{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_base")             }) return e;
+                    return vmhook::hotspot::iterate_struct_entries("Universe", "_narrow_oop._base");
+                }()
+            };
+            static const VMStructEntry* const shift_entry{
+                []() -> const VMStructEntry* {
+                    if (auto* e{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._shift") }) return e;
+                    if (auto* e{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_shift")             }) return e;
+                    return vmhook::hotspot::iterate_struct_entries("Universe", "_narrow_oop._shift");
+                }()
+            };
 
             if (!base_entry || !shift_entry)
             {
@@ -1637,8 +1653,24 @@ namespace vmhook
                 return nullptr;
             }
 
-            static const VMStructEntry* const base_entry{ iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._base") };
-            static const VMStructEntry* const shift_entry{ iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._shift") };
+            // VMStruct field names changed the same way as for CompressedOops:
+            //   JDK  8-16: Universe::_narrow_klass._base/shift
+            //   JDK 17-24: CompressedKlassPointers::_narrow_klass._base/shift
+            //   JDK 25+  : CompressedKlassPointers::_base/shift
+            static const VMStructEntry* const base_entry{
+                []() -> const VMStructEntry* {
+                    if (auto* e{ iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._base") }) return e;
+                    if (auto* e{ iterate_struct_entries("CompressedKlassPointers", "_base")               }) return e;
+                    return iterate_struct_entries("Universe", "_narrow_klass._base");
+                }()
+            };
+            static const VMStructEntry* const shift_entry{
+                []() -> const VMStructEntry* {
+                    if (auto* e{ iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._shift") }) return e;
+                    if (auto* e{ iterate_struct_entries("CompressedKlassPointers", "_shift")               }) return e;
+                    return iterate_struct_entries("Universe", "_narrow_klass._shift");
+                }()
+            };
 
             if (!base_entry || !shift_entry)
             {

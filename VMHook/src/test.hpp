@@ -108,21 +108,90 @@ struct CapturedFields
 };
 static CapturedFields g_captured{};
 
+// Returns the live TestTarget oop decoded from Main.testTargetRef.
+// Reading through the static reference is GC-safe: the compressed OOP stored
+// there is always updated by the collector when the object is moved.
+static void* get_test_target_oop()
+{
+    vmhook::hotspot::klass* const main_klass{ vmhook::find_class("vmhook/example/Main") };
+    if (!main_klass) return nullptr;
+
+    const std::uint32_t compressed{ vmhook::get_static_field<std::uint32_t>(main_klass, "testTargetRef") };
+    if (!compressed) return nullptr;
+
+    void* const oop{ vmhook::hotspot::decode_oop_ptr(compressed) };
+    return (oop && vmhook::hotspot::is_valid_ptr(oop)) ? oop : nullptr;
+}
+
+// Decodes a Java String OOP to a std::string.
+// Handles JDK 8 (char[] value, UTF-16) and JDK 9+ (byte[] value, compact strings).
+static std::string read_java_string(void* const string_oop)
+{
+    if (!string_oop || !vmhook::hotspot::is_valid_ptr(string_oop)) return {};
+
+    vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
+    if (!string_klass) return {};
+
+    // Read the 'value' array field as a compressed OOP
+    const std::uint32_t value_compressed{ vmhook::get_field<std::uint32_t>(string_oop, string_klass, "value") };
+    if (!value_compressed) return {};
+
+    void* const arr_oop{ vmhook::hotspot::decode_oop_ptr(value_compressed) };
+    if (!arr_oop || !vmhook::hotspot::is_valid_ptr(arr_oop)) return {};
+
+    // HotSpot Array object layout (x64, compressed OOPs):
+    //   +0  mark word (8 B)
+    //   +8  klass ptr (4 B)
+    //   +12 _length   (int, element count)
+    //   +16 _data[0]
+    const auto* const arr{ reinterpret_cast<const std::uint8_t*>(arr_oop) };
+    const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(arr + 12) };
+    if (length <= 0 || length > 4096) return {};
+
+    const std::uint8_t* const data{ arr + 16 };
+
+    // JDK 8: String.value is char[] — no 'coder' field exists
+    // JDK 9+: String.value is byte[], coder 0=LATIN1, 1=UTF16
+    const bool has_coder{ string_klass->find_field("coder").has_value() };
+
+    std::string result;
+    if (!has_coder)
+    {
+        // JDK 8: UTF-16 chars, _length = char count
+        const auto* const chars{ reinterpret_cast<const std::uint16_t*>(data) };
+        result.reserve(static_cast<std::size_t>(length));
+        for (std::int32_t i{ 0 }; i < length; ++i)
+            result += (chars[i] < 0x80) ? static_cast<char>(chars[i]) : '?';
+    }
+    else
+    {
+        const auto coder{ vmhook::get_field<std::int8_t>(string_oop, string_klass, "coder") };
+        if (coder == 0)
+        {
+            // LATIN1: one byte per char
+            result.assign(reinterpret_cast<const char*>(data), static_cast<std::size_t>(length));
+        }
+        else
+        {
+            // UTF-16: _length = byte count, two bytes per char
+            const auto* const chars{ reinterpret_cast<const std::uint16_t*>(data) };
+            result.reserve(static_cast<std::size_t>(length / 2));
+            for (std::int32_t i{ 0 }; i < length / 2; ++i)
+                result += (chars[i] < 0x80) ? static_cast<char>(chars[i]) : '?';
+        }
+    }
+    return result;
+}
+
 static void try_capture_from_main_static()
 {
     if (g_captured.ready) return;
 
-    vmhook::hotspot::klass* const main_klass{ vmhook::find_class("vmhook/example/Main") };
     vmhook::hotspot::klass* const target_klass{ vmhook::find_class("vmhook/example/TestTarget") };
-    if (!main_klass || !target_klass) return;
+    if (!target_klass) return;
 
-    const std::uint32_t compressed_ref{
-        vmhook::get_static_field<std::uint32_t>(main_klass, "testTargetRef") };
-    if (!compressed_ref) return;
-
-    vmhook::oop const target_oop{
-        reinterpret_cast<vmhook::oop>(vmhook::hotspot::decode_oop_ptr(compressed_ref)) };
-    if (!target_oop || !vmhook::hotspot::is_valid_ptr(target_oop)) return;
+    vmhook::oop const target_oop{ reinterpret_cast<vmhook::oop>(get_test_target_oop()) };
+    if (!target_oop) return;
 
     g_captured.fieldBool   = vmhook::get_field<bool>          (target_oop, target_klass, "fieldBool");
     g_captured.fieldByte   = vmhook::get_field<std::int8_t>   (target_oop, target_klass, "fieldByte");
@@ -280,6 +349,84 @@ static void test_instance_field_rw(TestResults& results)
     results.record(g_captured.fieldLong   == 9876543210LL,                              "get_field<int64>  fieldLong");
     results.record(g_captured.fieldDouble >  6.28   && g_captured.fieldDouble <  6.29, "get_field<double> fieldDouble", std::format("got={}", g_captured.fieldDouble));
     results.record(g_captured.fieldChar   == static_cast<std::uint16_t>('X'),           "get_field<char>   fieldChar");
+
+    // fieldRef: verify the String reference is non-null and contains "world"
+    vmhook::hotspot::klass* const target_klass{ vmhook::find_class("vmhook/example/TestTarget") };
+    void* const oop{ get_test_target_oop() };
+    if (target_klass && oop)
+    {
+        const std::uint32_t ref_compressed{ vmhook::get_field<std::uint32_t>(oop, target_klass, "fieldRef") };
+        void* const ref_oop{ ref_compressed ? vmhook::hotspot::decode_oop_ptr(ref_compressed) : nullptr };
+        results.record(ref_compressed != 0 && ref_oop != nullptr, "get_field<ref>  fieldRef non-null");
+        if (ref_oop && vmhook::hotspot::is_valid_ptr(ref_oop))
+        {
+            const std::string str{ read_java_string(ref_oop) };
+            results.record(str == "world", "get_field<ref>  fieldRef==\"world\"",
+                std::format("got=\"{}\"", str));
+        }
+    }
+}
+
+// 7. Instance field write — set_field + readback for every primitive type
+static void test_instance_field_write(TestResults& results)
+{
+    tlog("\n── 7. Instance field write / set_field ──");
+
+    vmhook::hotspot::klass* const target_klass{ vmhook::find_class("vmhook/example/TestTarget") };
+    if (!target_klass) { results.record(false, "set_field: TestTarget klass"); return; }
+
+    void* const oop{ get_test_target_oop() };
+    if (!oop) { results.record(false, "set_field: TestTarget oop"); return; }
+
+    // set_field / get_field both catch exceptions internally — no __try needed.
+
+    // bool: false → restore true
+    vmhook::set_field<bool>(oop, target_klass, "fieldBool", false);
+    results.record(vmhook::get_field<bool>(oop, target_klass, "fieldBool") == false,
+        "set_field<bool>   fieldBool→false");
+    vmhook::set_field<bool>(oop, target_klass, "fieldBool", true);
+
+    // byte: 42 → restore 127
+    vmhook::set_field<std::int8_t>(oop, target_klass, "fieldByte", std::int8_t{ 42 });
+    results.record(vmhook::get_field<std::int8_t>(oop, target_klass, "fieldByte") == 42,
+        "set_field<int8>   fieldByte→42");
+    vmhook::set_field<std::int8_t>(oop, target_klass, "fieldByte", std::int8_t{ 127 });
+
+    // short: 1000 → restore 32767
+    vmhook::set_field<std::int16_t>(oop, target_klass, "fieldShort", std::int16_t{ 1000 });
+    results.record(vmhook::get_field<std::int16_t>(oop, target_klass, "fieldShort") == 1000,
+        "set_field<int16>  fieldShort→1000");
+    vmhook::set_field<std::int16_t>(oop, target_klass, "fieldShort", std::int16_t{ 32767 });
+
+    // int: 99999 → restore 100
+    vmhook::set_field<std::int32_t>(oop, target_klass, "fieldInt", 99999);
+    results.record(vmhook::get_field<std::int32_t>(oop, target_klass, "fieldInt") == 99999,
+        "set_field<int32>  fieldInt→99999");
+    vmhook::set_field<std::int32_t>(oop, target_klass, "fieldInt", 100);
+
+    // float: 2.5f → restore 1.5f  (2.5 and 1.5 are exactly representable in IEEE 754)
+    vmhook::set_field<float>(oop, target_klass, "fieldFloat", 2.5f);
+    results.record(vmhook::get_field<float>(oop, target_klass, "fieldFloat") == 2.5f,
+        "set_field<float>  fieldFloat→2.5");
+    vmhook::set_field<float>(oop, target_klass, "fieldFloat", 1.5f);
+
+    // long: 111222333444 → restore 9876543210
+    vmhook::set_field<std::int64_t>(oop, target_klass, "fieldLong", 111'222'333'444LL);
+    results.record(vmhook::get_field<std::int64_t>(oop, target_klass, "fieldLong") == 111'222'333'444LL,
+        "set_field<int64>  fieldLong→111222333444");
+    vmhook::set_field<std::int64_t>(oop, target_klass, "fieldLong", 9'876'543'210LL);
+
+    // double: 1.0 → restore 6.283185307  (1.0 is exactly representable in IEEE 754)
+    vmhook::set_field<double>(oop, target_klass, "fieldDouble", 1.0);
+    results.record(vmhook::get_field<double>(oop, target_klass, "fieldDouble") == 1.0,
+        "set_field<double> fieldDouble→1.0");
+    vmhook::set_field<double>(oop, target_klass, "fieldDouble", 6.283185307);
+
+    // char: 'Z' → restore 'X'
+    vmhook::set_field<std::uint16_t>(oop, target_klass, "fieldChar", std::uint16_t{ 'Z' });
+    results.record(vmhook::get_field<std::uint16_t>(oop, target_klass, "fieldChar") == 'Z',
+        "set_field<char>   fieldChar→'Z'");
+    vmhook::set_field<std::uint16_t>(oop, target_klass, "fieldChar", std::uint16_t{ 'X' });
 }
 
 // 8 + 9. Static field read/write
@@ -314,6 +461,35 @@ static void test_static_field_rw(TestResults& results)
     vmhook::set_static_field<std::int64_t>(target_klass, "staticLong", 0xCAFEBABELL);
     results.record(vmhook::get_static_field<std::int64_t>(target_klass, "staticLong") == 0xCAFEBABELL, "set_static<int64>  staticLong→CAFEBABE");
     vmhook::set_static_field<std::int64_t>(target_klass, "staticLong", 0xDEADBEEFCAFELL); // restore
+
+    // Write + re-read: staticFloat  (4.0f is exact in IEEE 754)
+    vmhook::set_static_field<float>(target_klass, "staticFloat", 4.0f);
+    {
+        const float got{ vmhook::get_static_field<float>(target_klass, "staticFloat") };
+        results.record(got == 4.0f, "set_static<float>  staticFloat→4.0", std::format("got={}", got));
+    }
+    vmhook::set_static_field<float>(target_klass, "staticFloat", 3.14f); // restore
+
+    // Write + re-read: staticDouble  (2.0 is exact in IEEE 754)
+    vmhook::set_static_field<double>(target_klass, "staticDouble", 2.0);
+    {
+        const double got{ vmhook::get_static_field<double>(target_klass, "staticDouble") };
+        results.record(got == 2.0, "set_static<double> staticDouble→2.0", std::format("got={}", got));
+    }
+    vmhook::set_static_field<double>(target_klass, "staticDouble", 2.718281828); // restore
+
+    // staticString: read compressed OOP, decode, verify value == "hello"
+    {
+        const std::uint32_t str_compressed{ vmhook::get_static_field<std::uint32_t>(target_klass, "staticString") };
+        void* const str_oop{ str_compressed ? vmhook::hotspot::decode_oop_ptr(str_compressed) : nullptr };
+        results.record(str_compressed != 0 && str_oop != nullptr, "get_static<ref>  staticString non-null");
+        if (str_oop && vmhook::hotspot::is_valid_ptr(str_oop))
+        {
+            const std::string str{ read_java_string(str_oop) };
+            results.record(str == "hello", "get_static<ref>  staticString==\"hello\"",
+                std::format("got=\"{}\"", str));
+        }
+    }
 }
 
 /*
@@ -540,6 +716,7 @@ static auto run_all_tests(const test_logger_fn logger = nullptr) -> int
     test_field_lookup(results);
 
     test_instance_field_rw(results);
+    test_instance_field_write(results);
     test_static_field_rw(results);
     test_object_api(results, nullptr);   // object API: proxy-via-mirror (no raw OOP needed)
     test_hook(results, g_hook_call_count.load());
