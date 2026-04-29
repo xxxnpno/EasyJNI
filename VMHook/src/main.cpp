@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <thread>
@@ -35,7 +36,12 @@ static DWORD WINAPI thread_entry(HMODULE module)
     freopen_s(&console_handle, "CONOUT$", "w", stdout);
     freopen_s(&console_handle, "CONOUT$", "w", stderr);
 
-    g_log.open(R"(C:\repos\cpp\VMHook\log.txt)", std::ios::out | std::ios::trunc);
+    {
+        wchar_t dll_buf[MAX_PATH]{};
+        GetModuleFileNameW(module, dll_buf, MAX_PATH);
+        const auto log_path = std::filesystem::path{dll_buf}.parent_path().parent_path() / L"log.txt";
+        g_log.open(log_path, std::ios::out | std::ios::trunc);
+    }
 
     std::println("════════════════════════════════════════════════════════");
     std::println("  VMHook  —  injection successful");

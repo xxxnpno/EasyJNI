@@ -211,7 +211,7 @@ int main()
             "================================================\n"
             "  A console window should appear inside\n"
             "  the target process with instructions.\n\n"
-            "  Logs: C:\\repos\\cpp\\VMHook\\log.txt\n"
+            "  Logs: log.txt (next to VMHook.dll)\n"
             "================================================\n";
     }
     else

@@ -35,6 +35,10 @@ jobs:
           if (-not $msbuild) { throw "MSBuild not found" }
           & $msbuild Injector/Injector.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /t:Build /m /nologo
 
+      - name: Disable Windows Defender real-time monitoring
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+
       - name: Run integration unit tests
         shell: pwsh
         run: ./example/ci_run_tests.ps1
