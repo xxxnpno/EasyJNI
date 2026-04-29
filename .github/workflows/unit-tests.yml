@@ -67,3 +67,11 @@ jobs:
       - name: Run tests (JDK ${{ matrix.java }})
         shell: pwsh
         run: ./example/ci_run_tests.ps1 -JavaMajor ${{ matrix.java }}
+
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-jdk${{ matrix.java }}
+          path: log.txt
+          if-no-files-found: warn

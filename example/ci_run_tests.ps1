@@ -45,16 +45,22 @@ $javaProc = $null
 try {
     Write-Host "[CI] Starting JVM target..."
     $javaProc = Start-Process -FilePath "java" -ArgumentList @("-cp", $outDir, "vmhook.example.Main") -PassThru
-    Start-Sleep -Seconds 5
+    Write-Host "[CI] JVM PID: $($javaProc.Id)"
 
-    Write-Host "[CI] Injecting VMHook..."
+    Write-Host "[CI] Waiting 10 s for JVM to initialise..."
+    Start-Sleep -Seconds 10
+
+    if ($javaProc.HasExited) {
+        throw "JVM process exited before injection (exit code $($javaProc.ExitCode))"
+    }
+    Write-Host "[CI] JVM still running. Injecting VMHook..."
     & $injector | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "Injector exited with code $LASTEXITCODE"
     }
 
-    Write-Host "[CI] Waiting for test results..."
-    $deadline = (Get-Date).AddSeconds(25)
+    Write-Host "[CI] Waiting up to 60 s for test results..."
+    $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline) {
         if (Test-Path $logFile) {
             $content = Get-Content $logFile -ErrorAction SilentlyContinue
@@ -64,7 +70,7 @@ try {
     }
 
     if (-not (Test-Path $logFile)) {
-        throw "log.txt not created after injection"
+        throw "log.txt not created — injection likely failed or was blocked"
     }
 
     $lines = Get-Content $logFile
