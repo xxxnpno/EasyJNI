@@ -47,8 +47,8 @@ try {
     $javaProc = Start-Process -FilePath "java" -ArgumentList @("-cp", $outDir, "vmhook.example.Main") -PassThru
     Write-Host "[CI] JVM PID: $($javaProc.Id)"
 
-    Write-Host "[CI] Waiting 10 s for JVM to initialise..."
-    Start-Sleep -Seconds 10
+    Write-Host "[CI] Waiting 15 s for JVM to initialise and classes to load..."
+    Start-Sleep -Seconds 15
 
     if ($javaProc.HasExited) {
         throw "JVM process exited before injection (exit code $($javaProc.ExitCode))"
