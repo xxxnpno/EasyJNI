@@ -44,7 +44,7 @@ if (-not (Test-Path $injector)) {
 $javaProc = $null
 try {
     Write-Host "[CI] Starting JVM target..."
-    $javaProc = Start-Process -FilePath "java" -ArgumentList @("-Xint", "-cp", $outDir, "vmhook.example.Main") -PassThru
+    $javaProc = Start-Process -FilePath "java" -ArgumentList @("-cp", $outDir, "vmhook.example.Main") -PassThru
     Write-Host "[CI] JVM PID: $($javaProc.Id)"
 
     Write-Host "[CI] Waiting 10 s for JVM to initialise..."
