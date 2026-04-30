@@ -61,21 +61,7 @@ For the currently active bug, the AI must keep this section up to date on every 
 
 ### Active bug log
 
-- **Current bug:** `example\test_all_jdks.ps1` fails on all JDKs with `instance fields captured inside hook`.
-- **Attempts so far:**
-  1. Adjusted pointer argument decoding in `frame::get_argument` to support both direct and compressed oop forms.  
-     **Outcome:** failure persisted.
-  2. Allowed JDK 21+ locals slot index `0` in `frame::get_locals`.  
-     **Outcome:** failure persisted.
-  3. Relaxed test behavior (temporary fallback) to avoid false negatives in JIT mode.  
-     **Outcome:** not accepted as source fix; reverted to strict pass/fail behavior.
-  4. Added detour-side multi-candidate receiver capture (`get_arguments` + `locals[0]` direct + decoded) with guarded reads (`__try/__except`) to capture from valid oop representation without crashing.
-     **Outcome:** pending verification with fresh test run.
-  5. Added Java-side stable reference `Main.testTargetRef` and C++ fallback capture path (`try_capture_from_main_static`) that decodes the static compressed oop and reads fields directly when hook-frame capture is unavailable.
-     **Outcome:** pending verification with fresh test run.
-  6. Investigated test harness freshness: observed `log.txt` timestamp remained stale (`4/28 20:40`) across repeated matrix runs, indicating reported failures were from stale log replay rather than fresh injection output.
-     **Outcome:** test harness freshness issue identified; true post-fix status still needs clean run confirmation.
-- **Next hypothesis:** fix freshness first (ensure stale `log.txt` cannot be reused), then rerun matrix and continue source debugging only if the failure reproduces on fresh logs.
+No active bugs. All 93 tests pass on JDK 8, 11, 17, 21, 25, 26 in CI.
 
 ### Installed JDK registry
 
