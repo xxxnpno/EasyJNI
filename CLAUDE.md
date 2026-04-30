@@ -33,7 +33,7 @@ cd example
 run_tests.bat
 ```
 
-This compiles the Java sources, launches the target process with `-Xint` (interpreter-only, required for hooks to fire), injects `build\Injector.exe`, and reads the results from `log.txt`. Press DELETE inside the VMHook console to unload.
+This compiles the Java sources, launches the target process with JIT enabled, injects `build\Injector.exe`, and reads the results from `log.txt`. VMHook deoptimises hooked methods at install time so hooks fire even for JIT-compiled code. Press DELETE inside the VMHook console to unload.
 
 ## Testing — all JDK versions (REQUIRED after any change to vmhook.hpp)
 
@@ -91,9 +91,21 @@ When a new JDK release appears (check https://adoptium.net/temurin/releases/):
 **Only HotSpot distributions are supported** (Temurin, Corretto, Liberica, Microsoft, etc.).
 OpenJ9 and GraalVM use different internal structures and are out of scope.
 
-### Why -Xint is required for tests
+### JIT deoptimisation
 
-The `-Xint` flag disables JIT compilation so every method call goes through the HotSpot interpreter. VMHook patches the **interpreter-to-interpreter (i2i) entry stub**, so hooks only fire for interpreted calls. Without `-Xint`, a method that has already been JIT-compiled before injection is called via compiled code and the hook never fires. C1 compiles hot methods after ~200 invocations (~2 seconds at 100/s); `-Xint` eliminates this race.
+VMHook deoptimises hooked methods at `hook()` install time so the hook fires regardless of
+JIT compilation state:
+
+1. Saves original `_code`, `_from_interpreted_entry`, `_from_compiled_entry`.
+2. Nulls `_code` (dispatch reverts to interpreter).
+3. Resets `_from_interpreted_entry` → patched i2i stub.
+4. Resets `_from_compiled_entry` → c2i adapter (compiled callers re-enter interpreter).
+
+`shutdown_hooks()` restores all three fields.
+
+**Remaining edge case:** compiled callers with a stale monomorphic inline cache may bypass
+the hook for 1-2 ticks until HotSpot repairs the IC at the next safe-point. In the test
+loop (100 ticks/s + `Thread.sleep`) this resolves within the 10 s wait window.
 
 ## Repository layout
 
@@ -112,8 +124,8 @@ example\
   src\Player.java              ← demo class with float/double/String/static fields
   src\TestTarget.java          ← test subject: every primitive type + static fields + hookable method
   src\Main.java                ← long-running target process; JDK-8-compatible
-  build_and_run.bat            ← compile + launch (no -Xint; for manual testing)
-  run_tests.bat                ← compile + launch with -Xint + wait for results
+  build_and_run.bat            ← compile + launch (for manual testing)
+  run_tests.bat                ← compile + launch (JIT enabled) + wait for results
   test_all_jdks.ps1            ← iterate all JDKs, run full suite, print summary table
 ```
 
