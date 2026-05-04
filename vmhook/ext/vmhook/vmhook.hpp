@@ -127,7 +127,7 @@ namespace vmhook
         class  midi2i_hook;
         struct hooked_method;
         struct i2i_hook_data;
-        struct field_entry;
+        struct field_entry_t;
 
         static auto decode_oop_pointer(std::uint32_t compressed) noexcept -> void*;
     }
@@ -1034,7 +1034,7 @@ namespace vmhook
             /*
                 @brief Searches the InstanceKlass _fields array for a field by name.
                 @param name The exact Java field name (e.g. "health", "x", "INSTANCE").
-                @return A field_entry with offset, static flag, and type descriptor,
+                @return A field_entry_t with offset, static flag, and type descriptor,
                         or std::nullopt when the field is not declared directly by this class.
                 @details
                 Parses InstanceKlass._fields, which is an Array<u2>.  Each field occupies
@@ -1089,7 +1089,7 @@ namespace vmhook
                 All integers encoded with UNSIGNED5 (see decode_u5).
             */
             auto find_field_in_stream(const std::string_view name,
-                void** constant_pool_base) const noexcept -> std::optional<vmhook::hotspot::field_entry>
+                void** constant_pool_base) const noexcept -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::VMStructEntry* const fis_entry{
                     vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
@@ -1183,7 +1183,7 @@ namespace vmhook
                                     signature = signature_symbol->to_string();
                                 }
                             }
-                            return vmhook::hotspot::field_entry{ field_offset, is_static, signature };
+                             return vmhook::hotspot::field_entry_t{ field_offset, is_static, signature };
                         }
                     }
                 }
@@ -1208,7 +1208,7 @@ namespace vmhook
                 @note Searches only fields declared directly on this class.
                       Walk the superclass chain to find inherited fields.
             */
-            auto find_field(const std::string_view name) const noexcept -> std::optional<vmhook::hotspot::field_entry>
+            auto find_field(const std::string_view name) const noexcept -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::VMStructEntry* const fields_entry{
                     vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields") };
@@ -1320,7 +1320,7 @@ namespace vmhook
                     const std::string signature{
                         vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
 
-                    return field_entry{ offset, is_static, signature };
+                    return vmhook::hotspot::field_entry_t{ offset, is_static, signature };
                 }
 
                 return std::nullopt;
@@ -3122,12 +3122,12 @@ namespace vmhook
         @param target_klass  The klass that declares the field (obtain via find_class()).
                              Only the declaring class is searched - not superclasses.
         @param name          The exact Java field name.
-        @return The cached field_entry, or std::nullopt if the field is not found.
+        @return The cached field_entry_t, or std::nullopt if the field is not found.
         @details
         On the first call for a given (target_klass, name) pair the full InstanceKlass._fields
         array is walked; subsequent calls return the cached result directly.
     */
-    static auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name) -> std::optional<vmhook::hotspot::field_entry>
+    static auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name) -> std::optional<vmhook::hotspot::field_entry_t>
     {
         if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
         {
