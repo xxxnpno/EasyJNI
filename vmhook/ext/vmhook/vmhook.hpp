@@ -154,13 +154,14 @@ namespace vmhook
         Keys   - internal JVM class names (e.g. "java/lang/String").
         Values - lambda functions: +[](void* oop) { return std::make_unique<T>(oop); }
     */
-    using type_factory_function_t = std::unique_ptr<class object>(*)(void* instance);
+    using type_factory_function_t = std::unique_ptr<class object_base>(*)(void* instance);
     inline std::unordered_map<std::string, type_factory_function_t> g_type_factory_map{};
 
     template<class wrapper_type>
     static auto register_class(std::string_view class_name) noexcept -> bool;
 
-    class object;
+    class object_base;
+    template<typename T = void> class object;
 
     // --- HotSpot internals ----------------------------------------------------
 
@@ -841,7 +842,7 @@ namespace vmhook
             - is_static  true when JVM_ACC_STATIC (0x0008) is set on the field.
             - signature  JVM type descriptor, e.g. "I", "J", "Z", "Ljava/lang/String;"
         */
-        struct field_entry
+        struct field_entry_t
         {
             std::uint32_t offset;
             bool          is_static;
@@ -2388,13 +2389,13 @@ namespace vmhook
                 void** const locals{ get_locals() };
                 if (!locals)
                 {
-                    return type{};
+                    return argument_type{};
                 }
 
                 // locals[-index]: arguments are stored in descending slot order.
                 void* raw_value{ locals[-index] };
 
-                if constexpr (std::is_pointer_v<type>)
+                if constexpr (std::is_pointer_v<argument_type>)
                 {
                     if (!raw_value)
                     {
@@ -2409,21 +2410,21 @@ namespace vmhook
                     // direct pointer as-is.
                     if (raw_bits <= 0xFFFFFFFFull)
                     {
-                        return reinterpret_cast<type>(
+                        return reinterpret_cast<argument_type>(
                             vmhook::hotspot::decode_oop_pointer(static_cast<std::uint32_t>(raw_bits)));
                     }
 
-                    return reinterpret_cast<type>(raw_value);
+                    return reinterpret_cast<argument_type>(raw_value);
                 }
-                else if constexpr (sizeof(type) <= sizeof(void*))
+                else if constexpr (sizeof(argument_type) <= sizeof(void*))
                 {
-                    type result{};
-                    std::memcpy(&result, &raw_value, sizeof(type));
+                    argument_type result{};
+                    std::memcpy(&result, &raw_value, sizeof(argument_type));
                     return result;
                 }
                 else
                 {
-                    return type{};
+                    return argument_type{};
                 }
             }
         };
@@ -2812,7 +2813,7 @@ namespace vmhook
         // can construct C++ wrapper objects from decoded Java object references.
         g_type_factory_map.emplace(
             std::string{ class_name },
-            +[](void* instance) -> std::unique_ptr<object> {
+            +[](void* instance) -> std::unique_ptr<object_base> {
                 return std::make_unique<wrapper_type>(instance);
             });
 
@@ -3104,7 +3105,7 @@ namespace vmhook
         // 5. Return a unique_ptr<T> wrapping the new object
 
         std::println("{} vmhook::make_unique<{}>(): object construction not fully implemented.",
-            vmhook::warning_tag, typeid(T).name());
+            vmhook::warning_tag, typeid(wrapper_type).name());
         return nullptr;
     }
 
@@ -3117,7 +3118,7 @@ namespace vmhook
         Raw klass pointers are safe as keys for process-lifetime injection; class unloading
         would invalidate them, but that is not a concern for the typical use case here.
     */
-    inline std::unordered_map<vmhook::hotspot::klass*, std::unordered_map<std::string, vmhook::hotspot::field_entry>> g_field_cache{};
+    inline std::unordered_map<vmhook::hotspot::klass*, std::unordered_map<std::string, vmhook::hotspot::field_entry_t>> g_field_cache{};
 
     /*
         @brief Looks up and caches a field entry for a named field on a klass.
@@ -3500,9 +3501,13 @@ namespace vmhook
                         return static_cast<target_type>(nullptr);
                     }
                 }
-                else
+                else if constexpr (std::is_constructible_v<target_type, source_type>)
                 {
                     return static_cast<target_type>(v);
+                }
+                else
+                {
+                    return target_type{};
                 }
             }
 
@@ -3522,10 +3527,10 @@ namespace vmhook
             @param signature     JVM type descriptor, e.g. "I", "Z", "Ljava/lang/String;"
             @param is_static     true when JVM_ACC_STATIC is set on the field.
         */
-        field_proxy(void* field_pointer, std::string signature, const bool is_static) noexcept
+        field_proxy(void* field_pointer, std::string sig, const bool is_static_flag) noexcept
             : field_pointer{ field_pointer }
-            , signature{ std::move(signature) }
-            , is_static{ is_static }
+            , m_signature{ std::move(sig) }
+            , m_is_static{ is_static_flag }
         {
         }
 
@@ -3546,49 +3551,49 @@ namespace vmhook
                 return value_t{ std::int32_t{} };
             }
 
-            if (this->signature == "Z")
+            if (this->m_signature == "Z")
             {
                 bool value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
                 return value_t{ value };
             }
-            if (this->signature == "B")
+            if (this->m_signature == "B")
             {
                 std::int8_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
                 return value_t{ value };
             }
-            if (this->signature == "S")
+            if (this->m_signature == "S")
             {
                 std::int16_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
                 return value_t{ value };
             }
-            if (this->signature == "I")
+            if (this->m_signature == "I")
             {
                 std::int32_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
                 return value_t{ value };
             }
-            if (this->signature == "J")
+            if (this->m_signature == "J")
             {
                 std::int64_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
                 return value_t{ value };
             }
-            if (this->signature == "F")
+            if (this->m_signature == "F")
             {
                 float value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
                 return value_t{ value };
             }
-            if (this->signature == "D")
+            if (this->m_signature == "D")
             {
                 double value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
                 return value_t{ value };
             }
-            if (this->signature == "C")
+            if (this->m_signature == "C")
             {
                 std::uint16_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
@@ -3607,13 +3612,14 @@ namespace vmhook
             @note For reference-type fields value_type should be uint32_t (compressed OOP).
         */
         template<typename value_type>
-        auto set(const value_type value) const noexcept -> void
+        auto set(const value_type& value) const noexcept -> void
         {
-            static_assert(std::is_trivially_copyable_v<value_type>,
-                "field_proxy::set: value type must be trivially copyable.");
-            if (this->field_pointer)
+            if constexpr (std::is_trivially_copyable_v<value_type>)
             {
-                std::memcpy(this->field_pointer, &value, sizeof(value_type));
+                if (this->field_pointer)
+                {
+                    std::memcpy(this->field_pointer, &value, sizeof(value_type));
+                }
             }
         }
 
@@ -3750,12 +3756,12 @@ namespace vmhook
         */
         auto signature() const noexcept -> std::string_view
         {
-            return this->signature;
+            return this->m_signature;
         }
 
         auto is_static() const noexcept -> bool
         {
-            return this->is_static;
+            return this->m_is_static;
         }
 
         /*
@@ -3775,8 +3781,8 @@ namespace vmhook
 
     private:
         void* field_pointer;
-        std::string signature;
-        bool        is_static;
+        std::string m_signature;
+        bool        m_is_static;
     };
 
     // --- Method proxy ------------------------------------------------------
@@ -3843,10 +3849,11 @@ namespace vmhook
             @param method_pointer Pointer to the HotSpot Method object.
             @param signature     JVM method descriptor, e.g. "(I)Ljava/lang/String;"
         */
-        method_proxy(void* owning_object, vmhook::hotspot::method* method_ptr, std::string signature) noexcept
+        method_proxy(void* owning_object, vmhook::hotspot::method* method_ptr, std::string sig) noexcept
             : object{ owning_object }
             , method{ method_ptr }
-            , signature{ std::move(signature) }
+            , m_signature{ std::move(sig) }
+            , m_is_static{ false }
         {
         }
 
@@ -3896,12 +3903,12 @@ namespace vmhook
         */
         auto signature() const noexcept -> std::string_view
         {
-            return this->signature;
+            return this->m_signature;
         }
 
         auto is_static() const noexcept -> bool
         {
-            return this->is_static;
+            return this->m_is_static;
         }
 
         auto get_compressed_oop() const noexcept -> std::uint32_t
@@ -3918,8 +3925,8 @@ namespace vmhook
     private:
         void* object;
         vmhook::hotspot::method* method;
-        std::string signature;
-        bool        is_static;
+        std::string m_signature;
+        bool        m_is_static;
     };
 
     // --- Object base class ----------------------------------------------------
@@ -3934,6 +3941,7 @@ namespace vmhook
         created and the pointer remains valid only for the duration of the hook.
     */
     using oop_type_t = void*;
+    using oop_t = oop_type_t;
 
     /*
         @brief Base class for C++ wrappers around live Java objects.
@@ -3978,7 +3986,7 @@ namespace vmhook
         @note The wrapped pointer is a raw decoded OOP, not a JNI global reference.
               It is valid for the duration of the hook invocation only.
     */
-    class object
+    class object_base
     {
     public:
         /*
@@ -3986,23 +3994,23 @@ namespace vmhook
             @param instance Decoded OOP from frame->get_arguments<vmhook::oop_type_t>().
                             May be nullptr if the Java reference is null.
         */
-        explicit object(oop_type_t instance = nullptr) noexcept
+        explicit object_base(oop_type_t instance = nullptr) noexcept
             : instance{ instance }
         {
         }
 
-        virtual ~object() = default;
+        virtual ~object_base() = default;
 
-        object(const object&) = default;
-        auto operator=(const object&) -> object & = default;
+        object_base(const object_base&) = default;
+        auto operator=(const object_base&) -> object_base& = default;
 
-        object(object&& other) noexcept
+        object_base(object_base&& other) noexcept
             : instance{ other.instance }
         {
             other.instance = nullptr;
         }
 
-        auto operator=(object&& other) noexcept -> object&
+        auto operator=(object_base&& other) noexcept -> object_base&
         {
             if (this != &other)
             {
@@ -4154,6 +4162,13 @@ namespace vmhook
         }
     };
 
+    template<typename T>
+    class object : public object_base
+    {
+    public:
+        using object_base::object_base;
+    };
+
     // --- Helper: read a Java String OOP to std::string ------------------------
 
     /*
@@ -4243,7 +4258,11 @@ namespace vmhook
         {
             return nullptr;
         }
-        void* const a{ vmhook::hotspot::decode_oop_pointer(compressed) };
-        return (a && vmhook::hotspot::is_valid_pointer(a)) ? a : nullptr;
+        void* const ptr{ vmhook::hotspot::decode_oop_pointer(compressed) };
+        return (ptr && vmhook::hotspot::is_valid_pointer(ptr)) ? ptr : nullptr;
     }
 }
+
+#if __has_include("vmhook_fwd.hpp")
+#include "vmhook_fwd.hpp"
+#endif
