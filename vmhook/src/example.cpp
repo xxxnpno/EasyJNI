@@ -1079,7 +1079,10 @@ static auto WINAPI thread_entry(HMODULE module)
     set_prim_array<double>(*ex.get_field("staticDoubleArray"),       { 4.0, 5.0, 6.0 });
     set_prim_array<std::uint16_t>(*ex.get_field("staticCharArray"),
         { std::uint16_t{'X'}, std::uint16_t{'Y'}, std::uint16_t{'Z'} });
-    set_str_array(*ex.get_field("staticStringArray"),   { "world", "hello", "?" });
+    // Use values that are NOT original interned literals (hello/world/!) to avoid
+    // JVM string-pool corruption: if "hello"→"world" then the Java literal "world"
+    // resolves to the modified "hello" object and comparisons cross.
+    set_str_array(*ex.get_field("staticStringArray"),   { "alpha", "omega", "?" });
 
     // ── Non-static arrays – set ───────────────────────────────────────────────
     if (inst)
@@ -1100,7 +1103,7 @@ static auto WINAPI thread_entry(HMODULE module)
         set_prim_array<std::uint16_t>(*inst->get_field("notStaticCharArray"),
             { std::uint16_t{'D'}, std::uint16_t{'E'}, std::uint16_t{'F'} });
         set_str_array(*inst->get_field("notStaticStringArray"),
-            { "hi", "love", "coding" });
+            { "ab", "love", "coding" });
     }
 
     // ── C++ re-read verification ──────────────────────────────────────────────
@@ -1158,7 +1161,7 @@ static auto WINAPI thread_entry(HMODULE module)
         { std::uint16_t{'X'}, std::uint16_t{'Y'}, std::uint16_t{'Z'} });
     check_str_vec("set:staticStringArray",
         ex.get_field("staticStringArray")->get_as_string_vector(),
-        { "world", "hello", "?" });
+        { "alpha", "omega", "?" });
 
     if (inst)
     {
@@ -1188,7 +1191,7 @@ static auto WINAPI thread_entry(HMODULE module)
             { std::uint16_t{'D'}, std::uint16_t{'E'}, std::uint16_t{'F'} });
         check_str_vec("set:notStaticStringArray",
             inst->get_field("notStaticStringArray")->get_as_string_vector(),
-            { "hi", "love", "coding" });
+            { "ab", "love", "coding" });
     }
 
     // ── Summary ───────────────────────────────────────────────────────────────

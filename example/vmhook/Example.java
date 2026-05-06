@@ -137,9 +137,12 @@ public class Example
                 staticDoubleArray[0] == 4.0 && staticDoubleArray[1] == 5.0 && staticDoubleArray[2] == 6.0) & ok;
         ok = jcheck("staticCharArray",
                 staticCharArray[0] == 'X' && staticCharArray[1] == 'Y' && staticCharArray[2] == 'Z') & ok;
+        // Note: "alpha"/"omega"/"?" are used (not "world"/"hello") to avoid
+        // interning collisions — modifying "hello"->"world" and "world"->"hello"
+        // would corrupt the JVM string pool for those literals.
         ok = jcheck("staticStringArray",
-                "world".equals(staticStringArray[0]) &&
-                "hello".equals(staticStringArray[1]) &&
+                "alpha".equals(staticStringArray[0]) &&
+                "omega".equals(staticStringArray[1]) &&
                 "?".equals(staticStringArray[2])) & ok;
 
         // Non-static arrays
@@ -160,7 +163,7 @@ public class Example
         ok = jcheck("notStaticCharArray",
                 instance.notStaticCharArray[0] == 'D' && instance.notStaticCharArray[1] == 'E' && instance.notStaticCharArray[2] == 'F') & ok;
         ok = jcheck("notStaticStringArray",
-                "hi".equals(instance.notStaticStringArray[0]) &&
+                "ab".equals(instance.notStaticStringArray[0]) &&
                 "love".equals(instance.notStaticStringArray[1]) &&
                 "coding".equals(instance.notStaticStringArray[2])) & ok;
 

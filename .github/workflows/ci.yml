@@ -104,10 +104,13 @@ jobs:
           Write-Host "=== Java ${{ matrix.java-version }} unit test ==="
 
           # Start the Java example process (background).
+          # Redirect stdout so [JAVA PASS]/[JAVA FAIL] lines appear in the CI log.
           $java = Start-Process `
             -FilePath "java" `
             -ArgumentList "-cp", "out", "vmhook.Main" `
-            -PassThru -WindowStyle Hidden
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput "java_stdout.txt" `
+            -RedirectStandardError  "java_stderr.txt"
           Write-Host "Started java.exe (PID $($java.Id))"
 
           # Wait for JVM + class loading to complete.
@@ -133,6 +136,10 @@ jobs:
             exit 1
           }
           Write-Host "java.exe exited with code $($java.ExitCode)"
+
+          # Print Java process output so [JAVA PASS]/[JAVA FAIL] appear in the log.
+          if (Test-Path "java_stdout.txt") { Get-Content "java_stdout.txt" | ForEach-Object { Write-Host $_ } }
+          if (Test-Path "java_stderr.txt") { $e = Get-Content "java_stderr.txt"; if ($e) { $e | ForEach-Object { Write-Host "[java stderr]" $_ } } }
 
           # Non-zero exit code means Java-side verifySetterEffects() failed.
           if ($java.ExitCode -ne 0) {
