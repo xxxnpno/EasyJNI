@@ -27,7 +27,7 @@ jobs:
       - name: Compile injector.exe
         shell: cmd
         run: >
-          cl /nologo /std:c++23 /EHsc /MD /O2
+          cl /nologo /std:c++latest /EHsc /MD /O2
           /DNDEBUG /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DUNICODE /D_UNICODE
           /Fe"build\injector.exe"
           "injector\src\main.cpp"
@@ -39,7 +39,7 @@ jobs:
       - name: Compile vmhook.dll
         shell: cmd
         run: >
-          cl /nologo /std:c++23 /EHsc /LD /O2
+          cl /nologo /std:c++latest /EHsc /LD /O2
           /DNDEBUG /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00
           /I"vmhook\ext"
           /Fe"build\vmhook.dll"
