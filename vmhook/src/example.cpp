@@ -198,7 +198,7 @@ public:
     auto get_not_static_short()
         -> std::int16_t
     {
-        get_field("notStaticShort")->get();
+        return get_field("notStaticShort")->get();
     }
 
     auto set_not_static_short(std::int16_t value)
