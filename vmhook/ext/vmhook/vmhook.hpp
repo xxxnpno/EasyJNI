@@ -3036,11 +3036,12 @@ namespace vmhook
 
         /*
             Extract a single Java method argument from the interpreter frame, converting
-            the raw slot value to the requested C++ type T:
+            the raw slot value to the requested C++ type T.
+            Uses the public get_locals() path so it does not require friendship with frame.
               - std::string              → decoded OOP fed into read_java_string()
               - std::unique_ptr<U>       → decoded OOP fed into the registered factory for U
-              - pointer types            → decoded compressed OOP (via get_argument<T*>)
-              - primitive / trivial types → raw slot bits via get_argument<T>
+              - pointer types            → decoded compressed OOP
+              - primitive / trivial types → raw slot bits via memcpy
         */
         template<typename T>
         auto extract_frame_arg(vmhook::hotspot::frame* const frame, const std::int32_t index)
@@ -3048,15 +3049,33 @@ namespace vmhook
         {
             using base_t = std::remove_cvref_t<T>;
 
+            void** const locals{ frame->get_locals() };
+            if (!locals)
+            {
+                return base_t{};
+            }
+
+            void* const raw_value{ locals[-index] };
+            const std::uintptr_t raw_bits{ reinterpret_cast<std::uintptr_t>(raw_value) };
+
+            // Decode a compressed OOP (32-bit narrow value) to a full 64-bit pointer.
+            auto decode_oop = [](void* rv) -> void*
+            {
+                if (!rv) return nullptr;
+                const std::uintptr_t bits{ reinterpret_cast<std::uintptr_t>(rv) };
+                return (bits <= 0xFFFFFFFFull)
+                    ? vmhook::hotspot::decode_oop_pointer(static_cast<std::uint32_t>(bits))
+                    : rv;
+            };
+
             if constexpr (std::is_same_v<base_t, std::string>)
             {
-                void* const oop{ frame->get_argument<void*>(index) };
-                return vmhook::read_java_string(oop);
+                return vmhook::read_java_string(decode_oop(raw_value));
             }
             else if constexpr (is_unique_ptr_v<base_t>)
             {
                 using element_t = typename base_t::element_type;
-                void* const oop{ frame->get_argument<void*>(index) };
+                void* const oop{ decode_oop(raw_value) };
                 if (!oop)
                 {
                     return nullptr;
@@ -3073,9 +3092,19 @@ namespace vmhook
                 }
                 return base_t{ static_cast<element_t*>(factory_it->second(oop).release()) };
             }
+            else if constexpr (std::is_pointer_v<base_t>)
+            {
+                return reinterpret_cast<base_t>(decode_oop(raw_value));
+            }
+            else if constexpr (sizeof(base_t) <= sizeof(void*))
+            {
+                base_t result{};
+                std::memcpy(&result, &raw_value, sizeof(base_t));
+                return result;
+            }
             else
             {
-                return frame->get_argument<base_t>(index);
+                return base_t{};
             }
         }
     } // namespace detail
