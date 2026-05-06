@@ -103,12 +103,15 @@ auto set_flags(const std::vector<bool>& value)
 
 ## Static Fields
 
-Static Java fields can be exposed as static C++ methods. Use `get_static_field(...)` inside static C++ getters and setters:
+Static Java fields use the same `get_field(...)` API. Expose them as static
+C++ methods, then call `get_field(...)` through a default-constructed wrapper:
 
 ```cpp
 class example_class : public vmhook::object<example_class>
 {
 public:
+    example_class() = default;
+
     explicit example_class(vmhook::oop_t instance)
         : vmhook::object<example_class>{ instance }
     {
@@ -118,18 +121,20 @@ public:
     static auto get_static_double()
         -> double
     {
-        return get_static_field("staticDouble")->get();
+        return example_class{}.get_field("staticDouble")->get();
     }
 
     static auto set_static_double(double value)
         -> void
     {
-        get_static_field("staticDouble")->set(value);
+        example_class{}.get_field("staticDouble")->set(value);
     }
 };
 ```
 
-Use it without constructing a dummy object:
+The temporary wrapper has a null Java object pointer. That is fine for static
+fields because vmhook resolves them through the registered Java class metadata
+and reads/writes the `java.lang.Class` mirror.
 
 ```cpp
 example_class::set_static_double(2.0);
@@ -155,16 +160,74 @@ auto add_score(std::int32_t amount, const std::string& reason)
 }
 ```
 
-Static Java methods can be exposed as static C++ methods with `get_static_method(...)`:
+Static Java methods use the same `get_method(...)` API:
 
 ```cpp
 
 static auto static_call_me(std::int32_t value)
     -> void
 {
-    get_static_method("staticCallMe")->call(value);
+    example_class{}.get_method("staticCallMe")->call(value);
 }
 ```
+
+For instance methods, call through `this`:
+
+```cpp
+auto non_static_call_me(std::int32_t value)
+    -> void
+{
+    this->get_method("nonStaticCallMe")->call(value);
+}
+```
+
+## Hooks
+
+Hooks receive `vmhook::return_value&` first, followed by the decoded Java
+arguments. Instance methods receive the wrapped `this` object as the first Java
+argument:
+
+```cpp
+vmhook::hook<example_class>("nonStaticCallMe",
+    [](vmhook::return_value& return_value, const std::unique_ptr<example_class>& self, std::int32_t value)
+    {
+        // Leave return_value untouched to let the original Java method run.
+    });
+```
+
+To skip the original method body, set or cancel the return slot:
+
+```cpp
+vmhook::hook<example_class>("nonStaticReturnMe",
+    [](vmhook::return_value& return_value, const std::unique_ptr<example_class>& self, std::int32_t value)
+    {
+        return_value.set(static_cast<std::int32_t>(12345));
+    });
+
+vmhook::hook<example_class>("nonStaticVoidMethod",
+    [](vmhook::return_value& return_value, const std::unique_ptr<example_class>& self)
+    {
+        return_value.cancel();
+    });
+```
+
+Static method hooks omit the wrapper argument:
+
+```cpp
+vmhook::hook<example_class>("staticReturnMe",
+    [](vmhook::return_value& return_value, std::int32_t value)
+    {
+        return_value.set(static_cast<std::int32_t>(24680));
+    });
+```
+
+## Object Construction
+
+`vmhook::make_unique<T>(arg1, arg2, ...)` is present in the public header, but
+VM-side allocation and constructor dispatch are not implemented yet. The current
+behavior is to return `nullptr` after resolving the registered class. The example
+unit tests cover that status explicitly so it is not mistaken for working Java
+object construction.
 
 ## Example
 
@@ -176,6 +239,11 @@ The complete example lives in `vmhook/src/example.cpp`. It demonstrates:
 - `get()` for all supported field reads
 - `set(...)` for all supported field writes
 - `get_method("...")->call(...)` for method calls
+- method hooks that observe arguments and allow the original method
+- method hooks that force a return value
+- method hooks that cancel a void method
+- static method hooks
+- current `vmhook::make_unique<T>(...)` behavior
 - a GitHub Actions test harness that writes `test_results.txt`
 
 ## Notes

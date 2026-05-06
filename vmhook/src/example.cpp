@@ -10,12 +10,27 @@
 
 /*
     These wrapper classes are the public example surface.
-    Each Java field or method has one C++ function that hides the lower-level
-    vmhook proxy objects from the rest of the example.
+    The rest of this file uses these C++ methods instead of raw field names,
+    raw method names, or lower-level vmhook helpers.
+
+    Field pattern:
+        - instance field: this->get_field("javaField")->get()
+        - static field:  wrapper_class{}.get_field("javaField")->get()
+        - setter:        get_field(...)->set(value)
+
+    Method pattern:
+        - instance method: this->get_method("javaMethod")->call(args...)
+        - static method:  wrapper_class{}.get_method("javaMethod")->call(args...)
+
+    A default-constructed wrapper has a null object pointer. That is valid for
+    static fields and static methods because vmhook resolves those through the
+    registered Java class metadata, not through an instance.
 */
 class main_class : public vmhook::object<main_class>
 {
 public:
+    main_class() = default;
+
     explicit main_class(vmhook::oop_t instance)
         : vmhook::object<main_class>{ instance }
     {
@@ -25,19 +40,21 @@ public:
     static auto get_stop_jvm()
         -> bool
     {
-        return get_static_field("stopJVM")->get();
+        return main_class{}.get_field("stopJVM")->get();
     }
 
     static auto set_stop_jvm(bool value)
         -> void
     {
-        get_static_field("stopJVM")->set(value);
+        main_class{}.get_field("stopJVM")->set(value);
     }
 };
 
 class example_class : public vmhook::object<example_class>
 {
 public:
+    example_class() = default;
+
     explicit example_class(vmhook::oop_t instance)
         : vmhook::object<example_class>{ instance }
     {
@@ -48,109 +65,109 @@ public:
     static auto get_static_bool()
         -> bool
     {
-        return get_static_field("staticBool")->get();
+        return example_class{}.get_field("staticBool")->get();
     }
 
     static auto set_static_bool(bool value)
         -> void
     {
-        get_static_field("staticBool")->set(value);
+        example_class{}.get_field("staticBool")->set(value);
     }
 
     static auto get_static_byte()
         -> std::byte
     {
-        return get_static_field("staticByte")->get();
+        return example_class{}.get_field("staticByte")->get();
     }
 
     static auto set_static_byte(std::byte value)
         -> void
     {
-        get_static_field("staticByte")->set(value);
+        example_class{}.get_field("staticByte")->set(value);
     }
 
     static auto get_static_short()
         -> std::int16_t
     {
-        return get_static_field("staticShort")->get();
+        return example_class{}.get_field("staticShort")->get();
     }
 
     static auto set_static_short(std::int16_t value)
         -> void
     {
-        get_static_field("staticShort")->set(value);
+        example_class{}.get_field("staticShort")->set(value);
     }
 
     static auto get_static_int()
         -> std::int32_t
     {
-        return get_static_field("staticInt")->get();
+        return example_class{}.get_field("staticInt")->get();
     }
 
     static auto set_static_int(std::int32_t value)
         -> void
     {
-        get_static_field("staticInt")->set(value);
+        example_class{}.get_field("staticInt")->set(value);
     }
 
     static auto get_static_long()
         -> std::int64_t
     {
-        return get_static_field("staticLong")->get();
+        return example_class{}.get_field("staticLong")->get();
     }
 
     static auto set_static_long(std::int64_t value)
         -> void
     {
-        get_static_field("staticLong")->set(value);
+        example_class{}.get_field("staticLong")->set(value);
     }
 
     static auto get_static_float()
         -> float
     {
-        return get_static_field("staticFloat")->get();
+        return example_class{}.get_field("staticFloat")->get();
     }
 
     static auto set_static_float(float value)
         -> void
     {
-        get_static_field("staticFloat")->set(value);
+        example_class{}.get_field("staticFloat")->set(value);
     }
 
     static auto get_static_double()
         -> double
     {
-        return get_static_field("staticDouble")->get();
+        return example_class{}.get_field("staticDouble")->get();
     }
 
     static auto set_static_double(double value)
         -> void
     {
-        get_static_field("staticDouble")->set(value);
+        example_class{}.get_field("staticDouble")->set(value);
     }
 
     static auto get_static_char()
         -> char
     {
-        return get_static_field("staticChar")->get();
+        return example_class{}.get_field("staticChar")->get();
     }
 
     static auto set_static_char(char value)
         -> void
     {
-        get_static_field("staticChar")->set(value);
+        example_class{}.get_field("staticChar")->set(value);
     }
 
     static auto get_static_string()
         -> std::string
     {
-        return get_static_field("staticString")->get();
+        return example_class{}.get_field("staticString")->get();
     }
 
     static auto set_static_string(const std::string& value)
         -> void
     {
-        get_static_field("staticString")->set(value);
+        example_class{}.get_field("staticString")->set(value);
     }
 
     auto get_not_static_bool()
@@ -264,109 +281,109 @@ public:
     static auto get_static_bool_array()
         -> std::vector<bool>
     {
-        return get_static_field("staticBoolArray")->get();
+        return example_class{}.get_field("staticBoolArray")->get();
     }
 
     static auto set_static_bool_array(const std::vector<bool>& value)
         -> void
     {
-        get_static_field("staticBoolArray")->set(value);
+        example_class{}.get_field("staticBoolArray")->set(value);
     }
 
     static auto get_static_byte_array()
         -> std::vector<std::byte>
     {
-        return get_static_field("staticByteArray")->get();
+        return example_class{}.get_field("staticByteArray")->get();
     }
 
     static auto set_static_byte_array(const std::vector<std::byte>& value)
         -> void
     {
-        get_static_field("staticByteArray")->set(value);
+        example_class{}.get_field("staticByteArray")->set(value);
     }
 
     static auto get_static_short_array()
         -> std::vector<std::int16_t>
     {
-        return get_static_field("staticShortArray")->get();
+        return example_class{}.get_field("staticShortArray")->get();
     }
 
     static auto set_static_short_array(const std::vector<std::int16_t>& value)
         -> void
     {
-        get_static_field("staticShortArray")->set(value);
+        example_class{}.get_field("staticShortArray")->set(value);
     }
 
     static auto get_static_int_array()
         -> std::vector<std::int32_t>
     {
-        return get_static_field("staticIntArray")->get();
+        return example_class{}.get_field("staticIntArray")->get();
     }
 
     static auto set_static_int_array(const std::vector<std::int32_t>& value)
         -> void
     {
-        get_static_field("staticIntArray")->set(value);
+        example_class{}.get_field("staticIntArray")->set(value);
     }
 
     static auto get_static_long_array()
         -> std::vector<std::int64_t>
     {
-        return get_static_field("staticLongArray")->get();
+        return example_class{}.get_field("staticLongArray")->get();
     }
 
     static auto set_static_long_array(const std::vector<std::int64_t>& value)
         -> void
     {
-        get_static_field("staticLongArray")->set(value);
+        example_class{}.get_field("staticLongArray")->set(value);
     }
 
     static auto get_static_float_array()
         -> std::vector<float>
     {
-        return get_static_field("staticFloatArray")->get();
+        return example_class{}.get_field("staticFloatArray")->get();
     }
 
     static auto set_static_float_array(const std::vector<float>& value)
         -> void
     {
-        get_static_field("staticFloatArray")->set(value);
+        example_class{}.get_field("staticFloatArray")->set(value);
     }
 
     static auto get_static_double_array()
         -> std::vector<double>
     {
-        return get_static_field("staticDoubleArray")->get();
+        return example_class{}.get_field("staticDoubleArray")->get();
     }
 
     static auto set_static_double_array(const std::vector<double>& value)
         -> void
     {
-        get_static_field("staticDoubleArray")->set(value);
+        example_class{}.get_field("staticDoubleArray")->set(value);
     }
 
     static auto get_static_char_array()
         -> std::vector<char>
     {
-        return get_static_field("staticCharArray")->get();
+        return example_class{}.get_field("staticCharArray")->get();
     }
 
     static auto set_static_char_array(const std::vector<char>& value)
         -> void
     {
-        get_static_field("staticCharArray")->set(value);
+        example_class{}.get_field("staticCharArray")->set(value);
     }
 
     static auto get_static_string_array()
         -> std::vector<std::string>
     {
-        return get_static_field("staticStringArray")->get();
+        return example_class{}.get_field("staticStringArray")->get();
     }
 
     static auto set_static_string_array(const std::vector<std::string>& value)
         -> void
     {
-        get_static_field("staticStringArray")->set(value);
+        example_class{}.get_field("staticStringArray")->set(value);
     }
 
     auto get_not_static_bool_array()
@@ -480,85 +497,145 @@ public:
     static auto get_instance()
         -> std::unique_ptr<example_class>
     {
-        return get_static_field("instance")->get();
+        return example_class{}.get_field("instance")->get();
     }
 
     static auto set_instance(const std::unique_ptr<example_class>& value)
         -> void
     {
-        get_static_field("instance")->set(value);
+        example_class{}.get_field("instance")->set(value);
     }
 
     static auto get_static_called()
         -> std::int32_t
     {
-        return get_static_field("staticCalled")->get();
+        return example_class{}.get_field("staticCalled")->get();
     }
 
     static auto set_static_called(std::int32_t value)
         -> void
     {
-        get_static_field("staticCalled")->set(value);
+        example_class{}.get_field("staticCalled")->set(value);
     }
 
     static auto get_hook_probe_requested()
         -> bool
     {
-        return get_static_field("hookProbeRequested")->get();
+        return example_class{}.get_field("hookProbeRequested")->get();
     }
 
     static auto set_hook_probe_requested(bool value)
         -> void
     {
-        get_static_field("hookProbeRequested")->set(value);
+        example_class{}.get_field("hookProbeRequested")->set(value);
     }
 
     static auto get_hook_probe_done()
         -> bool
     {
-        return get_static_field("hookProbeDone")->get();
+        return example_class{}.get_field("hookProbeDone")->get();
     }
 
     static auto set_hook_probe_done(bool value)
         -> void
     {
-        get_static_field("hookProbeDone")->set(value);
+        example_class{}.get_field("hookProbeDone")->set(value);
     }
 
     static auto get_force_return_probe_requested()
         -> bool
     {
-        return get_static_field("forceReturnProbeRequested")->get();
+        return example_class{}.get_field("forceReturnProbeRequested")->get();
     }
 
     static auto set_force_return_probe_requested(bool value)
         -> void
     {
-        get_static_field("forceReturnProbeRequested")->set(value);
+        example_class{}.get_field("forceReturnProbeRequested")->set(value);
     }
 
     static auto get_force_return_probe_done()
         -> bool
     {
-        return get_static_field("forceReturnProbeDone")->get();
+        return example_class{}.get_field("forceReturnProbeDone")->get();
     }
 
     static auto set_force_return_probe_done(bool value)
         -> void
     {
-        get_static_field("forceReturnProbeDone")->set(value);
+        example_class{}.get_field("forceReturnProbeDone")->set(value);
     }
 
     static auto get_force_return_probe_value()
         -> std::int32_t
     {
-        return get_static_field("forceReturnProbeValue")->get();
+        return example_class{}.get_field("forceReturnProbeValue")->get();
     }
 
     static auto set_force_return_probe_value(std::int32_t value)
         -> void
     {
-        get_static_field("forceReturnProbeValue")->set(value);
+        example_class{}.get_field("forceReturnProbeValue")->set(value);
+    }
+
+    static auto get_cancel_probe_requested()
+        -> bool
+    {
+        return example_class{}.get_field("cancelProbeRequested")->get();
+    }
+
+    static auto set_cancel_probe_requested(bool value)
+        -> void
+    {
+        example_class{}.get_field("cancelProbeRequested")->set(value);
+    }
+
+    static auto get_cancel_probe_done()
+        -> bool
+    {
+        return example_class{}.get_field("cancelProbeDone")->get();
+    }
+
+    static auto set_cancel_probe_done(bool value)
+        -> void
+    {
+        example_class{}.get_field("cancelProbeDone")->set(value);
+    }
+
+    static auto get_static_force_return_probe_requested()
+        -> bool
+    {
+        return example_class{}.get_field("staticForceReturnProbeRequested")->get();
+    }
+
+    static auto set_static_force_return_probe_requested(bool value)
+        -> void
+    {
+        example_class{}.get_field("staticForceReturnProbeRequested")->set(value);
+    }
+
+    static auto get_static_force_return_probe_done()
+        -> bool
+    {
+        return example_class{}.get_field("staticForceReturnProbeDone")->get();
+    }
+
+    static auto set_static_force_return_probe_done(bool value)
+        -> void
+    {
+        example_class{}.get_field("staticForceReturnProbeDone")->set(value);
+    }
+
+    static auto get_static_force_return_probe_value()
+        -> std::int32_t
+    {
+        return example_class{}.get_field("staticForceReturnProbeValue")->get();
+    }
+
+    static auto set_static_force_return_probe_value(std::int32_t value)
+        -> void
+    {
+        example_class{}.get_field("staticForceReturnProbeValue")->set(value);
     }
 
     auto get_non_static_called()
@@ -573,12 +650,24 @@ public:
         this->get_field("nonStaticCalled")->set(value);
     }
 
+    auto get_cancel_called()
+        -> std::int32_t
+    {
+        return this->get_field("cancelCalled")->get();
+    }
+
+    auto set_cancel_called(std::int32_t value)
+        -> void
+    {
+        this->get_field("cancelCalled")->set(value);
+    }
+
     static auto static_call_me(std::int32_t value)
         -> void
     {
         const std::int32_t before_call_count{ get_static_called() };
 
-        get_static_method("staticCallMe")->call(value);
+        example_class{}.get_method("staticCallMe")->call(value);
 
         if (get_static_called() == before_call_count)
         {
@@ -609,6 +698,8 @@ public:
 class a_class : public vmhook::object<a_class>
 {
 public:
+    a_class() = default;
+
     explicit a_class(vmhook::oop_t instance)
         : vmhook::object<a_class>{ instance }
     {
@@ -667,6 +758,11 @@ namespace
     std::atomic_int force_return_hook_call_count{};
     std::atomic_bool force_return_saw_instance{};
     std::atomic_bool force_return_saw_expected_argument{};
+    std::atomic_int cancel_hook_call_count{};
+    std::atomic_bool cancel_saw_instance{};
+    std::atomic_bool cancel_saw_expected_argument{};
+    std::atomic_int static_force_return_hook_call_count{};
+    std::atomic_bool static_force_return_saw_expected_argument{};
 
 
     auto write_result(const std::string& line)
@@ -736,8 +832,10 @@ namespace
         -> void
     {
         /*
-            Static Java fields are accessed as C++ static methods. Instance Java
-            fields are accessed through the wrapper returned by get_instance().
+            Static Java fields are exposed as C++ static methods. Those static
+            methods still use get_field(...)->set(value) internally; they just
+            call it through a default-constructed wrapper because no Java object
+            instance is needed for static storage.
         */
         example_class::set_static_bool(false);
         example_class::set_static_byte(std::byte{ 7 });
@@ -956,6 +1054,127 @@ namespace
 
         vmhook::shutdown_hooks();
     }
+
+    auto test_method_cancel(example_class& instance)
+        -> void
+    {
+        /*
+            This validates void-method cancellation. The Java method increments
+            cancelCalled by 9. retval.cancel() should skip that body, so the field
+            must remain zero while the detour still observes the call arguments.
+        */
+        cancel_hook_call_count.store(0);
+        cancel_saw_instance.store(false);
+        cancel_saw_expected_argument.store(false);
+
+        instance.set_cancel_called(0);
+        example_class::set_cancel_probe_done(false);
+        example_class::set_cancel_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticCancelMe",
+            [](vmhook::return_value& retval, const std::unique_ptr<example_class>& self, std::int32_t value)
+            {
+                ++cancel_hook_call_count;
+                cancel_saw_instance.store(self != nullptr);
+                cancel_saw_expected_argument.store(value == 9);
+                retval.cancel();
+            }) };
+        check("cancelHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        example_class::set_cancel_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+
+        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
+        {
+            if (example_class::get_cancel_probe_done())
+            {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+
+        example_class::set_cancel_probe_requested(false);
+
+        check("cancelProbeDone", example_class::get_cancel_probe_done());
+        check_equal("cancelHookCallCount", cancel_hook_call_count.load(), 1);
+        check("cancelSawInstance", cancel_saw_instance.load());
+        check("cancelSawExpectedArgument", cancel_saw_expected_argument.load());
+        check_equal("cancelSkippedOriginalMethod", instance.get_cancel_called(), static_cast<std::int32_t>(0));
+
+        vmhook::shutdown_hooks();
+    }
+
+    auto test_static_method_force_return()
+        -> void
+    {
+        /*
+            Static hooks use the same hook API but have no wrapper 'self'
+            argument. The Java method normally returns value + 2; 24680 confirms
+            the native return slot replaced the Java result.
+        */
+        static_force_return_hook_call_count.store(0);
+        static_force_return_saw_expected_argument.store(false);
+
+        example_class::set_static_force_return_probe_value(0);
+        example_class::set_static_force_return_probe_done(false);
+        example_class::set_static_force_return_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("staticReturnMe",
+            [](vmhook::return_value& retval, std::int32_t value)
+            {
+                ++static_force_return_hook_call_count;
+                static_force_return_saw_expected_argument.store(value == 77);
+                retval.set(static_cast<std::int32_t>(24680));
+            }) };
+        check("staticForceReturnHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        example_class::set_static_force_return_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+
+        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
+        {
+            if (example_class::get_static_force_return_probe_done())
+            {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+
+        example_class::set_static_force_return_probe_requested(false);
+
+        check("staticForceReturnProbeDone", example_class::get_static_force_return_probe_done());
+        check_equal("staticForceReturnHookCallCount", static_force_return_hook_call_count.load(), 1);
+        check("staticForceReturnSawExpectedArgument", static_force_return_saw_expected_argument.load());
+        check_equal("staticForceReturnValue", example_class::get_static_force_return_probe_value(), static_cast<std::int32_t>(24680));
+
+        vmhook::shutdown_hooks();
+    }
+
+    auto test_make_unique_status()
+        -> void
+    {
+        /*
+            vmhook::make_unique<T>(...) currently resolves the registered Java
+            class but returns nullptr because VM-side allocation and constructor
+            dispatch are not implemented yet. This unit test documents that
+            current behavior so the README does not promise construction support.
+        */
+        check("makeUniqueNotImplemented", !vmhook::make_unique<a_class>());
+    }
 }
 
 static auto WINAPI thread_entry(HMODULE module)
@@ -976,6 +1195,9 @@ static auto WINAPI thread_entry(HMODULE module)
         call_example_methods(*instance);
         test_method_hook(*instance);
         test_method_force_return();
+        test_method_cancel(*instance);
+        test_static_method_force_return();
+        test_make_unique_status();
         set_expected_values(*instance);
         verify_expected_values(*instance);
     }

@@ -38,6 +38,18 @@ public class Main
                 Example.forceReturnProbeDone = true;
             }
 
+            if (Example.cancelProbeRequested && !Example.cancelProbeDone)
+            {
+                Example.instance.nonStaticCancelMe(9);
+                Example.cancelProbeDone = true;
+            }
+
+            if (Example.staticForceReturnProbeRequested && !Example.staticForceReturnProbeDone)
+            {
+                Example.staticForceReturnProbeValue = Example.staticReturnMe(77);
+                Example.staticForceReturnProbeDone = true;
+            }
+
             Thread.sleep(1);
         }
 

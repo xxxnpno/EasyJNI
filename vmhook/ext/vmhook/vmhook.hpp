@@ -16,14 +16,14 @@
         - jvm.dll loaded in the current process with gHotSpotVMStructs exported
 
     Thread safety:
-        - read-only operations (find_class, find_field, get_field, get_static_field)
+        - read-only operations (find_class, find_field, get_field)
           are NOT thread-safe; the caller must synchronise access.
         - hook installation and shutdown_hooks() MUST be called from a single thread.
         - The internal caches (klass_lookup_cache, g_field_cache, type_to_class_map)
           use std::unordered_map which is NOT thread-safe for concurrent mutation.
 
     Template requirements:
-        - get_field<T>, set_field<T>, get_static_field<T>, set_static_field<T>:
+        - get_field<T>, set_field<T>:
           T must be std::is_trivially_copyable_v<T> == true.
         - register_class<T>: T must be a complete class type with a virtual table
           (typeid(*this) is used to resolve the class name).
@@ -3554,21 +3554,29 @@ namespace vmhook
 
         try
         {
-            if (!object || !vmhook::hotspot::is_valid_pointer(object))
-            {
-                throw vmhook::exception{ "Object pointer is null or invalid." };
-            }
-
             const auto entry{ vmhook::find_field(target_klass, name) };
 
             if (!entry)
             {
-                throw vmhook::exception{ std::format("Instance field '{}' not found.", name) };
+                throw vmhook::exception{ std::format("Field '{}' not found.", name) };
             }
 
             if (entry->is_static)
             {
-                throw vmhook::exception{ std::format("'{}' is a static field; use vmhook::get_static_field<T>().", name) };
+                void* const mirror{ target_klass->get_java_mirror() };
+                if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
+                {
+                    throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
+                }
+
+                value_type result{};
+                std::memcpy(&result, reinterpret_cast<const std::uint8_t*>(mirror) + entry->offset, sizeof(value_type));
+                return result;
+            }
+
+            if (!object || !vmhook::hotspot::is_valid_pointer(object))
+            {
+                throw vmhook::exception{ "Object pointer is null or invalid." };
             }
 
             value_type result{};
@@ -3600,21 +3608,28 @@ namespace vmhook
 
         try
         {
-            if (!object || !vmhook::hotspot::is_valid_pointer(object))
-            {
-                throw vmhook::exception{ "Object pointer is null or invalid." };
-            }
-
             const auto entry{ vmhook::find_field(target_klass, name) };
 
             if (!entry)
             {
-                throw vmhook::exception{ std::format("Instance field '{}' not found.", name) };
+                throw vmhook::exception{ std::format("Field '{}' not found.", name) };
             }
 
             if (entry->is_static)
             {
-                throw vmhook::exception{ std::format("'{}' is a static field; use set_static_field().", name) };
+                void* const mirror{ target_klass->get_java_mirror() };
+                if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
+                {
+                    throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
+                }
+
+                std::memcpy(reinterpret_cast<std::uint8_t*>(mirror) + entry->offset, &value, sizeof(value_type));
+                return;
+            }
+
+            if (!object || !vmhook::hotspot::is_valid_pointer(object))
+            {
+                throw vmhook::exception{ "Object pointer is null or invalid." };
             }
 
             std::memcpy(reinterpret_cast<std::uint8_t*>(object) + entry->offset, &value, sizeof(value_type));
@@ -3622,97 +3637,6 @@ namespace vmhook
         catch (const std::exception& exception)
         {
             std::println("{} vmhook::set_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
-        }
-    }
-
-    /*
-        @brief Reads a static field from the java.lang.Class mirror of a klass.
-        @tparam T    The C++ scalar type to read the field as.
-        @param k     The klass that declares the static field.
-        @param name  The exact Java field name.
-        @return The field value as T, or a default-constructed T on failure.
-        @details
-        Static field values live inside the java.lang.Class mirror object at the
-        byte offset stored in InstanceKlass._fields. The mirror is obtained via
-        Klass::_java_mirror (an OopHandle - JDK 17+).
-    */
-        template<typename value_type>
-        static auto get_static_field(vmhook::hotspot::klass* const target_klass, const std::string_view name) 
-            -> value_type
-        {
-            static_assert(std::is_trivially_copyable_v<value_type>, "get_static_field<value_type>: value_type must be trivially copyable.");
-
-        try
-        {
-            const auto entry{ vmhook::find_field(target_klass, name) };
-
-            if (!entry)
-            {
-                throw vmhook::exception{ std::format("Static field '{}' not found.", name) };
-            }
-
-            if (!entry->is_static)
-            {
-                throw vmhook::exception{ std::format("'{}' is an instance field; use get_field().", name) };
-            }
-
-            void* const mirror{ target_klass->get_java_mirror() };
-
-            if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
-            {
-                throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
-            }
-
-            value_type result{};
-            std::memcpy(&result, reinterpret_cast<const std::uint8_t*>(mirror) + entry->offset, sizeof(value_type));
-            return result;
-        }
-        catch (const std::exception& exception)
-        {
-            std::println("{} vmhook::get_static_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
-            return value_type{};
-        }
-    }
-
-    /*
-        @brief Writes a value to a static field in the java.lang.Class mirror of a klass.
-        @tparam T    The C++ scalar type to write.
-        @param k     The klass that declares the static field.
-        @param name  The exact Java field name.
-        @param value The value to write.
-    */
-        template<typename value_type>
-        static auto set_static_field(vmhook::hotspot::klass* const target_klass, const std::string_view name, const value_type value) 
-            -> void
-        {
-            static_assert(std::is_trivially_copyable_v<value_type>, "set_static_field<value_type>: value_type must be trivially copyable.");
-
-        try
-        {
-            const auto entry{ vmhook::find_field(target_klass, name) };
-
-            if (!entry)
-            {
-                throw vmhook::exception{ std::format("Static field '{}' not found.", name) };
-            }
-
-            if (!entry->is_static)
-            {
-                throw vmhook::exception{ std::format("'{}' is an instance field; use set_field().", name) };
-            }
-
-            void* const mirror{ target_klass->get_java_mirror() };
-
-            if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
-            {
-                throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
-            }
-
-            std::memcpy(reinterpret_cast<std::uint8_t*>(mirror) + entry->offset, &value, sizeof(value_type));
-        }
-        catch (const std::exception& exception)
-        {
-            std::println("{} vmhook::set_static_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
         }
     }
 
@@ -4363,7 +4287,7 @@ namespace vmhook
         Derive from this class to create a typed façade for a Java class.
         get_field() handles both instance and static fields automatically -
         the library reads JVM_ACC_STATIC from the InstanceKlass._fields array
-        so there is no need for a separate get_static_field().
+        so there is no separate static-field accessor.
 
         Example:
 
@@ -4381,8 +4305,9 @@ namespace vmhook
                 // Cast inside the method if you want a concrete return type
                 auto get_timeout()  -> int { return static_cast<int>(get_field("timeout")->get()); }
 
-                // Static field - get_field detects JVM_ACC_STATIC automatically
-                auto get_version()  -> std::string { return get_field("VERSION")->get(); }
+                // Static field - construct a wrapper with no instance.
+                // get_field detects JVM_ACC_STATIC automatically.
+                static auto get_version() -> std::string { return http_client{}.get_field("VERSION")->get(); }
 
                 // Writing a field
                 auto set_health(int hp) -> void { get_field("health")->set(hp); }
@@ -4585,105 +4510,6 @@ namespace vmhook
     {
     public:
         using object_base::object_base;
-
-        /*
-            @brief Returns a field proxy for a static field declared on this class.
-            @param name Exact Java static field name.
-            @return Optional holding the field proxy, or nullopt on failure.
-            @details
-            This lets wrapper classes expose truly static C++ getters/setters for
-            Java static fields without constructing a dummy wrapper instance.
-        */
-        static auto get_static_field(const std::string_view name)
-            -> std::optional<vmhook::field_proxy>
-        {
-            const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(derived) }) };
-            if (type_map_entry == vmhook::type_to_class_map.end())
-            {
-                std::println("{} object::get_static_field() type '{}' not registered via register_class<T>().", vmhook::error_tag, typeid(derived).name());
-                return std::nullopt;
-            }
-
-            vmhook::hotspot::klass* const resolved_klass{ vmhook::find_class(type_map_entry->second) };
-            if (!resolved_klass)
-            {
-                std::println("{} object::get_static_field() class '{}' not found in JVM.", vmhook::error_tag, type_map_entry->second);
-                return std::nullopt;
-            }
-
-            const auto entry{ vmhook::find_field(resolved_klass, name) };
-            if (!entry)
-            {
-                return std::nullopt;
-            }
-
-            if (!entry->is_static)
-            {
-                std::println("{} object::get_static_field('{}') is not a static field.", vmhook::error_tag, name);
-                return std::nullopt;
-            }
-
-            void* const mirror{ resolved_klass->get_java_mirror() };
-            if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
-            {
-                std::println("{} object::get_static_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
-                return std::nullopt;
-            }
-
-            void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-            return vmhook::field_proxy{ field_pointer, entry->signature, true };
-        }
-
-        /*
-            @brief Returns a method proxy for a static method declared on this class.
-            @param method_name Exact Java static method name.
-            @return Optional holding the method proxy, or nullopt on failure.
-            @details
-            This mirrors get_static_field() for static Java methods so wrapper
-            classes can expose class-level methods with:
-
-                get_method("methodName")->call(arg1, arg2, arg3);
-
-            Complexity: O(M) time where M is the number of declared methods.
-            Exception safety: does not throw.
-            Thread safety: not thread-safe.
-        */
-        static auto get_static_method(const std::string_view method_name)
-            -> std::optional<vmhook::method_proxy>
-        {
-            const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(derived) }) };
-            if (type_map_entry == vmhook::type_to_class_map.end())
-            {
-                std::println("{} object::get_static_method() type '{}' not registered via register_class<T>().", vmhook::error_tag, typeid(derived).name());
-                return std::nullopt;
-            }
-
-            vmhook::hotspot::klass* const resolved_klass{ vmhook::find_class(type_map_entry->second) };
-            if (!resolved_klass)
-            {
-                std::println("{} object::get_static_method() class '{}' not found in JVM.", vmhook::error_tag, type_map_entry->second);
-                return std::nullopt;
-            }
-
-            const std::int32_t method_count{ resolved_klass->get_methods_count() };
-            vmhook::hotspot::method** const methods_array{ resolved_klass->get_methods_ptr() };
-
-            if (!methods_array || method_count <= 0)
-            {
-                return std::nullopt;
-            }
-
-            for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
-            {
-                vmhook::hotspot::method* const current_method{ methods_array[method_index] };
-                if (current_method && vmhook::hotspot::is_valid_pointer(current_method) && current_method->get_name() == method_name)
-                {
-                    return vmhook::method_proxy{ nullptr, current_method, current_method->get_signature() };
-                }
-            }
-
-            return std::nullopt;
-        }
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
