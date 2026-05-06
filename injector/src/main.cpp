@@ -1,8 +1,19 @@
 #include <print>
 #include <filesystem>
+#include <string>
 
 #include <windows.h>
 #include <tlhelp32.h>
+
+// std::println has no formatter<wchar_t> for narrow output; convert manually.
+static auto wstr_to_str(const std::wstring& ws)
+    -> std::string
+{
+    std::string result{};
+    result.reserve(ws.size());
+    for (const wchar_t c : ws) result += static_cast<char>(c);
+    return result;
+}
 
 static auto resolve_dll_path() 
     -> std::wstring
@@ -126,7 +137,7 @@ auto main(std::int32_t argc, char** argv)
 {
     const std::wstring dll_path{ resolve_dll_path() };
 
-	std::println("[INFO] dll_path : {}.", dll_path);
+    std::println("[INFO] dll_path : {}.", wstr_to_str(dll_path));
 
     if (!std::filesystem::exists(dll_path))
     {
