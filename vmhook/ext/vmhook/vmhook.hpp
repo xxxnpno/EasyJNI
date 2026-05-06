@@ -2644,7 +2644,7 @@ namespace vmhook
             midi2i_hook patches the i2i interpreter stub of a Java method at the injection
             point found by find_hook_location() with a 5-byte relative JMP instruction that
             redirects execution to an allocated trampoline stub. The trampoline saves all
-            volatile registers, calls common_detour with (frame*, java_thread*, bool*), and
+            volatile registers, calls common_detour with (frame*, java_thread*, return_slot*), and
             then either returns the custom value or resumes normal execution depending on
             whether the detour set the cancel flag.
 
@@ -2668,17 +2668,17 @@ namespace vmhook
             {
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
                 static constexpr std::int32_t JMP_SIZE{ 5 };
-                static constexpr std::int32_t JE_OFFSET{ 0x40 };   // offset of je in assembly
+                static constexpr std::int32_t JE_OFFSET{ 0x32 };   // offset of je in assembly
                 static constexpr std::int32_t JE_SIZE{ 6 };
-                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x5C }; // offset of data slot
+                static constexpr std::int32_t RESUME_OFFSET{ 0x63 };
+                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x73 };
+                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
+                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x78 }; // offset of data slot
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
                 // Stack layout after the two pushes:
                 //   [rsp+0]  return_slot::cancel  (bool, 1 byte; rest zeroed)
                 //   [rsp+8]  return_slot::retval  (int64_t)
-                //
-                // On the cancel path rbx carries the retval across the register restores
-                // so it can be placed into rax/xmm0 before returning to Java.
                 std::uint8_t assembly[]
                 {
                     0x50,                                           // push rax
@@ -2700,14 +2700,17 @@ namespace vmhook
                     0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
                     0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20
 
-                    0xFF, 0x15, 0x31, 0x00, 0x00, 0x00,             // call [rip+0x31]
+                    0xFF, 0x15, 0x4D, 0x00, 0x00, 0x00,             // call [rip+0x4D]
 
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
 
-                    0x58,                                           // pop rax   ; cancel flag
-                    0x5B,                                           // pop rbx   ; retval  (rbx is callee-saved, not in save list)
-                    0x48, 0x83, 0xF8, 0x00,                         // cmp rax, 0x0
+                    0x80, 0x3C, 0x24, 0x00,                         // cmp byte ptr [rsp], 0
+                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je resume  ; cancel==false
 
+                    // cancel path (cancel==true, falls through):
+                    0x48, 0x8B, 0x44, 0x24, 0x08,                   // mov rax, [rsp+8]    ; return_slot::retval
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax      ; float/double return
+                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10       ; discard return_slot
                     0x5D,                                           // pop rbp
                     0x41, 0x5B,                                     // pop r11
                     0x41, 0x5A,                                     // pop r10
@@ -2715,19 +2718,25 @@ namespace vmhook
                     0x41, 0x58,                                     // pop r8
                     0x5A,                                           // pop rdx
                     0x59,                                           // pop rcx
-                    0x58,                                           // pop rax   ; restore original rax
-
-                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je ????????  ; resume path (cancel==false)
-
-                    // cancel path (cancel==true, falls through):
-                    0x48, 0x89, 0xD8,                               // mov rax, rbx        ; integer/pointer return
-                    0x66, 0x48, 0x0F, 0x6E, 0xC3,                   // movq xmm0, rbx      ; float/double return
+                    0x48, 0x83, 0xC4, 0x08,                         // add rsp, 0x8        ; discard saved original rax
                     0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
                     0x5D,                                           // pop rbp
                     0x5E,                                           // pop rsi
                     0x48, 0x89, 0xDC,                               // mov rsp, rbx
                     0xFF, 0xE6,                                     // jmp rsi
+
+                    // resume path (cancel==false):
+                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10       ; discard return_slot
+                    0x5D,                                           // pop rbp
+                    0x41, 0x5B,                                     // pop r11
+                    0x41, 0x5A,                                     // pop r10
+                    0x41, 0x59,                                     // pop r9
+                    0x41, 0x58,                                     // pop r8
+                    0x5A,                                           // pop rdx
+                    0x59,                                           // pop rcx
+                    0x58,                                           // pop rax
+                    0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp target+HOOK_SIZE
 
                     // data slot: detour function pointer
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -2748,8 +2757,11 @@ namespace vmhook
                     return;
                 }
 
-                const std::int32_t je_delta{ static_cast<std::int32_t>(target + HOOK_SIZE - (this->allocated + HOOK_SIZE + JE_OFFSET + JE_SIZE)) };
+                const std::int32_t je_delta{ RESUME_OFFSET - (JE_OFFSET + JE_SIZE) };
                 *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
+
+                const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(target + HOOK_SIZE - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
+                *reinterpret_cast<std::int32_t*>(assembly + RESUME_JMP_OFFSET + 1) = resume_jmp_delta;
 
                 *reinterpret_cast<vmhook::hotspot::detour_function_t*>(assembly + DETOUR_ADDRESS_OFFSET) = detour;
 
@@ -2844,7 +2856,7 @@ namespace vmhook
             @brief Common detour function invoked by the trampoline stub for every intercepted method call.
             @param f      Pointer to the current HotSpot interpreter frame (rbp at hook site).
             @param thread Pointer to the current HotSpot JavaThread (r15).
-            @param cancel Pointer to the cancel flag on the trampoline stack.
+            @param slot Pointer to the return slot on the trampoline stack.
             @details
             Single entry point for all midi2i_hook trampolines.  Finds the matching
             per-method detour in g_hooked_methods and dispatches it.
@@ -3173,7 +3185,7 @@ namespace vmhook
                              Must have been registered via register_class<T>() beforehand.
         @param method_name  The name of the Java method to hook (e.g., "toString", "update").
         @param user_detour  A callable with signature:
-                              void(bool* cancel, T1 arg1, T2 arg2, ...)
+                              void(vmhook::return_value& retval, T1 arg1, T2 arg2, ...)
                             where T1, T2, ... correspond to the Java method's explicit parameters:
                               - int / boolean / byte / short / char / float  → std::int32_t / bool / ...
                               - long                                         → std::int64_t
@@ -3184,7 +3196,8 @@ namespace vmhook
                             For instance methods the implicit Java 'this' occupies slot 0, so it must
                             appear as the first argument (typically std::unique_ptr<wrapper_type>).
                             For static methods there is no 'this'; parameters begin at slot 0.
-                            Set *cancel = true to suppress execution of the original method body.
+                            Call retval.cancel() to suppress a void method body, or
+                            retval.set(value) to suppress the original body and return value to Java.
         @return true if the hook was successfully installed or was already active, false on failure.
         @details
         The hook installation process:

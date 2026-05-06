@@ -76,6 +76,9 @@ public class Example
     // these fields coordinate the native hook unit test
     public static volatile boolean hookProbeRequested = false;
     public static volatile boolean hookProbeDone = false;
+    public static volatile boolean forceReturnProbeRequested = false;
+    public static volatile boolean forceReturnProbeDone = false;
+    public static volatile int forceReturnProbeValue = 0;
 
     public static void staticCallMe(final int value)
     {
@@ -85,6 +88,11 @@ public class Example
     public void nonStaticCallMe(final int value)
     {
         this.nonStaticCalled++;
+    }
+
+    public int nonStaticReturnMe(final int value)
+    {
+        return value + 1;
     }
 
     // this part's goal is just to check if we can work with Objects correcly

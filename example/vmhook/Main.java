@@ -32,6 +32,12 @@ public class Main
                 Example.hookProbeDone = true;
             }
 
+            if (Example.forceReturnProbeRequested && !Example.forceReturnProbeDone)
+            {
+                Example.forceReturnProbeValue = Example.instance.nonStaticReturnMe(77);
+                Example.forceReturnProbeDone = true;
+            }
+
             Thread.sleep(1);
         }
 

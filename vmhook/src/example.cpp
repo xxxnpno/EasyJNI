@@ -525,6 +525,42 @@ public:
         get_static_field("hookProbeDone")->set(value);
     }
 
+    static auto get_force_return_probe_requested()
+        -> bool
+    {
+        return get_static_field("forceReturnProbeRequested")->get();
+    }
+
+    static auto set_force_return_probe_requested(bool value)
+        -> void
+    {
+        get_static_field("forceReturnProbeRequested")->set(value);
+    }
+
+    static auto get_force_return_probe_done()
+        -> bool
+    {
+        return get_static_field("forceReturnProbeDone")->get();
+    }
+
+    static auto set_force_return_probe_done(bool value)
+        -> void
+    {
+        get_static_field("forceReturnProbeDone")->set(value);
+    }
+
+    static auto get_force_return_probe_value()
+        -> std::int32_t
+    {
+        return get_static_field("forceReturnProbeValue")->get();
+    }
+
+    static auto set_force_return_probe_value(std::int32_t value)
+        -> void
+    {
+        get_static_field("forceReturnProbeValue")->set(value);
+    }
+
     auto get_non_static_called()
         -> std::int32_t
     {
@@ -628,6 +664,9 @@ namespace
     std::atomic_int hook_call_count{};
     std::atomic_bool hook_saw_instance{};
     std::atomic_bool hook_saw_expected_argument{};
+    std::atomic_int force_return_hook_call_count{};
+    std::atomic_bool force_return_saw_instance{};
+    std::atomic_bool force_return_saw_expected_argument{};
 
 
     auto write_result(const std::string& line)
@@ -861,6 +900,62 @@ namespace
 
         vmhook::shutdown_hooks();
     }
+
+    auto test_method_force_return()
+        -> void
+    {
+        /*
+            This validates the force-return hook path. The Java method normally
+            returns value + 1, so returning 12345 proves the trampoline skipped the
+            original method body and delivered the native return slot to Java.
+        */
+        force_return_hook_call_count.store(0);
+        force_return_saw_instance.store(false);
+        force_return_saw_expected_argument.store(false);
+
+        example_class::set_force_return_probe_value(0);
+        example_class::set_force_return_probe_done(false);
+        example_class::set_force_return_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticReturnMe",
+            [](vmhook::return_value& retval, const std::unique_ptr<example_class>& self, std::int32_t value)
+            {
+                ++force_return_hook_call_count;
+                force_return_saw_instance.store(self != nullptr);
+                force_return_saw_expected_argument.store(value == 77);
+                retval.set(static_cast<std::int32_t>(12345));
+            }) };
+        check("forceReturnHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        example_class::set_force_return_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+
+        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
+        {
+            if (example_class::get_force_return_probe_done())
+            {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+
+        example_class::set_force_return_probe_requested(false);
+
+        check("forceReturnProbeDone", example_class::get_force_return_probe_done());
+        check_equal("forceReturnHookCallCount", force_return_hook_call_count.load(), 1);
+        check("forceReturnSawInstance", force_return_saw_instance.load());
+        check("forceReturnSawExpectedArgument", force_return_saw_expected_argument.load());
+        check_equal("forceReturnValue", example_class::get_force_return_probe_value(), static_cast<std::int32_t>(12345));
+
+        vmhook::shutdown_hooks();
+    }
 }
 
 static auto WINAPI thread_entry(HMODULE module)
@@ -880,6 +975,7 @@ static auto WINAPI thread_entry(HMODULE module)
     {
         call_example_methods(*instance);
         test_method_hook(*instance);
+        test_method_force_return();
         set_expected_values(*instance);
         verify_expected_values(*instance);
     }
