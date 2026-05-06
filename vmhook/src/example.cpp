@@ -867,6 +867,8 @@ namespace
         check("hookSawInstance", hook_saw_instance.load());
         check("hookSawExpectedArgument", hook_saw_expected_argument.load());
         check_equal("hookAllowedOriginalMethod", instance.get_non_static_called(), static_cast<std::int32_t>(1));
+
+        vmhook::shutdown_hooks();
     }
 }
 
