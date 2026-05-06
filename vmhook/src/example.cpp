@@ -1,3 +1,6 @@
+// Prevent windows.h (included by vmhook.hpp) from defining min/max macros.
+#define NOMINMAX
+
 #include <vmhook/vmhook.hpp>
 
 #include <bit>
