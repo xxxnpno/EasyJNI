@@ -104,7 +104,7 @@ auto set_flags(const std::vector<bool>& value)
 ## Static Fields
 
 Static Java fields use the same `get_field(...)` API. Expose them as static
-C++ methods, then call `get_field(...)` through a default-constructed wrapper:
+C++ methods, then call `get_field(...)` directly:
 
 ```cpp
 class example_class : public vmhook::object<example_class>
@@ -121,20 +121,19 @@ public:
     static auto get_static_double()
         -> double
     {
-        return example_class{}.get_field("staticDouble")->get();
+        return get_field("staticDouble")->get();
     }
 
     static auto set_static_double(double value)
         -> void
     {
-        example_class{}.get_field("staticDouble")->set(value);
+        get_field("staticDouble")->set(value);
     }
 };
 ```
 
-The temporary wrapper has a null Java object pointer. That is fine for static
-fields because vmhook resolves them through the registered Java class metadata
-and reads/writes the `java.lang.Class` mirror.
+Static wrapper calls resolve through the registered Java class metadata and
+read/write the `java.lang.Class` mirror.
 
 ```cpp
 example_class::set_static_double(2.0);
@@ -167,7 +166,7 @@ Static Java methods use the same `get_method(...)` API:
 static auto static_call_me(std::int32_t value)
     -> void
 {
-    example_class{}.get_method("staticCallMe")->call(value);
+    get_method("staticCallMe")->call(value);
 }
 ```
 

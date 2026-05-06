@@ -14,13 +14,13 @@
     raw method names, or lower-level vmhook helpers.
 
     Field pattern:
-        - instance field: this->get_field("javaField")->get()
-        - static field:  wrapper_class{}.get_field("javaField")->get()
+        - instance field: this->object_base::get_field("javaField")->get()
+        - static field:  get_field("javaField")->get()
         - setter:        get_field(...)->set(value)
 
     Method pattern:
-        - instance method: this->get_method("javaMethod")->call(args...)
-        - static method:  wrapper_class{}.get_method("javaMethod")->call(args...)
+        - instance method: this->object_base::get_method("javaMethod")->call(args...)
+        - static method:  get_method("javaMethod")->call(args...)
 
     A default-constructed wrapper has a null object pointer. That is valid for
     static fields and static methods because vmhook resolves those through the
@@ -45,13 +45,13 @@ public:
     static auto get_stop_jvm()
         -> bool
     {
-        return main_class{}.get_field("stopJVM")->get();
+        return get_field("stopJVM")->get();
     }
 
     static auto set_stop_jvm(bool value)
         -> void
     {
-        main_class{}.get_field("stopJVM")->set(value);
+        get_field("stopJVM")->set(value);
     }
 };
 
@@ -70,625 +70,625 @@ public:
     static auto get_static_bool()
         -> bool
     {
-        return example_class{}.get_field("staticBool")->get();
+        return get_field("staticBool")->get();
     }
 
     static auto set_static_bool(bool value)
         -> void
     {
-        example_class{}.get_field("staticBool")->set(value);
+        get_field("staticBool")->set(value);
     }
 
     static auto get_static_byte()
         -> std::byte
     {
-        return example_class{}.get_field("staticByte")->get();
+        return get_field("staticByte")->get();
     }
 
     static auto set_static_byte(std::byte value)
         -> void
     {
-        example_class{}.get_field("staticByte")->set(value);
+        get_field("staticByte")->set(value);
     }
 
     static auto get_static_short()
         -> std::int16_t
     {
-        return example_class{}.get_field("staticShort")->get();
+        return get_field("staticShort")->get();
     }
 
     static auto set_static_short(std::int16_t value)
         -> void
     {
-        example_class{}.get_field("staticShort")->set(value);
+        get_field("staticShort")->set(value);
     }
 
     static auto get_static_int()
         -> std::int32_t
     {
-        return example_class{}.get_field("staticInt")->get();
+        return get_field("staticInt")->get();
     }
 
     static auto set_static_int(std::int32_t value)
         -> void
     {
-        example_class{}.get_field("staticInt")->set(value);
+        get_field("staticInt")->set(value);
     }
 
     static auto get_static_long()
         -> std::int64_t
     {
-        return example_class{}.get_field("staticLong")->get();
+        return get_field("staticLong")->get();
     }
 
     static auto set_static_long(std::int64_t value)
         -> void
     {
-        example_class{}.get_field("staticLong")->set(value);
+        get_field("staticLong")->set(value);
     }
 
     static auto get_static_float()
         -> float
     {
-        return example_class{}.get_field("staticFloat")->get();
+        return get_field("staticFloat")->get();
     }
 
     static auto set_static_float(float value)
         -> void
     {
-        example_class{}.get_field("staticFloat")->set(value);
+        get_field("staticFloat")->set(value);
     }
 
     static auto get_static_double()
         -> double
     {
-        return example_class{}.get_field("staticDouble")->get();
+        return get_field("staticDouble")->get();
     }
 
     static auto set_static_double(double value)
         -> void
     {
-        example_class{}.get_field("staticDouble")->set(value);
+        get_field("staticDouble")->set(value);
     }
 
     static auto get_static_char()
         -> char
     {
-        return example_class{}.get_field("staticChar")->get();
+        return get_field("staticChar")->get();
     }
 
     static auto set_static_char(char value)
         -> void
     {
-        example_class{}.get_field("staticChar")->set(value);
+        get_field("staticChar")->set(value);
     }
 
     static auto get_static_string()
         -> std::string
     {
-        return example_class{}.get_field("staticString")->get();
+        return get_field("staticString")->get();
     }
 
     static auto set_static_string(const std::string& value)
         -> void
     {
-        example_class{}.get_field("staticString")->set(value);
+        get_field("staticString")->set(value);
     }
 
     auto get_not_static_bool()
         -> bool
     {
-        return this->get_field("notStaticBool")->get();
+        return this->object_base::get_field("notStaticBool")->get();
     }
 
     auto set_not_static_bool(bool value)
         -> void
     {
-        this->get_field("notStaticBool")->set(value);
+        this->object_base::get_field("notStaticBool")->set(value);
     }
 
     auto get_not_static_byte()
         -> std::byte
     {
-        return this->get_field("notStaticByte")->get();
+        return this->object_base::get_field("notStaticByte")->get();
     }
 
     auto set_not_static_byte(std::byte value)
         -> void
     {
-        this->get_field("notStaticByte")->set(value);
+        this->object_base::get_field("notStaticByte")->set(value);
     }
 
     auto get_not_static_short()
         -> std::int16_t
     {
-        return this->get_field("notStaticShort")->get();
+        return this->object_base::get_field("notStaticShort")->get();
     }
 
     auto set_not_static_short(std::int16_t value)
         -> void
     {
-        this->get_field("notStaticShort")->set(value);
+        this->object_base::get_field("notStaticShort")->set(value);
     }
 
     auto get_not_static_int()
         -> std::int32_t
     {
-        return this->get_field("notStaticInt")->get();
+        return this->object_base::get_field("notStaticInt")->get();
     }
 
     auto set_not_static_int(std::int32_t value)
         -> void
     {
-        this->get_field("notStaticInt")->set(value);
+        this->object_base::get_field("notStaticInt")->set(value);
     }
 
     auto get_not_static_long()
         -> std::int64_t
     {
-        return this->get_field("notStaticLong")->get();
+        return this->object_base::get_field("notStaticLong")->get();
     }
 
     auto set_not_static_long(std::int64_t value)
         -> void
     {
-        this->get_field("notStaticLong")->set(value);
+        this->object_base::get_field("notStaticLong")->set(value);
     }
 
     auto get_not_static_float()
         -> float
     {
-        return this->get_field("notStaticFloat")->get();
+        return this->object_base::get_field("notStaticFloat")->get();
     }
 
     auto set_not_static_float(float value)
         -> void
     {
-        this->get_field("notStaticFloat")->set(value);
+        this->object_base::get_field("notStaticFloat")->set(value);
     }
 
     auto get_not_static_double()
         -> double
     {
-        return this->get_field("notStaticDouble")->get();
+        return this->object_base::get_field("notStaticDouble")->get();
     }
 
     auto set_not_static_double(double value)
         -> void
     {
-        this->get_field("notStaticDouble")->set(value);
+        this->object_base::get_field("notStaticDouble")->set(value);
     }
 
     auto get_not_static_char()
         -> char
     {
-        return this->get_field("notStaticChar")->get();
+        return this->object_base::get_field("notStaticChar")->get();
     }
 
     auto set_not_static_char(char value)
         -> void
     {
-        this->get_field("notStaticChar")->set(value);
+        this->object_base::get_field("notStaticChar")->set(value);
     }
 
     auto get_not_static_string()
         -> std::string
     {
-        return this->get_field("notStaticString")->get();
+        return this->object_base::get_field("notStaticString")->get();
     }
 
     auto set_not_static_string(const std::string& value)
         -> void
     {
-        this->get_field("notStaticString")->set(value);
+        this->object_base::get_field("notStaticString")->set(value);
     }
 
     static auto get_static_bool_array()
         -> std::vector<bool>
     {
-        return example_class{}.get_field("staticBoolArray")->get();
+        return get_field("staticBoolArray")->get();
     }
 
     static auto set_static_bool_array(const std::vector<bool>& value)
         -> void
     {
-        example_class{}.get_field("staticBoolArray")->set(value);
+        get_field("staticBoolArray")->set(value);
     }
 
     static auto get_static_byte_array()
         -> std::vector<std::byte>
     {
-        return example_class{}.get_field("staticByteArray")->get();
+        return get_field("staticByteArray")->get();
     }
 
     static auto set_static_byte_array(const std::vector<std::byte>& value)
         -> void
     {
-        example_class{}.get_field("staticByteArray")->set(value);
+        get_field("staticByteArray")->set(value);
     }
 
     static auto get_static_short_array()
         -> std::vector<std::int16_t>
     {
-        return example_class{}.get_field("staticShortArray")->get();
+        return get_field("staticShortArray")->get();
     }
 
     static auto set_static_short_array(const std::vector<std::int16_t>& value)
         -> void
     {
-        example_class{}.get_field("staticShortArray")->set(value);
+        get_field("staticShortArray")->set(value);
     }
 
     static auto get_static_int_array()
         -> std::vector<std::int32_t>
     {
-        return example_class{}.get_field("staticIntArray")->get();
+        return get_field("staticIntArray")->get();
     }
 
     static auto set_static_int_array(const std::vector<std::int32_t>& value)
         -> void
     {
-        example_class{}.get_field("staticIntArray")->set(value);
+        get_field("staticIntArray")->set(value);
     }
 
     static auto get_static_long_array()
         -> std::vector<std::int64_t>
     {
-        return example_class{}.get_field("staticLongArray")->get();
+        return get_field("staticLongArray")->get();
     }
 
     static auto set_static_long_array(const std::vector<std::int64_t>& value)
         -> void
     {
-        example_class{}.get_field("staticLongArray")->set(value);
+        get_field("staticLongArray")->set(value);
     }
 
     static auto get_static_float_array()
         -> std::vector<float>
     {
-        return example_class{}.get_field("staticFloatArray")->get();
+        return get_field("staticFloatArray")->get();
     }
 
     static auto set_static_float_array(const std::vector<float>& value)
         -> void
     {
-        example_class{}.get_field("staticFloatArray")->set(value);
+        get_field("staticFloatArray")->set(value);
     }
 
     static auto get_static_double_array()
         -> std::vector<double>
     {
-        return example_class{}.get_field("staticDoubleArray")->get();
+        return get_field("staticDoubleArray")->get();
     }
 
     static auto set_static_double_array(const std::vector<double>& value)
         -> void
     {
-        example_class{}.get_field("staticDoubleArray")->set(value);
+        get_field("staticDoubleArray")->set(value);
     }
 
     static auto get_static_char_array()
         -> std::vector<char>
     {
-        return example_class{}.get_field("staticCharArray")->get();
+        return get_field("staticCharArray")->get();
     }
 
     static auto set_static_char_array(const std::vector<char>& value)
         -> void
     {
-        example_class{}.get_field("staticCharArray")->set(value);
+        get_field("staticCharArray")->set(value);
     }
 
     static auto get_static_string_array()
         -> std::vector<std::string>
     {
-        return example_class{}.get_field("staticStringArray")->get();
+        return get_field("staticStringArray")->get();
     }
 
     static auto set_static_string_array(const std::vector<std::string>& value)
         -> void
     {
-        example_class{}.get_field("staticStringArray")->set(value);
+        get_field("staticStringArray")->set(value);
     }
 
     auto get_not_static_bool_array()
         -> std::vector<bool>
     {
-        return this->get_field("notStaticBoolArray")->get();
+        return this->object_base::get_field("notStaticBoolArray")->get();
     }
 
     auto set_not_static_bool_array(const std::vector<bool>& value)
         -> void
     {
-        this->get_field("notStaticBoolArray")->set(value);
+        this->object_base::get_field("notStaticBoolArray")->set(value);
     }
 
     auto get_not_static_byte_array()
         -> std::vector<std::byte>
     {
-        return this->get_field("notStaticByteArray")->get();
+        return this->object_base::get_field("notStaticByteArray")->get();
     }
 
     auto set_not_static_byte_array(const std::vector<std::byte>& value)
         -> void
     {
-        this->get_field("notStaticByteArray")->set(value);
+        this->object_base::get_field("notStaticByteArray")->set(value);
     }
 
     auto get_not_static_short_array()
         -> std::vector<std::int16_t>
     {
-        return this->get_field("notStaticShortArray")->get();
+        return this->object_base::get_field("notStaticShortArray")->get();
     }
 
     auto set_not_static_short_array(const std::vector<std::int16_t>& value)
         -> void
     {
-        this->get_field("notStaticShortArray")->set(value);
+        this->object_base::get_field("notStaticShortArray")->set(value);
     }
 
     auto get_not_static_int_array()
         -> std::vector<std::int32_t>
     {
-        return this->get_field("notStaticIntArray")->get();
+        return this->object_base::get_field("notStaticIntArray")->get();
     }
 
     auto set_not_static_int_array(const std::vector<std::int32_t>& value)
         -> void
     {
-        this->get_field("notStaticIntArray")->set(value);
+        this->object_base::get_field("notStaticIntArray")->set(value);
     }
 
     auto get_not_static_long_array()
         -> std::vector<std::int64_t>
     {
-        return this->get_field("notStaticLongArray")->get();
+        return this->object_base::get_field("notStaticLongArray")->get();
     }
 
     auto set_not_static_long_array(const std::vector<std::int64_t>& value)
         -> void
     {
-        this->get_field("notStaticLongArray")->set(value);
+        this->object_base::get_field("notStaticLongArray")->set(value);
     }
 
     auto get_not_static_float_array()
         -> std::vector<float>
     {
-        return this->get_field("notStaticFloatArray")->get();
+        return this->object_base::get_field("notStaticFloatArray")->get();
     }
 
     auto set_not_static_float_array(const std::vector<float>& value)
         -> void
     {
-        this->get_field("notStaticFloatArray")->set(value);
+        this->object_base::get_field("notStaticFloatArray")->set(value);
     }
 
     auto get_not_static_double_array()
         -> std::vector<double>
     {
-        return this->get_field("notStaticDoubleArray")->get();
+        return this->object_base::get_field("notStaticDoubleArray")->get();
     }
 
     auto set_not_static_double_array(const std::vector<double>& value)
         -> void
     {
-        this->get_field("notStaticDoubleArray")->set(value);
+        this->object_base::get_field("notStaticDoubleArray")->set(value);
     }
 
     auto get_not_static_char_array()
         -> std::vector<char>
     {
-        return this->get_field("notStaticCharArray")->get();
+        return this->object_base::get_field("notStaticCharArray")->get();
     }
 
     auto set_not_static_char_array(const std::vector<char>& value)
         -> void
     {
-        this->get_field("notStaticCharArray")->set(value);
+        this->object_base::get_field("notStaticCharArray")->set(value);
     }
 
     auto get_not_static_string_array()
         -> std::vector<std::string>
     {
-        return this->get_field("notStaticStringArray")->get();
+        return this->object_base::get_field("notStaticStringArray")->get();
     }
 
     auto set_not_static_string_array(const std::vector<std::string>& value)
         -> void
     {
-        this->get_field("notStaticStringArray")->set(value);
+        this->object_base::get_field("notStaticStringArray")->set(value);
     }
 
     static auto get_instance()
         -> std::unique_ptr<example_class>
     {
-        return example_class{}.get_field("instance")->get();
+        return get_field("instance")->get();
     }
 
     static auto set_instance(const std::unique_ptr<example_class>& value)
         -> void
     {
-        example_class{}.get_field("instance")->set(value);
+        get_field("instance")->set(value);
     }
 
     static auto get_static_called()
         -> std::int32_t
     {
-        return example_class{}.get_field("staticCalled")->get();
+        return get_field("staticCalled")->get();
     }
 
     static auto set_static_called(std::int32_t value)
         -> void
     {
-        example_class{}.get_field("staticCalled")->set(value);
+        get_field("staticCalled")->set(value);
     }
 
     static auto get_hook_probe_requested()
         -> bool
     {
-        return example_class{}.get_field("hookProbeRequested")->get();
+        return get_field("hookProbeRequested")->get();
     }
 
     static auto set_hook_probe_requested(bool value)
         -> void
     {
-        example_class{}.get_field("hookProbeRequested")->set(value);
+        get_field("hookProbeRequested")->set(value);
     }
 
     static auto get_hook_probe_done()
         -> bool
     {
-        return example_class{}.get_field("hookProbeDone")->get();
+        return get_field("hookProbeDone")->get();
     }
 
     static auto set_hook_probe_done(bool value)
         -> void
     {
-        example_class{}.get_field("hookProbeDone")->set(value);
+        get_field("hookProbeDone")->set(value);
     }
 
     static auto get_force_return_probe_requested()
         -> bool
     {
-        return example_class{}.get_field("forceReturnProbeRequested")->get();
+        return get_field("forceReturnProbeRequested")->get();
     }
 
     static auto set_force_return_probe_requested(bool value)
         -> void
     {
-        example_class{}.get_field("forceReturnProbeRequested")->set(value);
+        get_field("forceReturnProbeRequested")->set(value);
     }
 
     static auto get_force_return_probe_done()
         -> bool
     {
-        return example_class{}.get_field("forceReturnProbeDone")->get();
+        return get_field("forceReturnProbeDone")->get();
     }
 
     static auto set_force_return_probe_done(bool value)
         -> void
     {
-        example_class{}.get_field("forceReturnProbeDone")->set(value);
+        get_field("forceReturnProbeDone")->set(value);
     }
 
     static auto get_force_return_probe_value()
         -> std::int32_t
     {
-        return example_class{}.get_field("forceReturnProbeValue")->get();
+        return get_field("forceReturnProbeValue")->get();
     }
 
     static auto set_force_return_probe_value(std::int32_t value)
         -> void
     {
-        example_class{}.get_field("forceReturnProbeValue")->set(value);
+        get_field("forceReturnProbeValue")->set(value);
     }
 
     static auto get_cancel_probe_requested()
         -> bool
     {
-        return example_class{}.get_field("cancelProbeRequested")->get();
+        return get_field("cancelProbeRequested")->get();
     }
 
     static auto set_cancel_probe_requested(bool value)
         -> void
     {
-        example_class{}.get_field("cancelProbeRequested")->set(value);
+        get_field("cancelProbeRequested")->set(value);
     }
 
     static auto get_cancel_probe_done()
         -> bool
     {
-        return example_class{}.get_field("cancelProbeDone")->get();
+        return get_field("cancelProbeDone")->get();
     }
 
     static auto set_cancel_probe_done(bool value)
         -> void
     {
-        example_class{}.get_field("cancelProbeDone")->set(value);
+        get_field("cancelProbeDone")->set(value);
     }
 
     static auto get_static_force_return_probe_requested()
         -> bool
     {
-        return example_class{}.get_field("staticForceReturnProbeRequested")->get();
+        return get_field("staticForceReturnProbeRequested")->get();
     }
 
     static auto set_static_force_return_probe_requested(bool value)
         -> void
     {
-        example_class{}.get_field("staticForceReturnProbeRequested")->set(value);
+        get_field("staticForceReturnProbeRequested")->set(value);
     }
 
     static auto get_static_force_return_probe_done()
         -> bool
     {
-        return example_class{}.get_field("staticForceReturnProbeDone")->get();
+        return get_field("staticForceReturnProbeDone")->get();
     }
 
     static auto set_static_force_return_probe_done(bool value)
         -> void
     {
-        example_class{}.get_field("staticForceReturnProbeDone")->set(value);
+        get_field("staticForceReturnProbeDone")->set(value);
     }
 
     static auto get_static_force_return_probe_value()
         -> std::int32_t
     {
-        return example_class{}.get_field("staticForceReturnProbeValue")->get();
+        return get_field("staticForceReturnProbeValue")->get();
     }
 
     static auto set_static_force_return_probe_value(std::int32_t value)
         -> void
     {
-        example_class{}.get_field("staticForceReturnProbeValue")->set(value);
+        get_field("staticForceReturnProbeValue")->set(value);
     }
 
     static auto get_make_unique_probe_requested()
         -> bool
     {
-        return example_class{}.get_field("makeUniqueProbeRequested")->get();
+        return get_field("makeUniqueProbeRequested")->get();
     }
 
     static auto set_make_unique_probe_requested(bool value)
         -> void
     {
-        example_class{}.get_field("makeUniqueProbeRequested")->set(value);
+        get_field("makeUniqueProbeRequested")->set(value);
     }
 
     static auto get_make_unique_probe_done()
         -> bool
     {
-        return example_class{}.get_field("makeUniqueProbeDone")->get();
+        return get_field("makeUniqueProbeDone")->get();
     }
 
     static auto set_make_unique_probe_done(bool value)
         -> void
     {
-        example_class{}.get_field("makeUniqueProbeDone")->set(value);
+        get_field("makeUniqueProbeDone")->set(value);
     }
 
     auto get_non_static_called()
         -> std::int32_t
     {
-        return this->get_field("nonStaticCalled")->get();
+        return this->object_base::get_field("nonStaticCalled")->get();
     }
 
     auto set_non_static_called(std::int32_t value)
         -> void
     {
-        this->get_field("nonStaticCalled")->set(value);
+        this->object_base::get_field("nonStaticCalled")->set(value);
     }
 
     auto get_cancel_called()
         -> std::int32_t
     {
-        return this->get_field("cancelCalled")->get();
+        return this->object_base::get_field("cancelCalled")->get();
     }
 
     auto set_cancel_called(std::int32_t value)
         -> void
     {
-        this->get_field("cancelCalled")->set(value);
+        this->object_base::get_field("cancelCalled")->set(value);
     }
 
     static auto static_call_me(std::int32_t value)
@@ -696,7 +696,7 @@ public:
     {
         const std::int32_t before_call_count{ get_static_called() };
 
-        example_class{}.get_method("staticCallMe")->call(value);
+        get_method("staticCallMe")->call(value);
 
         if (get_static_called() == before_call_count)
         {
@@ -709,7 +709,7 @@ public:
     {
         const std::int32_t before_call_count{ this->get_non_static_called() };
 
-        this->get_method("nonStaticCallMe")->call(value);
+        this->object_base::get_method("nonStaticCallMe")->call(value);
 
         if (this->get_non_static_called() == before_call_count)
         {
@@ -720,7 +720,7 @@ public:
     auto use_a(const std::unique_ptr<class a_class>& value)
         -> void
     {
-        this->get_method("useA")->call(value);
+        this->object_base::get_method("useA")->call(value);
     }
 };
 
@@ -737,37 +737,37 @@ public:
     auto get_string()
         -> std::string
     {
-        return this->get_field("string")->get();
+        return this->object_base::get_field("string")->get();
     }
 
     auto set_string(const std::string& value)
         -> void
     {
-        this->get_field("string")->set(value);
+        this->object_base::get_field("string")->set(value);
     }
 
     static auto get_counter()
         -> std::int32_t
     {
-        return a_class{}.get_field("counter")->get();
+        return get_field("counter")->get();
     }
 
     static auto set_counter(std::int32_t value)
         -> void
     {
-        a_class{}.get_field("counter")->set(value);
+        get_field("counter")->set(value);
     }
 
     auto get_val()
         -> std::int32_t
     {
-        return this->get_field("val")->get();
+        return this->object_base::get_field("val")->get();
     }
 
     auto set_val(std::int32_t value)
         -> void
     {
-        this->get_field("val")->set(value);
+        this->object_base::get_field("val")->set(value);
     }
 
     auto construct()

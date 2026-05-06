@@ -4527,9 +4527,8 @@ namespace vmhook
                 // Cast inside the method if you want a concrete return type
                 auto get_timeout()  -> int { return static_cast<int>(get_field("timeout")->get()); }
 
-                // Static field - construct a wrapper with no instance.
-                // get_field detects JVM_ACC_STATIC automatically.
-                static auto get_version() -> std::string { return http_client{}.get_field("VERSION")->get(); }
+                // Static field - get_field resolves through the registered class.
+                static auto get_version() -> std::string { return get_field("VERSION")->get(); }
 
                 // Writing a field
                 auto set_health(int hp) -> void { get_field("health")->set(hp); }
@@ -4649,6 +4648,38 @@ namespace vmhook
             return vmhook::field_proxy{ field_pointer, entry->signature, false };
         }
 
+        static auto get_field(const std::type_index wrapper_type, const std::string_view name)
+            -> std::optional<vmhook::field_proxy>
+        {
+            vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
+            if (!resolved_klass)
+            {
+                return std::nullopt;
+            }
+
+            const auto entry{ vmhook::find_field(resolved_klass, name) };
+            if (!entry)
+            {
+                return std::nullopt;
+            }
+
+            if (!entry->is_static)
+            {
+                std::println("{} object::get_field('{}') needs an object instance.", vmhook::error_tag, name);
+                return std::nullopt;
+            }
+
+            void* const mirror{ resolved_klass->get_java_mirror() };
+            if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
+            {
+                std::println("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
+                return std::nullopt;
+            }
+
+            void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
+            return vmhook::field_proxy{ field_pointer, entry->signature, true };
+        }
+
         /*
             @brief Returns a method proxy for a method declared on this class.
             @param method_name Exact Java method name.
@@ -4692,6 +4723,35 @@ namespace vmhook
             return std::nullopt;
         }
 
+        static auto get_method(const std::type_index wrapper_type, const std::string_view method_name)
+            -> std::optional<vmhook::method_proxy>
+        {
+            vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
+            if (!resolved_klass)
+            {
+                return std::nullopt;
+            }
+
+            const std::int32_t method_count{ resolved_klass->get_methods_count() };
+            vmhook::hotspot::method** const methods_array{ resolved_klass->get_methods_ptr() };
+
+            if (!methods_array || method_count <= 0)
+            {
+                return std::nullopt;
+            }
+
+            for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+            {
+                vmhook::hotspot::method* const current_method{ methods_array[method_index] };
+                if (current_method && vmhook::hotspot::is_valid_pointer(current_method) && current_method->get_name() == method_name)
+                {
+                    return vmhook::method_proxy{ nullptr, current_method, current_method->get_signature() };
+                }
+            }
+
+            return std::nullopt;
+        }
+
     protected:
         /*
             @brief The raw decoded OOP pointer to the wrapped Java object.
@@ -4710,10 +4770,16 @@ namespace vmhook
         auto resolve_klass() const 
             -> vmhook::hotspot::klass*
         {
-            const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(*this) }) };
+            return resolve_klass(std::type_index{ typeid(*this) });
+        }
+
+        static auto resolve_klass(const std::type_index wrapper_type)
+            -> vmhook::hotspot::klass*
+        {
+            const auto type_map_entry{ vmhook::type_to_class_map.find(wrapper_type) };
             if (type_map_entry == vmhook::type_to_class_map.end())
             {
-                std::println("{} object::resolve_klass() type '{}' not registered via register_class<T>().", vmhook::error_tag, typeid(*this).name());
+                std::println("{} object::resolve_klass() type '{}' not registered via register_class<T>().", vmhook::error_tag, wrapper_type.name());
                 return nullptr;
             }
 
@@ -4732,6 +4798,18 @@ namespace vmhook
     {
     public:
         using object_base::object_base;
+
+        static auto get_field(const std::string_view name)
+            -> std::optional<vmhook::field_proxy>
+        {
+            return object_base::get_field(std::type_index{ typeid(derived) }, name);
+        }
+
+        static auto get_method(const std::string_view method_name)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return object_base::get_method(std::type_index{ typeid(derived) }, method_name);
+        }
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
