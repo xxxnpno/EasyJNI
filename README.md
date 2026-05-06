@@ -103,9 +103,7 @@ auto set_flags(const std::vector<bool>& value)
 
 ## Static Fields
 
-Static Java fields can be exposed as static C++ methods. Add a class-level
-`get_field(...)` wrapper that delegates to `get_static_field(...)`, then write
-normal static getters and setters:
+Static Java fields can be exposed as static C++ methods. Use `get_static_field(...)` inside static C++ getters and setters:
 
 ```cpp
 class example_class : public vmhook::object<example_class>
@@ -116,22 +114,17 @@ public:
     {
     }
 
-    static auto get_field(const std::string_view name)
-        -> std::optional<vmhook::field_proxy>
-    {
-        return get_static_field(name);
-    }
 
     static auto get_static_double()
         -> double
     {
-        return get_field("staticDouble")->get();
+        return get_static_field("staticDouble")->get();
     }
 
     static auto set_static_double(double value)
         -> void
     {
-        get_field("staticDouble")->set(value);
+        get_static_field("staticDouble")->set(value);
     }
 };
 ```
@@ -162,20 +155,14 @@ auto add_score(std::int32_t amount, const std::string& reason)
 }
 ```
 
-Static Java methods can be exposed as static C++ methods with a class-level
-`get_method(...)` wrapper:
+Static Java methods can be exposed as static C++ methods with `get_static_method(...)`:
 
 ```cpp
-static auto get_method(const std::string_view method_name)
-    -> std::optional<vmhook::method_proxy>
-{
-    return get_static_method(method_name);
-}
 
 static auto static_call_me(std::int32_t value)
     -> void
 {
-    get_method("staticCallMe")->call(value);
+    get_static_method("staticCallMe")->call(value);
 }
 ```
 
