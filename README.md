@@ -223,11 +223,50 @@ vmhook::hook<example_class>("staticReturnMe",
 
 ## Object Construction
 
-`vmhook::make_unique<T>(arg1, arg2, ...)` is present in the public header, but
-VM-side allocation and constructor dispatch are not implemented yet. The current
-behavior is to return `nullptr` after resolving the registered class. The example
-unit tests cover that status explicitly so it is not mistaken for working Java
-object construction.
+`vmhook::make_unique<T>(arg1, arg2, ...)` allocates a Java object for the
+registered wrapper type with HotSpot internals only. It uses the current
+JavaThread's TLAB, so call it from a `vmhook::hook(...)` detour where vmhook has
+captured the HotSpot JavaThread.
+
+The function returns a `std::unique_ptr<T>` wrapping the new OOP. After allocation
+it calls `wrapper.construct(arg1, arg2, ...)` when the wrapper exposes a matching
+C++ method. Use that method to initialize fields through the normal wrapper API:
+
+```cpp
+class a_class : public vmhook::object<a_class>
+{
+public:
+    a_class() = default;
+
+    explicit a_class(vmhook::oop_t instance)
+        : vmhook::object<a_class>{ instance }
+    {
+    }
+
+    auto set_val(std::int32_t value)
+        -> void
+    {
+        this->get_field("val")->set(value);
+    }
+
+    auto construct(std::int32_t value)
+        -> void
+    {
+        this->set_val(value);
+    }
+};
+
+vmhook::hook<example_class>("nonStaticCallMe",
+    [](vmhook::return_value& return_value,
+       const std::unique_ptr<example_class>& self,
+       std::int32_t value)
+    {
+        auto object{ vmhook::make_unique<a_class>(1337) };
+    });
+```
+
+`make_unique` does not use JNI and does not invoke Java constructor bytecode.
+Keep constructor-style initialization in the wrapper's `construct(...)` method.
 
 ## Example
 
@@ -243,7 +282,7 @@ The complete example lives in `vmhook/src/example.cpp`. It demonstrates:
 - method hooks that force a return value
 - method hooks that cancel a void method
 - static method hooks
-- current `vmhook::make_unique<T>(...)` behavior
+- `vmhook::make_unique<T>(...)` from a method hook
 - a GitHub Actions test harness that writes `test_results.txt`
 
 ## Notes

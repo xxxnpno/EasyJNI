@@ -1168,6 +1168,38 @@ namespace vmhook
                 }
             }
 
+            auto get_instance_size() const noexcept
+                -> std::size_t
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_layout_helper") };
+
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return 0;
+                }
+
+                const std::int32_t layout_helper{ *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
+                if (layout_helper <= 0)
+                {
+                    return 0;
+                }
+
+                return static_cast<std::size_t>(layout_helper & ~1);
+            }
+
+            auto get_prototype_header() const noexcept
+                -> std::uintptr_t
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_prototype_header") };
+
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return 1;
+                }
+
+                return *reinterpret_cast<const std::uintptr_t*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset);
+            }
+
             /*
                 @brief Searches the InstanceKlass _fields array for a field by name.
                 @param name The exact Java field name (e.g. "health", "x", "INSTANCE").
@@ -1866,7 +1898,54 @@ namespace vmhook
                     return 0;
                 }
             }
+
+            auto allocate_tlab(const std::size_t byte_size) const noexcept
+                -> void*
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const tlab_entry{ []()
+                    -> const vmhook::hotspot::vm_struct_entry_t*
+                    {
+                        {
+                            auto* entry{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_tlab") };
+                            if (entry)
+                            {
+                                return entry;
+                            }
+                        }
+                        return vmhook::hotspot::iterate_struct_entries("Thread", "_tlab");
+                    }()
+                };
+                static const vmhook::hotspot::vm_struct_entry_t* const top_entry{ vmhook::hotspot::iterate_struct_entries("ThreadLocalAllocBuffer", "_top") };
+                static const vmhook::hotspot::vm_struct_entry_t* const end_entry{ vmhook::hotspot::iterate_struct_entries("ThreadLocalAllocBuffer", "_end") };
+
+                if (!tlab_entry || !top_entry || !end_entry || byte_size == 0)
+                {
+                    return nullptr;
+                }
+
+                std::uint8_t* const tlab{ reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::java_thread*>(this)) + tlab_entry->offset };
+                std::uint8_t** const top_address{ reinterpret_cast<std::uint8_t**>(tlab + top_entry->offset) };
+                std::uint8_t** const end_address{ reinterpret_cast<std::uint8_t**>(tlab + end_entry->offset) };
+
+                std::uint8_t* const top{ *top_address };
+                std::uint8_t* const end{ *end_address };
+
+                if (!vmhook::hotspot::is_valid_pointer(top) || !vmhook::hotspot::is_valid_pointer(end) || top > end)
+                {
+                    return nullptr;
+                }
+
+                if (static_cast<std::size_t>(end - top) < byte_size)
+                {
+                    return nullptr;
+                }
+
+                *top_address = top + byte_size;
+                return top;
+            }
         };
+
+        inline thread_local vmhook::hotspot::java_thread* current_java_thread{ nullptr };
 
         /*
             @brief Decodes a compressed OOP to a real 64-bit pointer.
@@ -2092,6 +2171,72 @@ namespace vmhook
             const std::uint32_t shift{ *reinterpret_cast<const std::uint32_t*>(shift_entry->address) };
 
             return reinterpret_cast<void*>(base + (static_cast<std::uint64_t>(compressed) << shift));
+        }
+
+        static auto encode_klass_pointer(void* const decoded) noexcept
+            -> std::uint32_t
+        {
+            if (!decoded)
+            {
+                return 0;
+            }
+
+            static const vmhook::hotspot::vm_struct_entry_t* const base_entry{ []()
+                -> const vmhook::hotspot::vm_struct_entry_t*
+                {
+                    {
+                        auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._base") };
+                        if (entry)
+                        {
+                            return entry;
+                        }
+                    }
+                    {
+                        auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedKlassPointers", "_base") };
+                        if (entry)
+                        {
+                            return entry;
+                        }
+                    }
+                    return vmhook::hotspot::iterate_struct_entries("Universe", "_narrow_klass._base");
+                }()
+            };
+            static const vmhook::hotspot::vm_struct_entry_t* const shift_entry{ []()
+                -> const vmhook::hotspot::vm_struct_entry_t*
+                {
+                    {
+                        auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._shift") };
+                        if (entry)
+                        {
+                            return entry;
+                        }
+                    }
+                    {
+                        auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedKlassPointers", "_shift") };
+                        if (entry)
+                        {
+                            return entry;
+                        }
+                    }
+                    return vmhook::hotspot::iterate_struct_entries("Universe", "_narrow_klass._shift");
+                }()
+            };
+
+            if (!base_entry || !shift_entry)
+            {
+                return 0;
+            }
+
+            const std::uint64_t base{ *reinterpret_cast<const std::uint64_t*>(base_entry->address) };
+            const std::uint32_t shift{ *reinterpret_cast<const std::uint32_t*>(shift_entry->address) };
+            const std::uint64_t decoded_address{ reinterpret_cast<std::uint64_t>(decoded) };
+
+            if (decoded_address < base)
+            {
+                return 0;
+            }
+
+            return static_cast<std::uint32_t>((decoded_address - base) >> shift);
         }
 
         /*
@@ -2879,6 +3024,21 @@ namespace vmhook
                 }
 
                 const method* const current_method{ frame_pointer->get_method() };
+                struct current_thread_guard
+                {
+                    vmhook::hotspot::java_thread* previous;
+
+                    explicit current_thread_guard(vmhook::hotspot::java_thread* const thread_pointer) noexcept
+                        : previous{ vmhook::hotspot::current_java_thread }
+                    {
+                        vmhook::hotspot::current_java_thread = thread_pointer;
+                    }
+
+                    ~current_thread_guard()
+                    {
+                        vmhook::hotspot::current_java_thread = this->previous;
+                    }
+                } guard{ thread };
 
                 for (const vmhook::hotspot::hooked_method& hook : vmhook::hotspot::g_hooked_methods)
                 {
@@ -3472,15 +3632,77 @@ namespace vmhook
             return nullptr;
         }
 
-        // Placeholder: in a full implementation, we would:
-        // 1. Allocate a new Java object (via JVM allocation)
-        // 2. Find the constructor method matching the argument types
-        // 3. Set up an interpreter frame with the arguments
-        // 4. Call the constructor through the i2i entry point
-        // 5. Return a unique_ptr<T> wrapping the new object
+        vmhook::hotspot::java_thread* const thread{ vmhook::hotspot::current_java_thread };
+        if (!thread || !vmhook::hotspot::is_valid_pointer(thread))
+        {
+            std::println("{} vmhook::make_unique<{}>(): requires a JavaThread context. Call it from a vmhook method hook.", vmhook::warning_tag, typeid(wrapper_type).name());
+            return nullptr;
+        }
 
-        std::println("{} vmhook::make_unique<{}>(): object construction not fully implemented.", vmhook::warning_tag, typeid(wrapper_type).name());
-        return nullptr;
+        const std::size_t raw_size{ klass->get_instance_size() };
+        const std::size_t object_size{ (raw_size + 7u) & ~static_cast<std::size_t>(7u) };
+        if (object_size == 0)
+        {
+            std::println("{} vmhook::make_unique<{}>(): failed to read HotSpot instance size.", vmhook::error_tag, typeid(wrapper_type).name());
+            return nullptr;
+        }
+
+        void* const object_pointer{ thread->allocate_tlab(object_size) };
+        if (!object_pointer)
+        {
+            std::println("{} vmhook::make_unique<{}>(): current JavaThread TLAB has no room for {} bytes.", vmhook::warning_tag, typeid(wrapper_type).name(), object_size);
+            return nullptr;
+        }
+
+        std::memset(object_pointer, 0, object_size);
+
+        static const vmhook::hotspot::vm_struct_entry_t* const mark_entry{ []()
+            -> const vmhook::hotspot::vm_struct_entry_t*
+            {
+                {
+                    auto* entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_mark") };
+                    if (entry)
+                    {
+                        return entry;
+                    }
+                }
+                return vmhook::hotspot::iterate_struct_entries("oopDesc", "_markWord");
+            }()
+        };
+        static const vmhook::hotspot::vm_struct_entry_t* const compressed_klass_entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._compressed_klass") };
+        static const vmhook::hotspot::vm_struct_entry_t* const klass_entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
+
+        const std::size_t mark_offset{ mark_entry ? static_cast<std::size_t>(mark_entry->offset) : 0u };
+        *reinterpret_cast<std::uintptr_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + mark_offset) = klass->get_prototype_header();
+
+        if (compressed_klass_entry)
+        {
+            *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + compressed_klass_entry->offset) = vmhook::hotspot::encode_klass_pointer(klass);
+        }
+        else if (klass_entry)
+        {
+            *reinterpret_cast<vmhook::hotspot::klass**>(reinterpret_cast<std::uint8_t*>(object_pointer) + klass_entry->offset) = klass;
+        }
+        else
+        {
+            *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + 8u) = vmhook::hotspot::encode_klass_pointer(klass);
+        }
+
+        auto result{ std::make_unique<wrapper_type>(object_pointer) };
+
+        if constexpr (requires(wrapper_type& wrapper, args_t&&... construct_args)
+            {
+                wrapper.construct(std::forward<args_t>(construct_args)...);
+            })
+        {
+            result->construct(std::forward<args_t>(args)...);
+        }
+        else if constexpr (sizeof...(args_t) > 0)
+        {
+            std::println("{} vmhook::make_unique<{}>(): object allocated, but wrapper has no matching construct(...) method for the provided arguments.", vmhook::warning_tag, typeid(wrapper_type).name());
+        }
+
+        return result;
     }
 
     // --- Field access ---------------------------------------------------------

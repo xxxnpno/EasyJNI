@@ -50,6 +50,17 @@ public class Main
                 Example.staticForceReturnProbeDone = true;
             }
 
+            if (Example.makeUniqueProbeRequested && !Example.makeUniqueProbeDone)
+            {
+                final Object tlabRefill = new Object();
+                Example.instance.nonStaticCallMe(88);
+                if (tlabRefill == null)
+                {
+                    throw new IllegalStateException("unreachable");
+                }
+                Example.makeUniqueProbeDone = true;
+            }
+
             Thread.sleep(1);
         }
 

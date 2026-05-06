@@ -85,6 +85,8 @@ public class Example
     public static volatile boolean staticForceReturnProbeRequested = false;
     public static volatile boolean staticForceReturnProbeDone = false;
     public static volatile int staticForceReturnProbeValue = 0;
+    public static volatile boolean makeUniqueProbeRequested = false;
+    public static volatile boolean makeUniqueProbeDone = false;
 
     public static void staticCallMe(final int value)
     {

@@ -25,6 +25,11 @@
     A default-constructed wrapper has a null object pointer. That is valid for
     static fields and static methods because vmhook resolves those through the
     registered Java class metadata, not through an instance.
+
+    Object construction pattern:
+        - call vmhook::make_unique<wrapper_class>(args...) from a method hook
+        - add wrapper_class::construct(args...) when the new object needs field
+          initialization after the raw HotSpot allocation
 */
 class main_class : public vmhook::object<main_class>
 {
@@ -638,6 +643,30 @@ public:
         example_class{}.get_field("staticForceReturnProbeValue")->set(value);
     }
 
+    static auto get_make_unique_probe_requested()
+        -> bool
+    {
+        return example_class{}.get_field("makeUniqueProbeRequested")->get();
+    }
+
+    static auto set_make_unique_probe_requested(bool value)
+        -> void
+    {
+        example_class{}.get_field("makeUniqueProbeRequested")->set(value);
+    }
+
+    static auto get_make_unique_probe_done()
+        -> bool
+    {
+        return example_class{}.get_field("makeUniqueProbeDone")->get();
+    }
+
+    static auto set_make_unique_probe_done(bool value)
+        -> void
+    {
+        example_class{}.get_field("makeUniqueProbeDone")->set(value);
+    }
+
     auto get_non_static_called()
         -> std::int32_t
     {
@@ -717,16 +746,16 @@ public:
         this->get_field("string")->set(value);
     }
 
-    auto get_counter()
+    static auto get_counter()
         -> std::int32_t
     {
-        return this->get_field("counter")->get();
+        return a_class{}.get_field("counter")->get();
     }
 
-    auto set_counter(std::int32_t value)
+    static auto set_counter(std::int32_t value)
         -> void
     {
-        this->get_field("counter")->set(value);
+        a_class{}.get_field("counter")->set(value);
     }
 
     auto get_val()
@@ -739,6 +768,19 @@ public:
         -> void
     {
         this->get_field("val")->set(value);
+    }
+
+    auto construct()
+        -> void
+    {
+        set_counter(get_counter() + 1);
+    }
+
+    auto construct(std::int32_t value)
+        -> void
+    {
+        this->set_val(value);
+        this->construct();
     }
 };
 
@@ -763,6 +805,11 @@ namespace
     std::atomic_bool cancel_saw_expected_argument{};
     std::atomic_int static_force_return_hook_call_count{};
     std::atomic_bool static_force_return_saw_expected_argument{};
+    std::atomic_int make_unique_hook_call_count{};
+    std::atomic_bool make_unique_allocated{};
+    std::atomic_bool make_unique_saw_argument{};
+    std::atomic_bool make_unique_initialized_value{};
+    std::atomic_bool make_unique_initialized_counter{};
 
 
     auto write_result(const std::string& line)
@@ -1168,12 +1215,67 @@ namespace
         -> void
     {
         /*
-            vmhook::make_unique<T>(...) currently resolves the registered Java
-            class but returns nullptr because VM-side allocation and constructor
-            dispatch are not implemented yet. This unit test documents that
-            current behavior so the README does not promise construction support.
+            make_unique<T>(...) is HotSpot-only and needs the JavaThread captured
+            by a method hook. The hook below allocates vmhook.A from the current
+            thread's TLAB, then a_class::construct(...) initializes fields through
+            the same wrapper getter/setter API used everywhere else in this file.
         */
-        check("makeUniqueNotImplemented", !vmhook::make_unique<a_class>());
+        make_unique_hook_call_count.store(0);
+        make_unique_allocated.store(false);
+        make_unique_saw_argument.store(false);
+        make_unique_initialized_value.store(false);
+        make_unique_initialized_counter.store(false);
+
+        a_class::set_counter(0);
+        example_class::set_make_unique_probe_done(false);
+        example_class::set_make_unique_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticCallMe",
+            [](vmhook::return_value& /*retval*/, const std::unique_ptr<example_class>& /*self*/, std::int32_t value)
+            {
+                ++make_unique_hook_call_count;
+                make_unique_saw_argument.store(value == 88);
+
+                auto made{ vmhook::make_unique<a_class>(1337) };
+                make_unique_allocated.store(made != nullptr);
+
+                if (made)
+                {
+                    make_unique_initialized_value.store(made->get_val() == 1337);
+                    make_unique_initialized_counter.store(a_class::get_counter() == 1);
+                }
+            }) };
+        check("makeUniqueHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        example_class::set_make_unique_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+
+        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
+        {
+            if (example_class::get_make_unique_probe_done())
+            {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+
+        example_class::set_make_unique_probe_requested(false);
+
+        check("makeUniqueProbeDone", example_class::get_make_unique_probe_done());
+        check_equal("makeUniqueHookCallCount", make_unique_hook_call_count.load(), 1);
+        check("makeUniqueSawExpectedArgument", make_unique_saw_argument.load());
+        check("makeUniqueAllocated", make_unique_allocated.load());
+        check("makeUniqueInitializedValue", make_unique_initialized_value.load());
+        check("makeUniqueInitializedCounter", make_unique_initialized_counter.load());
+
+        vmhook::shutdown_hooks();
     }
 }
 
