@@ -33,17 +33,17 @@ jobs:
           "injector\src\main.cpp"
           /link /SUBSYSTEM:CONSOLE kernel32.lib
 
-      # Build vmhook.dll (test variant) from test/vmhook_test.cpp.
+      # Build vmhook.dll from vmhook/src/example.cpp (which contains the test logic).
       # The injector resolves the DLL as <injector_dir>\vmhook.dll, so the
       # output must be named vmhook.dll and placed next to injector.exe.
-      - name: Compile vmhook.dll (test)
+      - name: Compile vmhook.dll
         shell: cmd
         run: >
           cl /nologo /std:c++23 /EHsc /LD /O2
           /DNDEBUG /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00
           /I"vmhook\ext"
           /Fe"build\vmhook.dll"
-          "test\vmhook_test.cpp"
+          "vmhook\src\example.cpp"
           /link kernel32.lib
 
       - name: Upload build artifacts
@@ -93,7 +93,7 @@ jobs:
       #     Class.forName (see Main.java).
       #  3. Run injector.exe – it finds the single java.exe process and loads
       #     build\vmhook.dll into it.
-      #  4. The injected DLL (vmhook_test.cpp) reads every getter field,
+      #  4. The injected DLL (example.cpp) reads every getter field,
       #     compares with the known Java values, writes test_results.txt,
       #     then sets stopJVM = true so Main exits cleanly.
       #  5. Wait for java.exe to exit (30 s timeout).

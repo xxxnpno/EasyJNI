@@ -3416,6 +3416,138 @@ namespace vmhook
             &value, sizeof(element_type));
     }
 
+// --- Java String decoder --------------------------------------------------
+
+    /*
+        @brief Decodes a Java String object into a UTF-8 std::string.
+        @param string_oop Decoded (full 64-bit) pointer to a java.lang.String instance.
+        @return The string contents encoded as UTF-8, or an empty string on failure.
+        @details
+        Handles both storage layouts used by HotSpot:
+
+          Java 8 — char[] value  (field signature "[C")
+            Each array element is a UTF-16 code unit stored as uint16_t.
+            The code unit count equals the array length.
+
+          Java 9+ compact strings — byte[] value  (field signature "[B") + byte coder
+            coder = 0 (LATIN1): one byte per character, ISO 8859-1.
+            coder = 1 (UTF16):  two bytes per character, little-endian UTF-16.
+
+        In all cases BMP code points are emitted as their UTF-8 sequence.
+        Surrogate pairs (code points above U+FFFF) are not handled; they pass
+        through as two separate three-byte sequences (CESU-8 behaviour).
+    */
+    static auto read_java_string(void* const string_oop) noexcept
+        -> std::string
+    {
+        if (!string_oop || !vmhook::hotspot::is_valid_pointer(string_oop))
+        {
+            return {};
+        }
+
+        vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
+        if (!string_klass)
+        {
+            return {};
+        }
+
+        const auto value_entry{ vmhook::find_field(string_klass, "value") };
+        if (!value_entry)
+        {
+            return {};
+        }
+
+        std::uint32_t compressed_oop{};
+        std::memcpy(&compressed_oop,
+                    reinterpret_cast<const std::uint8_t*>(string_oop) + value_entry->offset,
+                    sizeof(compressed_oop));
+        if (!compressed_oop)
+        {
+            return {};
+        }
+
+        void* const value_array{ vmhook::hotspot::decode_oop_pointer(compressed_oop) };
+        if (!value_array || !vmhook::hotspot::is_valid_pointer(value_array))
+        {
+            return {};
+        }
+
+        const std::int32_t raw_len{ vmhook::array_length(value_array) };
+        if (raw_len <= 0)
+        {
+            return {};
+        }
+
+        // Helper: encode a single UTF-16 code unit as UTF-8 bytes.
+        auto encode_utf8{ [](std::string& out, std::uint16_t ch)
+        {
+            if (ch < 0x80u)
+            {
+                out += static_cast<char>(ch);
+            }
+            else if (ch < 0x800u)
+            {
+                out += static_cast<char>(0xC0u | (ch >> 6));
+                out += static_cast<char>(0x80u | (ch & 0x3Fu));
+            }
+            else
+            {
+                out += static_cast<char>(0xE0u | (ch >> 12));
+                out += static_cast<char>(0x80u | ((ch >> 6) & 0x3Fu));
+                out += static_cast<char>(0x80u | (ch & 0x3Fu));
+            }
+        }};
+
+        std::string result{};
+
+        if (value_entry->signature == "[C")
+        {
+            // Java 8: char[] – each element is one UTF-16 code unit (uint16_t).
+            result.reserve(static_cast<std::size_t>(raw_len));
+            for (std::int32_t i{ 0 }; i < raw_len; ++i)
+            {
+                encode_utf8(result, vmhook::get_array_element<std::uint16_t>(value_array, i));
+            }
+        }
+        else if (value_entry->signature == "[B")
+        {
+            // Java 9+ compact strings.
+            std::int8_t coder{ 0 };
+            const auto coder_entry{ vmhook::find_field(string_klass, "coder") };
+            if (coder_entry)
+            {
+                std::memcpy(&coder,
+                            reinterpret_cast<const std::uint8_t*>(string_oop) + coder_entry->offset,
+                            sizeof(coder));
+            }
+
+            if (coder == 0)
+            {
+                // LATIN1: one byte per character.
+                result.reserve(static_cast<std::size_t>(raw_len));
+                for (std::int32_t i{ 0 }; i < raw_len; ++i)
+                {
+                    const std::uint8_t b{ vmhook::get_array_element<std::uint8_t>(value_array, i) };
+                    encode_utf8(result, static_cast<std::uint16_t>(b));
+                }
+            }
+            else
+            {
+                // UTF-16LE: two bytes per character.
+                const std::int32_t char_count{ raw_len / 2 };
+                result.reserve(static_cast<std::size_t>(char_count));
+                for (std::int32_t i{ 0 }; i < char_count; ++i)
+                {
+                    const std::uint8_t lo{ vmhook::get_array_element<std::uint8_t>(value_array, i * 2) };
+                    const std::uint8_t hi{ vmhook::get_array_element<std::uint8_t>(value_array, i * 2 + 1) };
+                    encode_utf8(result, static_cast<std::uint16_t>(lo | (hi << 8)));
+                }
+            }
+        }
+
+        return result;
+    }
+
 // --- Field proxy ----------------------------------------------------------
 
     /*
@@ -3777,6 +3909,88 @@ namespace vmhook
             std::uint32_t value{};
             std::memcpy(&value, this->field_pointer, sizeof(value));
             return value;
+        }
+
+        /*
+            @brief Reads a java.lang.String field and returns its content as UTF-8 std::string.
+            @return The string content, or an empty string when the field is null or unreadable.
+            @details Only valid for fields with a "Ljava/lang/String;" signature.
+            Delegates to vmhook::read_java_string() which handles both the Java 8
+            char-array layout and the Java 9+ compact-string (byte[] + coder) layout.
+        */
+        auto get_as_string() const noexcept
+            -> std::string
+        {
+            if (!this->field_pointer)
+            {
+                return {};
+            }
+
+            std::uint32_t compressed{};
+            std::memcpy(&compressed, this->field_pointer, sizeof(compressed));
+            if (!compressed)
+            {
+                return {};
+            }
+
+            void* const string_oop{ vmhook::hotspot::decode_oop_pointer(compressed) };
+            if (!string_oop || !vmhook::hotspot::is_valid_pointer(string_oop))
+            {
+                return {};
+            }
+
+            return vmhook::read_java_string(string_oop);
+        }
+
+        /*
+            @brief Reads a java.lang.String[] field and returns each element as a UTF-8 std::string.
+            @return A vector of string values; null elements produce empty strings.
+            @details Only valid for fields with a "[Ljava/lang/String;" signature.
+            Each element of the Java array is a compressed OOP pointing to a String object;
+            vmhook::read_java_string() is called for each non-null element.
+        */
+        auto get_as_string_vector() const noexcept
+            -> std::vector<std::string>
+        {
+            std::vector<std::string> result{};
+            if (!this->field_pointer)
+            {
+                return result;
+            }
+
+            std::uint32_t compressed{};
+            std::memcpy(&compressed, this->field_pointer, sizeof(compressed));
+            if (!compressed)
+            {
+                return result;
+            }
+
+            void* const array_oop{ vmhook::hotspot::decode_oop_pointer(compressed) };
+            if (!array_oop || !vmhook::hotspot::is_valid_pointer(array_oop))
+            {
+                return result;
+            }
+
+            const std::int32_t length{ vmhook::array_length(array_oop) };
+            if (length <= 0)
+            {
+                return result;
+            }
+
+            result.reserve(static_cast<std::size_t>(length));
+            for (std::int32_t i{ 0 }; i < length; ++i)
+            {
+                const std::uint32_t elem_compressed{ vmhook::get_array_element<std::uint32_t>(array_oop, i) };
+                if (!elem_compressed)
+                {
+                    result.emplace_back();
+                    continue;
+                }
+                void* const str_oop{ vmhook::hotspot::decode_oop_pointer(elem_compressed) };
+                result.push_back(vmhook::read_java_string(str_oop));
+            }
+
+            return result;
         }
 
     private:
