@@ -824,7 +824,7 @@ namespace
         example_class::set_hook_probe_requested(false);
 
         const bool hook_installed{ vmhook::hook<example_class>("nonStaticCallMe",
-            [](bool* /*cancel*/, const std::unique_ptr<example_class>& self, std::int32_t value)
+            [](vmhook::return_value& /*retval*/, const std::unique_ptr<example_class>& self, std::int32_t value)
             {
                 ++hook_call_count;
                 hook_saw_instance.store(self != nullptr);

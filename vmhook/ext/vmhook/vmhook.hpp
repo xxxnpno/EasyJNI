@@ -112,6 +112,48 @@ namespace vmhook
         std::string message;
     };
 
+    namespace hotspot { struct return_slot; }
+
+    /*
+        @brief Handle passed as the first argument to every hook callback.
+        @details
+        Call set(value) to suppress the original Java method body and return a
+        custom value to the caller.  Call cancel() to suppress without a return
+        value (for void methods).  If neither is called the original method runs
+        normally.
+
+        Example:
+            vmhook::hook<MyClass>("getScore",
+                [](vmhook::return_value& ret, const std::unique_ptr<MyClass>& self) {
+                    ret.set(std::int32_t{ 9999 });   // always return 9999
+                });
+    */
+    class return_value
+    {
+    public:
+        explicit return_value(vmhook::hotspot::return_slot* slot) noexcept
+            : slot_{ slot }
+        {
+        }
+
+        template<typename T>
+        auto set(const T value) noexcept -> void
+        {
+            static_assert(sizeof(T) <= sizeof(std::int64_t), "return type too large for hook slot");
+            slot_->cancel = true;
+            slot_->retval  = 0;
+            std::memcpy(&slot_->retval, &value, sizeof(T));
+        }
+
+        auto cancel() noexcept -> void
+        {
+            slot_->cancel = true;
+        }
+
+    private:
+        vmhook::hotspot::return_slot* slot_{ nullptr };
+    };
+
     namespace hotspot
     {
         struct vm_struct_entry_t;
@@ -2242,7 +2284,20 @@ namespace vmhook
             return nullptr;
         }
 
-        using detour_function_t = void(*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, bool*);
+        /*
+            @brief Stack slot passed by the trampoline to common_detour.
+            The cancel field suppresses the original method body when set to true.
+            The retval field holds the raw 64-bit return value written into rax/xmm0
+            when cancel is true; ignored for void methods.
+        */
+        struct return_slot
+        {
+            bool          cancel{ false };
+            // 7 bytes implicit padding
+            std::int64_t  retval{ 0 };
+        };
+
+        using detour_function_t = void(*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*);
 
         /*
             @brief Type-erased container for method arguments obtained via auto-detection.
@@ -2619,11 +2674,17 @@ namespace vmhook
             {
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
                 static constexpr std::int32_t JMP_SIZE{ 5 };
-                static constexpr std::int32_t JE_OFFSET{ 0x3d };
+                static constexpr std::int32_t JE_OFFSET{ 0x40 };   // offset of je in assembly
                 static constexpr std::int32_t JE_SIZE{ 6 };
-                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x56 };
+                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x5C }; // offset of data slot
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
+                // Stack layout after the two pushes:
+                //   [rsp+0]  return_slot::cancel  (bool, 1 byte; rest zeroed)
+                //   [rsp+8]  return_slot::retval  (int64_t)
+                //
+                // On the cancel path rbx carries the retval across the register restores
+                // so it can be placed into rax/xmm0 before returning to Java.
                 std::uint8_t assembly[]
                 {
                     0x50,                                           // push rax
@@ -2634,21 +2695,23 @@ namespace vmhook
                     0x41, 0x52,                                     // push r10
                     0x41, 0x53,                                     // push r11
                     0x55,                                           // push rbp
-                    0x6A, 0x00,                                     // push 0x0  ; cancel flag
+                    0x6A, 0x00,                                     // push 0x0  ; return_slot::retval  (slot +8)
+                    0x6A, 0x00,                                     // push 0x0  ; return_slot::cancel  (slot +0)
 
-                    0x48, 0x89, 0xE9,                               // mov rcx, rbp  ; frame*
-                    0x4C, 0x89, 0xFA,                               // mov rdx, r15  ; java_thread*
-                    0x4C, 0x8D, 0x04, 0x24,                         // lea r8,  [rsp] ; bool* cancel
+                    0x48, 0x89, 0xE9,                               // mov rcx, rbp   ; frame*
+                    0x4C, 0x89, 0xFA,                               // mov rdx, r15   ; java_thread*
+                    0x4C, 0x8D, 0x04, 0x24,                         // lea r8, [rsp]  ; return_slot*
 
                     0x48, 0x89, 0xE5,                               // mov rbp, rsp
                     0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
                     0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20
 
-                    0xFF, 0x15, 0x2D, 0x00, 0x00, 0x00,             // call [rip+0x2D]
+                    0xFF, 0x15, 0x31, 0x00, 0x00, 0x00,             // call [rip+0x31]
 
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
 
-                    0x58,                                           // pop rax  ; cancel flag value
+                    0x58,                                           // pop rax   ; cancel flag
+                    0x5B,                                           // pop rbx   ; retval  (rbx is callee-saved, not in save list)
                     0x48, 0x83, 0xF8, 0x00,                         // cmp rax, 0x0
 
                     0x5D,                                           // pop rbp
@@ -2658,14 +2721,13 @@ namespace vmhook
                     0x41, 0x58,                                     // pop r8
                     0x5A,                                           // pop rdx
                     0x59,                                           // pop rcx
-                    0x58,                                           // pop rax
+                    0x58,                                           // pop rax   ; restore original rax
 
-                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je ????????  ; cancel path
+                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je ????????  ; resume path (cancel==false)
 
-                    // resume path: fall through to original code (JE not taken)
-
-                    // cancel path
-                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax
+                    // cancel path (cancel==true, falls through):
+                    0x48, 0x89, 0xD8,                               // mov rax, rbx        ; integer/pointer return
+                    0x66, 0x48, 0x0F, 0x6E, 0xC3,                   // movq xmm0, rbx      ; float/double return
                     0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
                     0x5D,                                           // pop rbp
@@ -2755,7 +2817,7 @@ namespace vmhook
         struct hooked_method
         {
             vmhook::hotspot::method* method{ nullptr };
-            std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, bool*)> detour;
+            std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*)> detour;
             void* original_code{ nullptr };
             void* original_from_interpreted_entry{ nullptr };
             void* original_from_compiled_entry{ nullptr };
@@ -2800,7 +2862,7 @@ namespace vmhook
             detour returns we force the state to _thread_in_Java so the bytecode
             dispatch that follows finds the correct state.
         */
-        static auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, bool* const cancel) 
+        static auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, vmhook::hotspot::return_slot* const slot)
             -> void
         {
             try
@@ -2816,7 +2878,7 @@ namespace vmhook
                 {
                     if (hook.method == current_method)
                     {
-                        hook.detour(frame_pointer, thread, cancel);
+                        hook.detour(frame_pointer, thread, slot);
                         // Ensure the thread state is _thread_in_Java after the detour
                         // so the bytecode dispatcher finds a consistent state.
                         thread->set_thread_state(vmhook::hotspot::java_thread_state::_thread_in_Java);
@@ -3233,13 +3295,13 @@ namespace vmhook
 
             // Wrap the user callable: extract typed Java args from the frame and forward them.
             auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour)]
-                (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, bool* const cancel)
+                (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot* const slot)
             {
-                // Slots are indexed from 0: for instance methods slot 0 is 'this', then
-                // the explicit parameters follow. Static methods start at slot 0 directly.
+                vmhook::return_value retval{ slot };
+                // Slots indexed from 0: instance methods have 'this' at slot 0.
                 auto invoke = [&]<std::size_t... Is>(std::index_sequence<Is...>)
                 {
-                    detour(cancel,
+                    detour(retval,
                         vmhook::detail::extract_frame_arg<std::tuple_element_t<Is, method_arg_tuple>>(
                             frame_pointer, static_cast<std::int32_t>(Is))...);
                 };
