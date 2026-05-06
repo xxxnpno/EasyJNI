@@ -73,6 +73,7 @@
 #include <cstring>
 #include <optional>
 #include <variant>
+#include <functional>
 
 #include <windows.h>
 
