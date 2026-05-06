@@ -555,7 +555,7 @@ public:
     {
         const std::int32_t before_call_count{ this->get_non_static_called() };
 
-        this->get_method("notStaticCallMe")->call(value);
+        this->get_method("nonStaticCallMe")->call(value);
 
         if (this->get_non_static_called() == before_call_count)
         {
@@ -819,7 +819,7 @@ namespace
         instance.not_static_call_me(2);
 
         check_equal("staticCallMe", example_class::get_static_called(), static_cast<std::int32_t>(1));
-        check_equal("notStaticCallMe", instance.get_non_static_called(), static_cast<std::int32_t>(1));
+        check_equal("nonStaticCallMe", instance.get_non_static_called(), static_cast<std::int32_t>(1));
     }
 
     auto test_method_hook(example_class& instance)
@@ -827,7 +827,7 @@ namespace
     {
         /*
             This validates the low-level interpreter hook path. The native worker
-            installs the hook, asks the Java main loop to call notStaticCallMe(77),
+            installs the hook, asks the Java main loop to call nonStaticCallMe(77),
             then waits for the detour to observe that call.
         */
         hook_call_count.store(0);
@@ -838,7 +838,7 @@ namespace
         example_class::set_hook_probe_done(false);
         example_class::set_hook_probe_requested(false);
 
-        const bool hook_installed{ vmhook::hook<example_class>("notStaticCallMe", not_static_call_me_detour) };
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticCallMe", not_static_call_me_detour) };
         check("hookInstalled", hook_installed);
 
         if (!hook_installed)

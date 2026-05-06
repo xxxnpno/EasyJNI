@@ -28,7 +28,7 @@ public class Main
         {
             if (Example.hookProbeRequested && !Example.hookProbeDone)
             {
-                Example.instance.notStaticCallMe(77);
+                Example.instance.nonStaticCallMe(77);
                 Example.hookProbeDone = true;
             }
 
