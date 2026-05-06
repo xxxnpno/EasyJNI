@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  # ─── Build C++ artifacts ────────────────────────────────────────────────────
+  build-cpp:
+    name: Build C++ (injector + test DLL)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Set up the MSVC x64 toolchain (cl.exe, link.exe, Windows SDK headers/libs).
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Create build directory
+        run: New-Item -ItemType Directory -Force -Path build | Out-Null
+        shell: pwsh
+
+      # Build injector.exe from injector/src/main.cpp.
+      # Uses std:c++23 to match the project's language standard.
+      - name: Compile injector.exe
+        shell: cmd
+        run: >
+          cl /nologo /std:c++23 /EHsc /MD /O2
+          /DNDEBUG /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DUNICODE /D_UNICODE
+          /Fe"build\injector.exe"
+          "injector\src\main.cpp"
+          /link /SUBSYSTEM:CONSOLE kernel32.lib
+
+      # Build vmhook.dll (test variant) from test/vmhook_test.cpp.
+      # The injector resolves the DLL as <injector_dir>\vmhook.dll, so the
+      # output must be named vmhook.dll and placed next to injector.exe.
+      - name: Compile vmhook.dll (test)
+        shell: cmd
+        run: >
+          cl /nologo /std:c++23 /EHsc /LD /O2
+          /DNDEBUG /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00
+          /I"vmhook\ext"
+          /Fe"build\vmhook.dll"
+          "test\vmhook_test.cpp"
+          /link kernel32.lib
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-build
+          path: |
+            build/injector.exe
+            build/vmhook.dll
+
+  # ─── Run unit tests for each Java version ───────────────────────────────────
+  test:
+    name: Test Java ${{ matrix.java-version }}
+    needs: build-cpp
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Java 8 through the latest release.  Update the list when a new
+        # major version ships (Temurin releases follow the OpenJDK cadence).
+        java-version: ['8', '11', '17', '21', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java ${{ matrix.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cpp-build
+          path: build
+
+      - name: Compile Java example classes
+        shell: cmd
+        run: |
+          mkdir out 2>nul || true
+          javac -d out example\vmhook\Main.java example\vmhook\Example.java example\vmhook\A.java
+
+      # The test sequence:
+      #  1. Start java.exe in the background (Main waits for stopJVM = true).
+      #  2. Give the JVM ~5 s to initialise and load vmhook.Example via
+      #     Class.forName (see Main.java).
+      #  3. Run injector.exe – it finds the single java.exe process and loads
+      #     build\vmhook.dll into it.
+      #  4. The injected DLL (vmhook_test.cpp) reads every getter field,
+      #     compares with the known Java values, writes test_results.txt,
+      #     then sets stopJVM = true so Main exits cleanly.
+      #  5. Wait for java.exe to exit (30 s timeout).
+      #  6. Read test_results.txt and fail the step if any [FAIL] line exists.
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          Write-Host "=== Java ${{ matrix.java-version }} unit test ==="
+
+          # Start the Java example process (background).
+          $java = Start-Process `
+            -FilePath "java" `
+            -ArgumentList "-cp", "out", "vmhook.Main" `
+            -PassThru -WindowStyle Hidden
+          Write-Host "Started java.exe (PID $($java.Id))"
+
+          # Wait for JVM + class loading to complete.
+          Start-Sleep -Seconds 5
+
+          # Inject the test DLL.
+          $inject = Start-Process `
+            -FilePath "build\injector.exe" `
+            -PassThru -Wait -WindowStyle Hidden
+          Write-Host "injector.exe exited with code $($inject.ExitCode)"
+
+          if ($inject.ExitCode -ne 0) {
+            Write-Error "Injection failed (exit code $($inject.ExitCode))"
+            Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          # Wait for java.exe to exit (the DLL sets stopJVM = true when done).
+          $exited = $java.WaitForExit(30000)
+          if (-not $exited) {
+            Write-Error "java.exe did not exit within 30 s"
+            Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "java.exe exited with code $($java.ExitCode)"
+
+          # Parse results file.
+          if (-not (Test-Path "test_results.txt")) {
+            Write-Error "test_results.txt was not created by the test DLL"
+            exit 1
+          }
+
+          $results = Get-Content "test_results.txt"
+          $results | ForEach-Object { Write-Host $_ }
+
+          $failures = $results | Where-Object { $_ -match '^\[FAIL\]' }
+          if ($failures) {
+            Write-Host ""
+            Write-Error "$($failures.Count) unit test(s) FAILED"
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "All unit tests PASSED for Java ${{ matrix.java-version }}"
