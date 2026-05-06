@@ -1,5 +1,6 @@
 #include <vmhook/vmhook.hpp>
 
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
@@ -500,6 +501,30 @@ public:
         get_static_field("staticCalled")->set(value);
     }
 
+    static auto get_hook_probe_requested()
+        -> bool
+    {
+        return get_static_field("hookProbeRequested")->get();
+    }
+
+    static auto set_hook_probe_requested(bool value)
+        -> void
+    {
+        get_static_field("hookProbeRequested")->set(value);
+    }
+
+    static auto get_hook_probe_done()
+        -> bool
+    {
+        return get_static_field("hookProbeDone")->get();
+    }
+
+    static auto set_hook_probe_done(bool value)
+        -> void
+    {
+        get_static_field("hookProbeDone")->set(value);
+    }
+
     auto get_non_static_called()
         -> std::int32_t
     {
@@ -600,6 +625,25 @@ namespace
     std::ofstream test_log{};
     std::size_t passed_checks{};
     std::size_t failed_checks{};
+    std::atomic_int hook_call_count{};
+    std::atomic_bool hook_saw_instance{};
+    std::atomic_bool hook_saw_expected_argument{};
+
+    auto not_static_call_me_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, bool*)
+        -> void
+    {
+        ++hook_call_count;
+
+        if (!frame_pointer)
+        {
+            return;
+        }
+
+        const auto [instance, value]{ frame_pointer->get_arguments<vmhook::oop_t, std::int32_t>() };
+
+        hook_saw_instance.store(instance != nullptr);
+        hook_saw_expected_argument.store(value == 77);
+    }
 
     auto write_result(const std::string& line)
         -> void
@@ -777,6 +821,53 @@ namespace
         check_equal("staticCallMe", example_class::get_static_called(), static_cast<std::int32_t>(1));
         check_equal("notStaticCallMe", instance.get_non_static_called(), static_cast<std::int32_t>(1));
     }
+
+    auto test_method_hook(example_class& instance)
+        -> void
+    {
+        /*
+            This validates the low-level interpreter hook path. The native worker
+            installs the hook, asks the Java main loop to call notStaticCallMe(77),
+            then waits for the detour to observe that call.
+        */
+        hook_call_count.store(0);
+        hook_saw_instance.store(false);
+        hook_saw_expected_argument.store(false);
+
+        instance.set_non_static_called(0);
+        example_class::set_hook_probe_done(false);
+        example_class::set_hook_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("notStaticCallMe", not_static_call_me_detour) };
+        check("hookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        example_class::set_hook_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+
+        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
+        {
+            if (example_class::get_hook_probe_done())
+            {
+                break;
+            }
+
+            Sleep(1);
+        }
+
+        example_class::set_hook_probe_requested(false);
+
+        check("hookProbeDone", example_class::get_hook_probe_done());
+        check_equal("hookCallCount", hook_call_count.load(), 1);
+        check("hookSawInstance", hook_saw_instance.load());
+        check("hookSawExpectedArgument", hook_saw_expected_argument.load());
+        check_equal("hookAllowedOriginalMethod", instance.get_non_static_called(), static_cast<std::int32_t>(1));
+    }
 }
 
 static auto WINAPI thread_entry(HMODULE module)
@@ -795,6 +886,7 @@ static auto WINAPI thread_entry(HMODULE module)
     if (instance)
     {
         call_example_methods(*instance);
+        test_method_hook(*instance);
         set_expected_values(*instance);
         verify_expected_values(*instance);
     }

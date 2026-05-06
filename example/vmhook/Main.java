@@ -26,6 +26,12 @@ public class Main
         // vmhook has to get_field("stopJVM")->set(true) to stop the JVM
         while(!stopJVM)
         {
+            if (Example.hookProbeRequested && !Example.hookProbeDone)
+            {
+                Example.instance.notStaticCallMe(77);
+                Example.hookProbeDone = true;
+            }
+
             Thread.sleep(1);
         }
 

@@ -73,6 +73,10 @@ public class Example
     // this one will store how many times did nonStaticCallMe got called
     public int nonStaticCalled = 0;
 
+    // these fields coordinate the native hook unit test
+    public static volatile boolean hookProbeRequested = false;
+    public static volatile boolean hookProbeDone = false;
+
     public static void staticCallMe(final int value)
     {
         staticCalled++;
