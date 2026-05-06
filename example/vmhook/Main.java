@@ -28,5 +28,16 @@ public class Main
         {
             Thread.sleep(1);
         }
+
+        // Phase 3: Java-side verification that C++ setter effects are visible.
+        System.out.println("[INFO] Running Java-side setter verification...");
+
+        if (!Example.verifySetterEffects())
+        {
+            System.out.println("[JAVA FAIL] One or more setter verifications failed.");
+            System.exit(1);
+        }
+
+        System.out.println("[JAVA PASS] All setter verifications passed.");
     }
 }

@@ -90,4 +90,86 @@ public class Example
     {
         a.field++;
     }
+
+    // ── Java-side verification of C++ setter effects ──────────────────────────
+    // Called by Main after stopJVM is set to true.
+    // Returns true only if every field holds the value written by C++ Phase 2.
+    public static boolean verifySetterEffects()
+    {
+        boolean ok = true;
+
+        // Static scalars
+        ok = jcheck("staticBool",   staticBool   == false)        & ok;
+        ok = jcheck("staticByte",   staticByte   == 7)             & ok;
+        ok = jcheck("staticShort",  staticShort  == 127)           & ok;
+        ok = jcheck("staticInt",    staticInt    == 0x7fff)        & ok;
+        ok = jcheck("staticLong",   staticLong   == 0x7fffffffL)   & ok;
+        ok = jcheck("staticFloat",  staticFloat  == 1.0f)          & ok;
+        ok = jcheck("staticDouble", staticDouble == 2.0)           & ok;
+        ok = jcheck("staticChar",   staticChar   == 'A')           & ok;
+        ok = jcheck("staticString", "java_ftw".equals(staticString)) & ok;
+
+        // Non-static scalars (on Example.instance)
+        ok = jcheck("notStaticBool",   instance.notStaticBool   == false)       & ok;
+        ok = jcheck("notStaticByte",   instance.notStaticByte   == 7)           & ok;
+        ok = jcheck("notStaticShort",  instance.notStaticShort  == 127)         & ok;
+        ok = jcheck("notStaticInt",    instance.notStaticInt    == 0x7fff)      & ok;
+        ok = jcheck("notStaticLong",   instance.notStaticLong   == 0x7fffffffL) & ok;
+        ok = jcheck("notStaticFloat",  instance.notStaticFloat  == 1.0f)        & ok;
+        ok = jcheck("notStaticDouble", instance.notStaticDouble == 2.0)         & ok;
+        ok = jcheck("notStaticChar",   instance.notStaticChar   == 'B')         & ok;
+        ok = jcheck("notStaticString", "cppwins!".equals(instance.notStaticString)) & ok;
+
+        // Static arrays
+        ok = jcheck("staticBoolArray",
+                !staticBoolArray[0] && staticBoolArray[1] && !staticBoolArray[2]) & ok;
+        ok = jcheck("staticByteArray",
+                staticByteArray[0] == 10 && staticByteArray[1] == 20 && staticByteArray[2] == 30) & ok;
+        ok = jcheck("staticShortArray",
+                staticShortArray[0] == 256 && staticShortArray[1] == 512 && staticShortArray[2] == 768) & ok;
+        ok = jcheck("staticIntArray",
+                staticIntArray[0] == 4096 && staticIntArray[1] == 8192 && staticIntArray[2] == 12288) & ok;
+        ok = jcheck("staticLongArray",
+                staticLongArray[0] == 65536L && staticLongArray[1] == 131072L && staticLongArray[2] == 196608L) & ok;
+        ok = jcheck("staticFloatArray",
+                staticFloatArray[0] == 4.0f && staticFloatArray[1] == 5.0f && staticFloatArray[2] == 6.0f) & ok;
+        ok = jcheck("staticDoubleArray",
+                staticDoubleArray[0] == 4.0 && staticDoubleArray[1] == 5.0 && staticDoubleArray[2] == 6.0) & ok;
+        ok = jcheck("staticCharArray",
+                staticCharArray[0] == 'X' && staticCharArray[1] == 'Y' && staticCharArray[2] == 'Z') & ok;
+        ok = jcheck("staticStringArray",
+                "world".equals(staticStringArray[0]) &&
+                "hello".equals(staticStringArray[1]) &&
+                "?".equals(staticStringArray[2])) & ok;
+
+        // Non-static arrays
+        ok = jcheck("notStaticBoolArray",
+                !instance.notStaticBoolArray[0] && instance.notStaticBoolArray[1] && !instance.notStaticBoolArray[2]) & ok;
+        ok = jcheck("notStaticByteArray",
+                instance.notStaticByteArray[0] == 10 && instance.notStaticByteArray[1] == 20 && instance.notStaticByteArray[2] == 30) & ok;
+        ok = jcheck("notStaticShortArray",
+                instance.notStaticShortArray[0] == 256 && instance.notStaticShortArray[1] == 512 && instance.notStaticShortArray[2] == 768) & ok;
+        ok = jcheck("notStaticIntArray",
+                instance.notStaticIntArray[0] == 4096 && instance.notStaticIntArray[1] == 8192 && instance.notStaticIntArray[2] == 12288) & ok;
+        ok = jcheck("notStaticLongArray",
+                instance.notStaticLongArray[0] == 65536L && instance.notStaticLongArray[1] == 131072L && instance.notStaticLongArray[2] == 196608L) & ok;
+        ok = jcheck("notStaticFloatArray",
+                instance.notStaticFloatArray[0] == 4.0f && instance.notStaticFloatArray[1] == 5.0f && instance.notStaticFloatArray[2] == 6.0f) & ok;
+        ok = jcheck("notStaticDoubleArray",
+                instance.notStaticDoubleArray[0] == 4.0 && instance.notStaticDoubleArray[1] == 5.0 && instance.notStaticDoubleArray[2] == 6.0) & ok;
+        ok = jcheck("notStaticCharArray",
+                instance.notStaticCharArray[0] == 'D' && instance.notStaticCharArray[1] == 'E' && instance.notStaticCharArray[2] == 'F') & ok;
+        ok = jcheck("notStaticStringArray",
+                "hi".equals(instance.notStaticStringArray[0]) &&
+                "love".equals(instance.notStaticStringArray[1]) &&
+                "coding".equals(instance.notStaticStringArray[2])) & ok;
+
+        return ok;
+    }
+
+    private static boolean jcheck(final String name, final boolean condition)
+    {
+        System.out.println(condition ? "[JAVA PASS] " + name : "[JAVA FAIL] " + name);
+        return condition;
+    }
 }

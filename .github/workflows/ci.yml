@@ -126,13 +126,19 @@ jobs:
           }
 
           # Wait for java.exe to exit (the DLL sets stopJVM = true when done).
-          $exited = $java.WaitForExit(30000)
+          $exited = $java.WaitForExit(60000)
           if (-not $exited) {
-            Write-Error "java.exe did not exit within 30 s"
+            Write-Error "java.exe did not exit within 60 s"
             Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue
             exit 1
           }
           Write-Host "java.exe exited with code $($java.ExitCode)"
+
+          # Non-zero exit code means Java-side verifySetterEffects() failed.
+          if ($java.ExitCode -ne 0) {
+            Write-Error "java.exe exited with code $($java.ExitCode) — Java-side setter verification failed"
+            exit 1
+          }
 
           # Parse results file.
           if (-not (Test-Path "test_results.txt")) {

@@ -748,6 +748,114 @@ static auto check_str_vec(const std::string& name,
     emit(actual == expected, name, to_str(actual), to_str(expected));
 }
 
+// ─── Phase 2 set helpers ─────────────────────────────────────────────────────
+//
+// These helpers let the test code reach into Java heap objects that the
+// field_proxy::set() overload cannot touch (non-trivially-copyable types:
+// Java Strings and arrays).
+
+// Decode the compressed OOP stored in a field_proxy into a raw pointer.
+static auto field_oop(const vmhook::field_proxy& fp) noexcept
+    -> void*
+{
+    const std::uint32_t coop{ fp.get_compressed_oop() };
+    if (!coop) return nullptr;
+    void* const ptr{ vmhook::hotspot::decode_oop_pointer(coop) };
+    return vmhook::hotspot::is_valid_pointer(ptr) ? ptr : nullptr;
+}
+
+// Overwrite each byte/char of a Java String object's backing array in-place.
+// new_value must fit within the existing array (we cannot resize Java arrays).
+// Handles both Java 8 (char[] value) and Java 9+ (byte[] value, LATIN1 coder).
+static auto write_java_string(void* const str_oop, std::string_view new_value) noexcept
+    -> void
+{
+    if (!str_oop || !vmhook::hotspot::is_valid_pointer(str_oop)) return;
+
+    vmhook::hotspot::klass* const sk{ vmhook::find_class("java/lang/String") };
+    if (!sk) return;
+
+    const auto ve{ vmhook::find_field(sk, "value") };
+    if (!ve) return;
+
+    std::uint32_t coop{};
+    std::memcpy(&coop,
+                reinterpret_cast<const std::uint8_t*>(str_oop) + ve->offset,
+                sizeof(coop));
+    if (!coop) return;
+
+    void* const arr{ vmhook::hotspot::decode_oop_pointer(coop) };
+    if (!arr || !vmhook::hotspot::is_valid_pointer(arr)) return;
+
+    const std::int32_t cap{ vmhook::array_length(arr) };
+    const std::int32_t wlen{ std::min(static_cast<std::int32_t>(new_value.size()), cap) };
+
+    if (ve->signature == "[C")
+    {
+        for (std::int32_t i{}; i < wlen; ++i)
+            vmhook::set_array_element<std::uint16_t>(arr, i,
+                static_cast<std::uint16_t>(static_cast<unsigned char>(new_value[i])));
+    }
+    else if (ve->signature == "[B")
+    {
+        for (std::int32_t i{}; i < wlen; ++i)
+            vmhook::set_array_element<std::uint8_t>(arr, i,
+                static_cast<std::uint8_t>(new_value[i]));
+    }
+}
+
+// Overwrite a String field (reads the OOP from fp then calls write_java_string).
+static auto set_str_field(const vmhook::field_proxy& fp, std::string_view text) noexcept
+    -> void
+{
+    write_java_string(field_oop(fp), text);
+}
+
+// Overwrite each element of a primitive Java array field.
+template<typename T>
+static auto set_prim_array(const vmhook::field_proxy& fp,
+                           std::initializer_list<T> values) noexcept
+    -> void
+{
+    void* const arr{ field_oop(fp) };
+    if (!arr) return;
+    std::int32_t i{};
+    for (const T v : values)
+        vmhook::set_array_element<T>(arr, i++, v);
+}
+
+// Overwrite a Java boolean[] (JVM stores booleans as uint8_t, 0 or 1).
+static auto set_bool_array(const vmhook::field_proxy& fp,
+                           std::initializer_list<bool> values) noexcept
+    -> void
+{
+    void* const arr{ field_oop(fp) };
+    if (!arr) return;
+    std::int32_t i{};
+    for (const bool v : values)
+        vmhook::set_array_element<std::uint8_t>(arr, i++,
+            v ? std::uint8_t{1} : std::uint8_t{0});
+}
+
+// Overwrite each String element of a String[] field.
+static auto set_str_array(const vmhook::field_proxy& fp,
+                          std::initializer_list<std::string_view> values) noexcept
+    -> void
+{
+    void* const arr{ field_oop(fp) };
+    if (!arr) return;
+    const std::int32_t len{ vmhook::array_length(arr) };
+    std::int32_t i{};
+    for (const std::string_view sv : values)
+    {
+        if (i >= len) break;
+        const std::uint32_t ecoop{ vmhook::get_array_element<std::uint32_t>(arr, i) };
+        if (ecoop)
+            write_java_string(vmhook::hotspot::decode_oop_pointer(ecoop), sv);
+        ++i;
+    }
+}
+
 // ─── Thread entry point ──────────────────────────────────────────────────────
 
 static auto WINAPI thread_entry(HMODULE module)
@@ -919,6 +1027,170 @@ static auto WINAPI thread_entry(HMODULE module)
             { "we", "like", "vmhook" });
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // Phase 2 — set new values from C++, re-verify from C++
+    // ══════════════════════════════════════════════════════════════════════════
+    std::println("[VMHook Test] Phase 2: setting new field values...");
+    g_log << "[VMHook Test] Phase 2: setting new field values...\n";
+
+    // New values (different from originals, same string lengths for in-place edit).
+    static constexpr float  nf  = 1.0f;          // was FLT_MAX
+    static constexpr double nd  = 2.0;            // was DBL_MAX
+
+    // ── Static scalars – set ─────────────────────────────────────────────────
+    // Primitives use wrapper setters (trivially copyable → field_proxy::set() works).
+    ex.set_static_bool(false);
+    ex.set_static_byte(std::byte{7});
+    ex.set_static_short(std::int16_t{127});
+    ex.set_static_int(std::int32_t{0x7fff});
+    ex.set_static_long(std::int64_t{0x7fffffffLL});
+    ex.set_static_float(nf);
+    ex.set_static_double(nd);
+    // char: wrapper writes 1 byte (8-bit) into a 2-byte Java char field and
+    // corrupts it; write the full uint16_t directly instead.
+    ex.get_field("staticChar")->set(static_cast<std::uint16_t>('A'));
+    // String/array: wrapper setter is a no-op for non-trivially-copyable types;
+    // modify the Java heap objects in-place.
+    set_str_field(*ex.get_field("staticString"), "java_ftw");
+
+    // ── Non-static scalars – set ─────────────────────────────────────────────
+    if (inst)
+    {
+        inst->set_not_static_bool(false);
+        inst->set_not_static_byte(std::byte{7});
+        inst->set_not_static_short(std::int16_t{127});
+        inst->set_not_static_int(std::int32_t{0x7fff});
+        inst->set_not_static_long(std::int64_t{0x7fffffffLL});
+        inst->set_not_static_float(nf);
+        inst->set_not_static_double(nd);
+        inst->get_field("notStaticChar")->set(static_cast<std::uint16_t>('B'));
+        set_str_field(*inst->get_field("notStaticString"), "cppwins!");
+    }
+
+    // ── Static arrays – set ──────────────────────────────────────────────────
+    set_bool_array(*ex.get_field("staticBoolArray"),   { false, true, false });
+    set_prim_array<std::byte>(*ex.get_field("staticByteArray"),
+        { std::byte{10}, std::byte{20}, std::byte{30} });
+    set_prim_array<std::int16_t>(*ex.get_field("staticShortArray"),  { 256, 512, 768 });
+    set_prim_array<std::int32_t>(*ex.get_field("staticIntArray"),    { 4096, 8192, 12288 });
+    set_prim_array<std::int64_t>(*ex.get_field("staticLongArray"),
+        { 65536LL, 131072LL, 196608LL });
+    set_prim_array<float>(*ex.get_field("staticFloatArray"),         { 4.0f, 5.0f, 6.0f });
+    set_prim_array<double>(*ex.get_field("staticDoubleArray"),       { 4.0, 5.0, 6.0 });
+    set_prim_array<std::uint16_t>(*ex.get_field("staticCharArray"),
+        { std::uint16_t{'X'}, std::uint16_t{'Y'}, std::uint16_t{'Z'} });
+    set_str_array(*ex.get_field("staticStringArray"),   { "world", "hello", "?" });
+
+    // ── Non-static arrays – set ───────────────────────────────────────────────
+    if (inst)
+    {
+        set_bool_array(*inst->get_field("notStaticBoolArray"), { false, true, false });
+        set_prim_array<std::byte>(*inst->get_field("notStaticByteArray"),
+            { std::byte{10}, std::byte{20}, std::byte{30} });
+        set_prim_array<std::int16_t>(*inst->get_field("notStaticShortArray"),
+            { 256, 512, 768 });
+        set_prim_array<std::int32_t>(*inst->get_field("notStaticIntArray"),
+            { 4096, 8192, 12288 });
+        set_prim_array<std::int64_t>(*inst->get_field("notStaticLongArray"),
+            { 65536LL, 131072LL, 196608LL });
+        set_prim_array<float>(*inst->get_field("notStaticFloatArray"),
+            { 4.0f, 5.0f, 6.0f });
+        set_prim_array<double>(*inst->get_field("notStaticDoubleArray"),
+            { 4.0, 5.0, 6.0 });
+        set_prim_array<std::uint16_t>(*inst->get_field("notStaticCharArray"),
+            { std::uint16_t{'D'}, std::uint16_t{'E'}, std::uint16_t{'F'} });
+        set_str_array(*inst->get_field("notStaticStringArray"),
+            { "hi", "love", "coding" });
+    }
+
+    // ── C++ re-read verification ──────────────────────────────────────────────
+    std::println("[VMHook Test] Phase 2: verifying from C++ side...");
+    g_log << "[VMHook Test] Phase 2: verifying from C++ side...\n";
+
+    check_int ("set:staticBool",  ex.get_static_bool()   ? 1 : 0,  0);
+    { const std::int8_t v{ ex.get_field("staticByte")->get() }; check_int("set:staticByte", v, 7); }
+    check_int ("set:staticShort", ex.get_static_short(), 127);
+    check_int ("set:staticInt",   ex.get_static_int(),   0x7fff);
+    check_int ("set:staticLong",  ex.get_static_long(),  0x7fffffffLL);
+    check_float ("set:staticFloat",  ex.get_static_float(),  nf);
+    check_double("set:staticDouble", ex.get_static_double(), nd);
+    { const std::uint16_t v{ ex.get_field("staticChar")->get() }; check_uint("set:staticChar", v, std::uint16_t{'A'}); }
+    check_str("set:staticString",
+        ex.get_field("staticString")->get_as_string(), "java_ftw");
+
+    if (inst)
+    {
+        check_int ("set:notStaticBool",  inst->get_not_static_bool()   ? 1 : 0, 0);
+        { const std::int8_t v{ inst->get_field("notStaticByte")->get() }; check_int("set:notStaticByte", v, 7); }
+        check_int ("set:notStaticShort", inst->get_not_static_short(), 127);
+        check_int ("set:notStaticInt",   inst->get_not_static_int(),   0x7fff);
+        check_int ("set:notStaticLong",  inst->get_not_static_long(),  0x7fffffffLL);
+        check_float ("set:notStaticFloat",  inst->get_not_static_float(),  nf);
+        check_double("set:notStaticDouble", inst->get_not_static_double(), nd);
+        { const std::uint16_t v{ inst->get_field("notStaticChar")->get() }; check_uint("set:notStaticChar", v, std::uint16_t{'B'}); }
+        check_str("set:notStaticString",
+            inst->get_field("notStaticString")->get_as_string(), "cppwins!");
+    }
+
+    check_bool_vec("set:staticBoolArray",
+        ex.get_field("staticBoolArray")->get_as_vector_bool(),
+        { false, true, false });
+    check_vec<std::byte>("set:staticByteArray",
+        ex.get_field("staticByteArray")->get_as_vector<std::byte>(),
+        { std::byte{10}, std::byte{20}, std::byte{30} });
+    check_vec<std::int16_t>("set:staticShortArray",
+        ex.get_field("staticShortArray")->get_as_vector<std::int16_t>(),
+        { 256, 512, 768 });
+    check_vec<std::int32_t>("set:staticIntArray",
+        ex.get_field("staticIntArray")->get_as_vector<std::int32_t>(),
+        { 4096, 8192, 12288 });
+    check_vec<std::int64_t>("set:staticLongArray",
+        ex.get_field("staticLongArray")->get_as_vector<std::int64_t>(),
+        { 65536LL, 131072LL, 196608LL });
+    check_float_vec("set:staticFloatArray",
+        ex.get_field("staticFloatArray")->get_as_vector<float>(),
+        { 4.0f, 5.0f, 6.0f });
+    check_double_vec("set:staticDoubleArray",
+        ex.get_field("staticDoubleArray")->get_as_vector<double>(),
+        { 4.0, 5.0, 6.0 });
+    check_vec<std::uint16_t>("set:staticCharArray",
+        ex.get_field("staticCharArray")->get_as_vector<std::uint16_t>(),
+        { std::uint16_t{'X'}, std::uint16_t{'Y'}, std::uint16_t{'Z'} });
+    check_str_vec("set:staticStringArray",
+        ex.get_field("staticStringArray")->get_as_string_vector(),
+        { "world", "hello", "?" });
+
+    if (inst)
+    {
+        check_bool_vec("set:notStaticBoolArray",
+            inst->get_field("notStaticBoolArray")->get_as_vector_bool(),
+            { false, true, false });
+        check_vec<std::byte>("set:notStaticByteArray",
+            inst->get_field("notStaticByteArray")->get_as_vector<std::byte>(),
+            { std::byte{10}, std::byte{20}, std::byte{30} });
+        check_vec<std::int16_t>("set:notStaticShortArray",
+            inst->get_field("notStaticShortArray")->get_as_vector<std::int16_t>(),
+            { 256, 512, 768 });
+        check_vec<std::int32_t>("set:notStaticIntArray",
+            inst->get_field("notStaticIntArray")->get_as_vector<std::int32_t>(),
+            { 4096, 8192, 12288 });
+        check_vec<std::int64_t>("set:notStaticLongArray",
+            inst->get_field("notStaticLongArray")->get_as_vector<std::int64_t>(),
+            { 65536LL, 131072LL, 196608LL });
+        check_float_vec("set:notStaticFloatArray",
+            inst->get_field("notStaticFloatArray")->get_as_vector<float>(),
+            { 4.0f, 5.0f, 6.0f });
+        check_double_vec("set:notStaticDoubleArray",
+            inst->get_field("notStaticDoubleArray")->get_as_vector<double>(),
+            { 4.0, 5.0, 6.0 });
+        check_vec<std::uint16_t>("set:notStaticCharArray",
+            inst->get_field("notStaticCharArray")->get_as_vector<std::uint16_t>(),
+            { std::uint16_t{'D'}, std::uint16_t{'E'}, std::uint16_t{'F'} });
+        check_str_vec("set:notStaticStringArray",
+            inst->get_field("notStaticStringArray")->get_as_string_vector(),
+            { "hi", "love", "coding" });
+    }
+
     // ── Summary ───────────────────────────────────────────────────────────────
     const std::string summary{
         std::format("TOTAL: {}/{} PASSED", g_passed, g_passed + g_failed)
@@ -927,7 +1199,7 @@ static auto WINAPI thread_entry(HMODULE module)
     g_log << summary << '\n';
     g_log.close();
 
-    // Signal Main.java to exit.
+    // Signal Main.java to exit.  Java will run verifySetterEffects() after this.
     main_class main_obj{ nullptr };
     main_obj.set_stop_jvm(true);
 
