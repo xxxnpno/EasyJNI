@@ -112,7 +112,14 @@ namespace vmhook
         std::string message;
     };
 
-    namespace hotspot { struct return_slot; }
+    namespace hotspot
+    {
+        struct return_slot
+        {
+            bool         cancel{ false };
+            std::int64_t retval{ 0 };
+        };
+    }
 
     /*
         @brief Handle passed as the first argument to every hook callback.
@@ -2283,19 +2290,6 @@ namespace vmhook
 
             return nullptr;
         }
-
-        /*
-            @brief Stack slot passed by the trampoline to common_detour.
-            The cancel field suppresses the original method body when set to true.
-            The retval field holds the raw 64-bit return value written into rax/xmm0
-            when cancel is true; ignored for void methods.
-        */
-        struct return_slot
-        {
-            bool          cancel{ false };
-            // 7 bytes implicit padding
-            std::int64_t  retval{ 0 };
-        };
 
         using detour_function_t = void(*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*);
 
