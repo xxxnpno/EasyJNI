@@ -1,17 +1,197 @@
 # vmhook
 
-## This project's goal is to allow clean and fast interactions between a Java Virtual Machine and native C++ code
+vmhook is a C++23 single-header library for interacting with a running HotSpot
+Java Virtual Machine from native code without JNI or JVMTI. A C++ wrapper class
+is registered against a Java class name, then wrapper methods read fields, write
+fields, and call Java methods through a small proxy API.
 
-- _Is this a copy of the Java Native Interface?_
-Everything that the Java Native Interface C++ library offers can be done using vmhook, but vmhook is way more powerful.  
-First, vmhook's API is way easier to use: no more local or global references; with vmhook, you associate a C++ class with a Java class, and you work directly on the Java Virtual Machine with your C++ code. Each Java field or method usage is one C++ function call with **no Java signature and no C++ type templates**.  
-Secondly, vmhook works directly with Java HotSpot. That means insanely fast interactions and no Java Native Interface overhead.  
-Finally, hooking is an important part of vmhook. With vmhook, you can hook method calls, intercept arguments, modify them, totally stop Java methods from being called, or return your own values. You can also intercept when a Java class is being loaded in the Java Virtual Machine. You work directly with the Just-In-Time compiler's Assembly instructions; retransform classes, add your own Assembly instructions. And the best part is: you don't have to have any Java Virtual Machine Tool Interface permissions since it doesn't use them. **Vmhook works on any Java Virtual Machine from Java 8 to the latest and doesn't care about the Java Virtual Machine's opinion.**
+## Platform
 
-## Currently only Windows support
+vmhook currently targets Windows and MSVC.
 
-- Compile with MSVC
-
-```bash
-msbuild vmhook.slnx /p:Configuration=Release /p:Platform=x64
+```powershell
+MSBuild vmhook.slnx /p:Configuration=Release /p:Platform=x64 /m
 ```
+
+## Basic Model
+
+Include the header:
+
+```cpp
+#include <vmhook/vmhook.hpp>
+```
+
+Create one C++ wrapper class for each Java class you want to use:
+
+```cpp
+class example_class : public vmhook::object<example_class>
+{
+public:
+    explicit example_class(vmhook::oop_t instance)
+        : vmhook::object<example_class>{ instance }
+    {
+    }
+
+    auto get_counter()
+        -> std::int32_t
+    {
+        return this->get_field("counter")->get();
+    }
+
+    auto set_counter(std::int32_t value)
+        -> void
+    {
+        this->get_field("counter")->set(value);
+    }
+
+    auto tick(std::int32_t amount)
+        -> void
+    {
+        this->get_method("tick")->call(amount);
+    }
+};
+```
+
+Register the wrapper once before using it:
+
+```cpp
+vmhook::register_class<example_class>("vmhook/Example");
+```
+
+Wrap a decoded Java object pointer when you need instance fields or instance
+methods:
+
+```cpp
+example_class example{ instance_oop };
+
+std::int32_t counter{ example.get_counter() };
+example.set_counter(counter + 1);
+example.tick(5);
+```
+
+## Fields
+
+Fields use one read function and one write function:
+
+```cpp
+this->get_field("fieldName")->get();
+this->get_field("fieldName")->set(value);
+```
+
+`get()` converts to the C++ return type selected by your wrapper method. The
+same API is used for primitives, strings, object wrappers, and vectors:
+
+```cpp
+auto get_name()
+    -> std::string
+{
+    return this->get_field("name")->get();
+}
+
+auto get_flags()
+    -> std::vector<bool>
+{
+    return this->get_field("flags")->get();
+}
+
+auto set_flags(const std::vector<bool>& value)
+    -> void
+{
+    this->get_field("flags")->set(value);
+}
+```
+
+## Static Fields
+
+Static Java fields can be exposed as static C++ methods. Add a class-level
+`get_field(...)` wrapper that delegates to `get_static_field(...)`, then write
+normal static getters and setters:
+
+```cpp
+class example_class : public vmhook::object<example_class>
+{
+public:
+    explicit example_class(vmhook::oop_t instance)
+        : vmhook::object<example_class>{ instance }
+    {
+    }
+
+    static auto get_field(const std::string_view name)
+        -> std::optional<vmhook::field_proxy>
+    {
+        return get_static_field(name);
+    }
+
+    static auto get_static_double()
+        -> double
+    {
+        return get_field("staticDouble")->get();
+    }
+
+    static auto set_static_double(double value)
+        -> void
+    {
+        get_field("staticDouble")->set(value);
+    }
+};
+```
+
+Use it without constructing a dummy object:
+
+```cpp
+example_class::set_static_double(2.0);
+double value{ example_class::get_static_double() };
+```
+
+## Methods
+
+Method calls intentionally mirror fields:
+
+```cpp
+this->get_method("methodName")->call(arg1, arg2, arg3);
+```
+
+Expose Java methods through wrapper methods so the rest of your C++ code never
+uses raw method names:
+
+```cpp
+auto add_score(std::int32_t amount, const std::string& reason)
+    -> void
+{
+    this->get_method("addScore")->call(amount, reason);
+}
+```
+
+Static Java methods can be exposed as static C++ methods with a class-level
+`get_method(...)` wrapper:
+
+```cpp
+static auto get_method(const std::string_view method_name)
+    -> std::optional<vmhook::method_proxy>
+{
+    return get_static_method(method_name);
+}
+
+static auto static_call_me(std::int32_t value)
+    -> void
+{
+    get_method("staticCallMe")->call(value);
+}
+```
+
+## Example
+
+The complete example lives in `vmhook/src/example.cpp`. It demonstrates:
+
+- wrapper classes for `vmhook.Main`, `vmhook.Example`, and `vmhook.A`
+- static field getters and setters as static C++ methods
+- instance field getters and setters as instance C++ methods
+- `get()` for all supported field reads
+- `set(...)` for all supported field writes
+- `get_method("...")->call(...)` for method calls
+- a GitHub Actions test harness that writes `test_results.txt`
+
+## Notes
+
+vmhook works directly with HotSpot internals. Field names and method names must
+match the Java class exactly, and wrapper classes must be registered before use.

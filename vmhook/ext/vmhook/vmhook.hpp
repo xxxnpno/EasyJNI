@@ -4366,6 +4366,105 @@ namespace vmhook
     {
     public:
         using object_base::object_base;
+
+        /*
+            @brief Returns a field proxy for a static field declared on this class.
+            @param name Exact Java static field name.
+            @return Optional holding the field proxy, or nullopt on failure.
+            @details
+            This lets wrapper classes expose truly static C++ getters/setters for
+            Java static fields without constructing a dummy wrapper instance.
+        */
+        static auto get_static_field(const std::string_view name)
+            -> std::optional<vmhook::field_proxy>
+        {
+            const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(derived) }) };
+            if (type_map_entry == vmhook::type_to_class_map.end())
+            {
+                std::println("{} object::get_static_field() type '{}' not registered via register_class<T>().", vmhook::error_tag, typeid(derived).name());
+                return std::nullopt;
+            }
+
+            vmhook::hotspot::klass* const resolved_klass{ vmhook::find_class(type_map_entry->second) };
+            if (!resolved_klass)
+            {
+                std::println("{} object::get_static_field() class '{}' not found in JVM.", vmhook::error_tag, type_map_entry->second);
+                return std::nullopt;
+            }
+
+            const auto entry{ vmhook::find_field(resolved_klass, name) };
+            if (!entry)
+            {
+                return std::nullopt;
+            }
+
+            if (!entry->is_static)
+            {
+                std::println("{} object::get_static_field('{}') is not a static field.", vmhook::error_tag, name);
+                return std::nullopt;
+            }
+
+            void* const mirror{ resolved_klass->get_java_mirror() };
+            if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
+            {
+                std::println("{} object::get_static_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
+                return std::nullopt;
+            }
+
+            void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
+            return vmhook::field_proxy{ field_pointer, entry->signature, true };
+        }
+
+        /*
+            @brief Returns a method proxy for a static method declared on this class.
+            @param method_name Exact Java static method name.
+            @return Optional holding the method proxy, or nullopt on failure.
+            @details
+            This mirrors get_static_field() for static Java methods so wrapper
+            classes can expose class-level methods with:
+
+                get_method("methodName")->call(arg1, arg2, arg3);
+
+            Complexity: O(M) time where M is the number of declared methods.
+            Exception safety: does not throw.
+            Thread safety: not thread-safe.
+        */
+        static auto get_static_method(const std::string_view method_name)
+            -> std::optional<vmhook::method_proxy>
+        {
+            const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(derived) }) };
+            if (type_map_entry == vmhook::type_to_class_map.end())
+            {
+                std::println("{} object::get_static_method() type '{}' not registered via register_class<T>().", vmhook::error_tag, typeid(derived).name());
+                return std::nullopt;
+            }
+
+            vmhook::hotspot::klass* const resolved_klass{ vmhook::find_class(type_map_entry->second) };
+            if (!resolved_klass)
+            {
+                std::println("{} object::get_static_method() class '{}' not found in JVM.", vmhook::error_tag, type_map_entry->second);
+                return std::nullopt;
+            }
+
+            const std::int32_t method_count{ resolved_klass->get_methods_count() };
+            vmhook::hotspot::method** const methods_array{ resolved_klass->get_methods_ptr() };
+
+            if (!methods_array || method_count <= 0)
+            {
+                return std::nullopt;
+            }
+
+            for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+            {
+                vmhook::hotspot::method* const current_method{ methods_array[method_index] };
+                if (current_method && vmhook::hotspot::is_valid_pointer(current_method) && current_method->get_name() == method_name)
+                {
+                    return vmhook::method_proxy{ nullptr, current_method, current_method->get_signature() };
+                }
+            }
+
+            return std::nullopt;
+        }
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
