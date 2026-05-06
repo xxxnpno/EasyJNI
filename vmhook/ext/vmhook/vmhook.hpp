@@ -4815,7 +4815,7 @@ namespace vmhook
 
             object_base::get_field() handles both static and instance Java fields automatically.
         */
-        static auto cls() noexcept -> derived { return derived{}; }
+        static auto cls() noexcept -> derived { return derived{ static_cast<vmhook::oop_t>(nullptr) }; }
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
