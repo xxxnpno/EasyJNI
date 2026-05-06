@@ -774,9 +774,14 @@ static auto WINAPI thread_entry(HMODULE module)
     // Primitive wrappers use ->get() and return correct C++ types.
     example ex{ nullptr };
 
-    check_int ("staticBool",  ex.get_static_bool()   ? 1 : 0,             1);
-    check_int ("staticByte",  std::to_integer<int>(ex.get_static_byte()), 0xf);
-    check_int ("staticShort", ex.get_static_short(),                      0xff);
+    check_int ("staticBool",  ex.get_static_bool()   ? 1 : 0,  1);
+    // std::byte is not constructible from int8_t (narrowing), so ->get() returns 0.
+    // Read the field directly via field_proxy to get the real int8_t value.
+    {
+        const std::int8_t v{ ex.get_field("staticByte")->get() };
+        check_int("staticByte", v, 0xf);
+    }
+    check_int ("staticShort", ex.get_static_short(), 0xff);
     check_int ("staticInt",   ex.get_static_int(),                        0xffff);
     check_int ("staticLong",  ex.get_static_long(),                       0xffffffffLL);
     check_float ("staticFloat",  ex.get_static_float(),  expected_float);
@@ -810,9 +815,12 @@ static auto WINAPI thread_entry(HMODULE module)
     }
     else
     {
-        check_int ("notStaticBool",  inst->get_not_static_bool()   ? 1 : 0,             1);
-        check_int ("notStaticByte",  std::to_integer<int>(inst->get_not_static_byte()), 0xf);
-        check_int ("notStaticShort", inst->get_not_static_short(),                      0xff);
+        check_int ("notStaticBool",  inst->get_not_static_bool()   ? 1 : 0, 1);
+        {
+            const std::int8_t v{ inst->get_field("notStaticByte")->get() };
+            check_int("notStaticByte", v, 0xf);
+        }
+        check_int ("notStaticShort", inst->get_not_static_short(), 0xff);
         check_int ("notStaticInt",   inst->get_not_static_int(),                        0xffff);
         check_int ("notStaticLong",  inst->get_not_static_long(),                       0xffffffffLL);
         check_float ("notStaticFloat",  inst->get_not_static_float(),  expected_float);
