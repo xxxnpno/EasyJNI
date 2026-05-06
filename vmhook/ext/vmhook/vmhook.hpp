@@ -4802,20 +4802,53 @@ namespace vmhook
         using object_base::object_base;
 
         /*
-            @brief Returns a null-instance proxy for accessing static Java fields and methods.
+            @brief Instance get_field — handles both static and instance Java fields.
             @details
-            Use this from static C++ wrapper methods when there is no Java object instance:
+            String literals are an exact match for const char*, so this overload
+            wins when called from an instance context (non-static C++ method).
+            object_base::get_field() handles both static and instance Java fields
+            automatically via the OOP pointer.
 
-                static auto get_version() -> std::string { return cls().get_field("version")->get(); }
-                static auto reset()       -> void        { cls().get_method("reset")->call(); }
-
-            For instance methods, call get_field() / get_method() directly on 'this':
-
-                auto get_health() -> int { return get_field("health")->get(); }
-
-            object_base::get_field() handles both static and instance Java fields automatically.
+            Use from any method (static or instance) with the same syntax:
+                auto get_health() -> int  { return get_field("health")->get(); }
+                static auto get_max_hp()  { return get_field("maxHp")->get(); }
         */
-        static auto cls() noexcept -> derived { return derived{ static_cast<vmhook::oop_t>(nullptr) }; }
+        auto get_field(const char* const name) const
+            -> std::optional<vmhook::field_proxy>
+        {
+            return object_base::get_field(name);
+        }
+
+        /*
+            @brief Static get_field — only viable from static C++ methods (no 'this').
+            @details
+            String literals prefer const char* over std::string_view, so from an
+            instance context the instance overload above wins.  In a static C++
+            method the instance overload is not callable and this one is selected.
+        */
+        static auto get_field(const std::string_view name)
+            -> std::optional<vmhook::field_proxy>
+        {
+            return object_base::get_field(std::type_index{ typeid(derived) }, name);
+        }
+
+        /*
+            @brief Instance get_method — mirrors get_field semantics for methods.
+        */
+        auto get_method(const char* const name) const
+            -> std::optional<vmhook::method_proxy>
+        {
+            return object_base::get_method(name);
+        }
+
+        /*
+            @brief Static get_method — only viable from static C++ methods (no 'this').
+        */
+        static auto get_method(const std::string_view name)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return object_base::get_method(std::type_index{ typeid(derived) }, name);
+        }
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
