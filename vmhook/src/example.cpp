@@ -34,11 +34,11 @@ public:
     }
 };
 
-class example : public vmhook::object<example>
+class example_class : public vmhook::object<example_class>
 {
 public:
-    explicit example(vmhook::oop_t instance)
-        : vmhook::object<example>{ instance }
+    explicit example_class(vmhook::oop_t instance)
+        : vmhook::object<example_class>{ instance }
     {
     }
 
@@ -475,12 +475,12 @@ public:
     }
 
     auto get_instance()
-        -> std::unique_ptr<example>
+        -> std::unique_ptr<example_class>
     {
         return this->get_field("instance")->get();
     }
 
-    auto set_instance(const std::unique_ptr<example>& value)
+    auto set_instance(const std::unique_ptr<example_class>& value)
         -> void
     {
         this->get_field("instance")->set(value);
@@ -871,7 +871,7 @@ static auto WINAPI thread_entry(HMODULE module)
     g_log << "[VMHook Test] Starting unit tests...\n";
 
     vmhook::register_class<main_class>("vmhook/Main");
-    vmhook::register_class<example>("vmhook/Example");
+    vmhook::register_class<example_class>("vmhook/Example");
     vmhook::register_class<a_class>("vmhook/A");
 
     // Expected values taken verbatim from Example.java.
@@ -880,7 +880,7 @@ static auto WINAPI thread_entry(HMODULE module)
 
     // ── Static scalar fields ──────────────────────────────────────────────────
     // Primitive wrappers use ->get() and return correct C++ types.
-    example ex{ nullptr };
+    example_class ex{ nullptr };
 
     check_int ("staticBool",  ex.get_static_bool()   ? 1 : 0,  1);
     // std::byte is not constructible from int8_t (narrowing), so ->get() returns 0.
@@ -912,7 +912,7 @@ static auto WINAPI thread_entry(HMODULE module)
     // ── Non-static scalar fields (via Example.instance) ───────────────────────
     // get_instance() with ->get() returns nullptr; access the static field
     // directly via field_proxy::get_as<> to obtain a live wrapper.
-    auto inst{ ex.get_field("instance")->get_as<example>() };
+    auto inst{ ex.get_field("instance")->get_as<example_class>() };
 
     if (!inst)
     {
