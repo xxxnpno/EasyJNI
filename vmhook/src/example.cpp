@@ -15,12 +15,12 @@
 
     Field pattern:
         - instance field: get_field("javaField")->get()
-        - static field:  get_field("javaField")->get()
-        - setter:        get_field(...)->set(value)
+        - static field:   cls().get_field("javaField")->get()
+        - setter:         get_field(...)->set(value)  /  cls().get_field(...)->set(value)
 
     Method pattern:
         - instance method: get_method("javaMethod")->call(args...)
-        - static method:  get_method("javaMethod")->call(args...)
+        - static method:   cls().get_method("javaMethod")->call(args...)
 
     A default-constructed wrapper has a null object pointer. That is valid for
     static fields and static methods because vmhook resolves those through the
@@ -43,13 +43,13 @@ public:
     static auto get_stop_jvm()
         -> bool
     {
-        return get_field("stopJVM")->get();
+        return cls().get_field("stopJVM")->get();
     }
 
     static auto set_stop_jvm(bool value)
         -> void
     {
-        get_field("stopJVM")->set(value);
+        cls().get_field("stopJVM")->set(value);
     }
 };
 
@@ -66,109 +66,109 @@ public:
     static auto get_static_bool()
         -> bool
     {
-        return get_field("staticBool")->get();
+        return cls().get_field("staticBool")->get();
     }
 
     static auto set_static_bool(bool value)
         -> void
     {
-        get_field("staticBool")->set(value);
+        cls().get_field("staticBool")->set(value);
     }
 
     static auto get_static_byte()
         -> std::byte
     {
-        return get_field("staticByte")->get();
+        return cls().get_field("staticByte")->get();
     }
 
     static auto set_static_byte(std::byte value)
         -> void
     {
-        get_field("staticByte")->set(value);
+        cls().get_field("staticByte")->set(value);
     }
 
     static auto get_static_short()
         -> std::int16_t
     {
-        return get_field("staticShort")->get();
+        return cls().get_field("staticShort")->get();
     }
 
     static auto set_static_short(std::int16_t value)
         -> void
     {
-        get_field("staticShort")->set(value);
+        cls().get_field("staticShort")->set(value);
     }
 
     static auto get_static_int()
         -> std::int32_t
     {
-        return get_field("staticInt")->get();
+        return cls().get_field("staticInt")->get();
     }
 
     static auto set_static_int(std::int32_t value)
         -> void
     {
-        get_field("staticInt")->set(value);
+        cls().get_field("staticInt")->set(value);
     }
 
     static auto get_static_long()
         -> std::int64_t
     {
-        return get_field("staticLong")->get();
+        return cls().get_field("staticLong")->get();
     }
 
     static auto set_static_long(std::int64_t value)
         -> void
     {
-        get_field("staticLong")->set(value);
+        cls().get_field("staticLong")->set(value);
     }
 
     static auto get_static_float()
         -> float
     {
-        return get_field("staticFloat")->get();
+        return cls().get_field("staticFloat")->get();
     }
 
     static auto set_static_float(float value)
         -> void
     {
-        get_field("staticFloat")->set(value);
+        cls().get_field("staticFloat")->set(value);
     }
 
     static auto get_static_double()
         -> double
     {
-        return get_field("staticDouble")->get();
+        return cls().get_field("staticDouble")->get();
     }
 
     static auto set_static_double(double value)
         -> void
     {
-        get_field("staticDouble")->set(value);
+        cls().get_field("staticDouble")->set(value);
     }
 
     static auto get_static_char()
         -> char
     {
-        return get_field("staticChar")->get();
+        return cls().get_field("staticChar")->get();
     }
 
     static auto set_static_char(char value)
         -> void
     {
-        get_field("staticChar")->set(value);
+        cls().get_field("staticChar")->set(value);
     }
 
     static auto get_static_string()
         -> std::string
     {
-        return get_field("staticString")->get();
+        return cls().get_field("staticString")->get();
     }
 
     static auto set_static_string(const std::string& value)
         -> void
     {
-        get_field("staticString")->set(value);
+        cls().get_field("staticString")->set(value);
     }
 
     auto get_not_static_bool()
@@ -282,109 +282,109 @@ public:
     static auto get_static_bool_array()
         -> std::vector<bool>
     {
-        return get_field("staticBoolArray")->get();
+        return cls().get_field("staticBoolArray")->get();
     }
 
     static auto set_static_bool_array(const std::vector<bool>& value)
         -> void
     {
-        get_field("staticBoolArray")->set(value);
+        cls().get_field("staticBoolArray")->set(value);
     }
 
     static auto get_static_byte_array()
         -> std::vector<std::byte>
     {
-        return get_field("staticByteArray")->get();
+        return cls().get_field("staticByteArray")->get();
     }
 
     static auto set_static_byte_array(const std::vector<std::byte>& value)
         -> void
     {
-        get_field("staticByteArray")->set(value);
+        cls().get_field("staticByteArray")->set(value);
     }
 
     static auto get_static_short_array()
         -> std::vector<std::int16_t>
     {
-        return get_field("staticShortArray")->get();
+        return cls().get_field("staticShortArray")->get();
     }
 
     static auto set_static_short_array(const std::vector<std::int16_t>& value)
         -> void
     {
-        get_field("staticShortArray")->set(value);
+        cls().get_field("staticShortArray")->set(value);
     }
 
     static auto get_static_int_array()
         -> std::vector<std::int32_t>
     {
-        return get_field("staticIntArray")->get();
+        return cls().get_field("staticIntArray")->get();
     }
 
     static auto set_static_int_array(const std::vector<std::int32_t>& value)
         -> void
     {
-        get_field("staticIntArray")->set(value);
+        cls().get_field("staticIntArray")->set(value);
     }
 
     static auto get_static_long_array()
         -> std::vector<std::int64_t>
     {
-        return get_field("staticLongArray")->get();
+        return cls().get_field("staticLongArray")->get();
     }
 
     static auto set_static_long_array(const std::vector<std::int64_t>& value)
         -> void
     {
-        get_field("staticLongArray")->set(value);
+        cls().get_field("staticLongArray")->set(value);
     }
 
     static auto get_static_float_array()
         -> std::vector<float>
     {
-        return get_field("staticFloatArray")->get();
+        return cls().get_field("staticFloatArray")->get();
     }
 
     static auto set_static_float_array(const std::vector<float>& value)
         -> void
     {
-        get_field("staticFloatArray")->set(value);
+        cls().get_field("staticFloatArray")->set(value);
     }
 
     static auto get_static_double_array()
         -> std::vector<double>
     {
-        return get_field("staticDoubleArray")->get();
+        return cls().get_field("staticDoubleArray")->get();
     }
 
     static auto set_static_double_array(const std::vector<double>& value)
         -> void
     {
-        get_field("staticDoubleArray")->set(value);
+        cls().get_field("staticDoubleArray")->set(value);
     }
 
     static auto get_static_char_array()
         -> std::vector<char>
     {
-        return get_field("staticCharArray")->get();
+        return cls().get_field("staticCharArray")->get();
     }
 
     static auto set_static_char_array(const std::vector<char>& value)
         -> void
     {
-        get_field("staticCharArray")->set(value);
+        cls().get_field("staticCharArray")->set(value);
     }
 
     static auto get_static_string_array()
         -> std::vector<std::string>
     {
-        return get_field("staticStringArray")->get();
+        return cls().get_field("staticStringArray")->get();
     }
 
     static auto set_static_string_array(const std::vector<std::string>& value)
         -> void
     {
-        get_field("staticStringArray")->set(value);
+        cls().get_field("staticStringArray")->set(value);
     }
 
     auto get_not_static_bool_array()
@@ -498,169 +498,169 @@ public:
     static auto get_instance()
         -> std::unique_ptr<example_class>
     {
-        return get_field("instance")->get();
+        return cls().get_field("instance")->get();
     }
 
     static auto set_instance(const std::unique_ptr<example_class>& value)
         -> void
     {
-        get_field("instance")->set(value);
+        cls().get_field("instance")->set(value);
     }
 
     static auto get_static_called()
         -> std::int32_t
     {
-        return get_field("staticCalled")->get();
+        return cls().get_field("staticCalled")->get();
     }
 
     static auto set_static_called(std::int32_t value)
         -> void
     {
-        get_field("staticCalled")->set(value);
+        cls().get_field("staticCalled")->set(value);
     }
 
     static auto get_hook_probe_requested()
         -> bool
     {
-        return get_field("hookProbeRequested")->get();
+        return cls().get_field("hookProbeRequested")->get();
     }
 
     static auto set_hook_probe_requested(bool value)
         -> void
     {
-        get_field("hookProbeRequested")->set(value);
+        cls().get_field("hookProbeRequested")->set(value);
     }
 
     static auto get_hook_probe_done()
         -> bool
     {
-        return get_field("hookProbeDone")->get();
+        return cls().get_field("hookProbeDone")->get();
     }
 
     static auto set_hook_probe_done(bool value)
         -> void
     {
-        get_field("hookProbeDone")->set(value);
+        cls().get_field("hookProbeDone")->set(value);
     }
 
     static auto get_force_return_probe_requested()
         -> bool
     {
-        return get_field("forceReturnProbeRequested")->get();
+        return cls().get_field("forceReturnProbeRequested")->get();
     }
 
     static auto set_force_return_probe_requested(bool value)
         -> void
     {
-        get_field("forceReturnProbeRequested")->set(value);
+        cls().get_field("forceReturnProbeRequested")->set(value);
     }
 
     static auto get_force_return_probe_done()
         -> bool
     {
-        return get_field("forceReturnProbeDone")->get();
+        return cls().get_field("forceReturnProbeDone")->get();
     }
 
     static auto set_force_return_probe_done(bool value)
         -> void
     {
-        get_field("forceReturnProbeDone")->set(value);
+        cls().get_field("forceReturnProbeDone")->set(value);
     }
 
     static auto get_force_return_probe_value()
         -> std::int32_t
     {
-        return get_field("forceReturnProbeValue")->get();
+        return cls().get_field("forceReturnProbeValue")->get();
     }
 
     static auto set_force_return_probe_value(std::int32_t value)
         -> void
     {
-        get_field("forceReturnProbeValue")->set(value);
+        cls().get_field("forceReturnProbeValue")->set(value);
     }
 
     static auto get_cancel_probe_requested()
         -> bool
     {
-        return get_field("cancelProbeRequested")->get();
+        return cls().get_field("cancelProbeRequested")->get();
     }
 
     static auto set_cancel_probe_requested(bool value)
         -> void
     {
-        get_field("cancelProbeRequested")->set(value);
+        cls().get_field("cancelProbeRequested")->set(value);
     }
 
     static auto get_cancel_probe_done()
         -> bool
     {
-        return get_field("cancelProbeDone")->get();
+        return cls().get_field("cancelProbeDone")->get();
     }
 
     static auto set_cancel_probe_done(bool value)
         -> void
     {
-        get_field("cancelProbeDone")->set(value);
+        cls().get_field("cancelProbeDone")->set(value);
     }
 
     static auto get_static_force_return_probe_requested()
         -> bool
     {
-        return get_field("staticForceReturnProbeRequested")->get();
+        return cls().get_field("staticForceReturnProbeRequested")->get();
     }
 
     static auto set_static_force_return_probe_requested(bool value)
         -> void
     {
-        get_field("staticForceReturnProbeRequested")->set(value);
+        cls().get_field("staticForceReturnProbeRequested")->set(value);
     }
 
     static auto get_static_force_return_probe_done()
         -> bool
     {
-        return get_field("staticForceReturnProbeDone")->get();
+        return cls().get_field("staticForceReturnProbeDone")->get();
     }
 
     static auto set_static_force_return_probe_done(bool value)
         -> void
     {
-        get_field("staticForceReturnProbeDone")->set(value);
+        cls().get_field("staticForceReturnProbeDone")->set(value);
     }
 
     static auto get_static_force_return_probe_value()
         -> std::int32_t
     {
-        return get_field("staticForceReturnProbeValue")->get();
+        return cls().get_field("staticForceReturnProbeValue")->get();
     }
 
     static auto set_static_force_return_probe_value(std::int32_t value)
         -> void
     {
-        get_field("staticForceReturnProbeValue")->set(value);
+        cls().get_field("staticForceReturnProbeValue")->set(value);
     }
 
     static auto get_make_unique_probe_requested()
         -> bool
     {
-        return get_field("makeUniqueProbeRequested")->get();
+        return cls().get_field("makeUniqueProbeRequested")->get();
     }
 
     static auto set_make_unique_probe_requested(bool value)
         -> void
     {
-        get_field("makeUniqueProbeRequested")->set(value);
+        cls().get_field("makeUniqueProbeRequested")->set(value);
     }
 
     static auto get_make_unique_probe_done()
         -> bool
     {
-        return get_field("makeUniqueProbeDone")->get();
+        return cls().get_field("makeUniqueProbeDone")->get();
     }
 
     static auto set_make_unique_probe_done(bool value)
         -> void
     {
-        get_field("makeUniqueProbeDone")->set(value);
+        cls().get_field("makeUniqueProbeDone")->set(value);
     }
 
     auto get_non_static_called()
@@ -692,7 +692,7 @@ public:
     {
         const std::int32_t before_call_count{ get_static_called() };
 
-        get_method("staticCallMe")->call(value);
+        cls().get_method("staticCallMe")->call(value);
 
         if (get_static_called() == before_call_count)
         {
@@ -743,13 +743,13 @@ public:
     static auto get_counter()
         -> std::int32_t
     {
-        return get_field("counter")->get();
+        return cls().get_field("counter")->get();
     }
 
     static auto set_counter(std::int32_t value)
         -> void
     {
-        get_field("counter")->set(value);
+        cls().get_field("counter")->set(value);
     }
 
     auto get_val()

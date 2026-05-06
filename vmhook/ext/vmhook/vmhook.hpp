@@ -100,6 +100,7 @@ namespace vmhook
         explicit exception(const std::string_view msg)
             : message{ msg }
         {
+
         }
 
         auto what() const noexcept 
@@ -141,6 +142,7 @@ namespace vmhook
         explicit return_value(vmhook::hotspot::return_slot* slot) noexcept
             : slot_{ slot }
         {
+
         }
 
         template<typename T>
@@ -4799,17 +4801,21 @@ namespace vmhook
     public:
         using object_base::object_base;
 
-        static auto get_field(const std::string_view name)
-            -> std::optional<vmhook::field_proxy>
-        {
-            return object_base::get_field(std::type_index{ typeid(derived) }, name);
-        }
+        /*
+            @brief Returns a null-instance proxy for accessing static Java fields and methods.
+            @details
+            Use this from static C++ wrapper methods when there is no Java object instance:
 
-        static auto get_method(const std::string_view method_name)
-            -> std::optional<vmhook::method_proxy>
-        {
-            return object_base::get_method(std::type_index{ typeid(derived) }, method_name);
-        }
+                static auto get_version() -> std::string { return cls().get_field("version")->get(); }
+                static auto reset()       -> void        { cls().get_method("reset")->call(); }
+
+            For instance methods, call get_field() / get_method() directly on 'this':
+
+                auto get_health() -> int { return get_field("health")->get(); }
+
+            object_base::get_field() handles both static and instance Java fields automatically.
+        */
+        static auto cls() noexcept -> derived { return derived{}; }
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
