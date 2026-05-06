@@ -824,10 +824,10 @@ namespace
         example_class::set_hook_probe_requested(false);
 
         const bool hook_installed{ vmhook::hook<example_class>("nonStaticCallMe",
-            [](bool* /*cancel*/, std::int32_t value)
+            [](bool* /*cancel*/, const std::unique_ptr<example_class>& self, std::int32_t value)
             {
                 ++hook_call_count;
-                hook_saw_instance.store(true);
+                hook_saw_instance.store(self != nullptr);
                 hook_saw_expected_argument.store(value == 77);
             }) };
         check("hookInstalled", hook_installed);

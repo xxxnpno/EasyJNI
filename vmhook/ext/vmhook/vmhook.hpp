@@ -3095,7 +3095,9 @@ namespace vmhook
                               - String                                       → std::string (or const std::string&)
                               - Object reference                             → std::unique_ptr<WrapperClass>
                                                                                (or const std::unique_ptr<...>&)
-                            The implicit Java 'this' is NOT included; only the explicit parameters appear.
+                            For instance methods the implicit Java 'this' occupies slot 0, so it must
+                            appear as the first argument (typically std::unique_ptr<wrapper_type>).
+                            For static methods there is no 'this'; parameters begin at slot 0.
                             Set *cancel = true to suppress execution of the original method body.
         @return true if the hook was successfully installed or was already active, false on failure.
         @details
@@ -3176,7 +3178,6 @@ namespace vmhook
             {
                 throw vmhook::exception{ "Failed to retrieve access flags." };
             }
-            const bool is_static_method{ (*flags & 0x0008u) != 0u };
             *flags |= vmhook::hotspot::NO_COMPILE;
 
             // -- Snapshot original entry points before any modification ----------
@@ -3201,16 +3202,16 @@ namespace vmhook
             }
 
             // Wrap the user callable: extract typed Java args from the frame and forward them.
-            auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour), is_static_method]
+            auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour)]
                 (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, bool* const cancel)
             {
-                // Instance methods have an implicit 'this' at slot 0; skip it.
-                const std::int32_t slot_start{ is_static_method ? 0 : 1 };
+                // Slots are indexed from 0: for instance methods slot 0 is 'this', then
+                // the explicit parameters follow. Static methods start at slot 0 directly.
                 auto invoke = [&]<std::size_t... Is>(std::index_sequence<Is...>)
                 {
                     detour(cancel,
                         vmhook::detail::extract_frame_arg<std::tuple_element_t<Is, method_arg_tuple>>(
-                            frame_pointer, slot_start + static_cast<std::int32_t>(Is))...);
+                            frame_pointer, static_cast<std::int32_t>(Is))...);
                 };
                 invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple>>{});
             };
