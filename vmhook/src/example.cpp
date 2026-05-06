@@ -629,21 +629,6 @@ namespace
     std::atomic_bool hook_saw_instance{};
     std::atomic_bool hook_saw_expected_argument{};
 
-    auto not_static_call_me_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, bool*)
-        -> void
-    {
-        ++hook_call_count;
-
-        if (!frame_pointer)
-        {
-            return;
-        }
-
-        const auto [instance, value]{ frame_pointer->get_arguments<vmhook::oop_t, std::int32_t>() };
-
-        hook_saw_instance.store(instance != nullptr);
-        hook_saw_expected_argument.store(value == 77);
-    }
 
     auto write_result(const std::string& line)
         -> void
@@ -838,7 +823,13 @@ namespace
         example_class::set_hook_probe_done(false);
         example_class::set_hook_probe_requested(false);
 
-        const bool hook_installed{ vmhook::hook<example_class>("nonStaticCallMe", not_static_call_me_detour) };
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticCallMe",
+            [](bool* /*cancel*/, std::int32_t value)
+            {
+                ++hook_call_count;
+                hook_saw_instance.store(true);
+                hook_saw_expected_argument.store(value == 77);
+            }) };
         check("hookInstalled", hook_installed);
 
         if (!hook_installed)

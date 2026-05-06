@@ -2754,7 +2754,7 @@ namespace vmhook
         struct hooked_method
         {
             vmhook::hotspot::method* method{ nullptr };
-            vmhook::hotspot::detour_function_t detour{ nullptr };
+            std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, bool*)> detour;
             void* original_code{ nullptr };
             void* original_from_interpreted_entry{ nullptr };
             void* original_from_compiled_entry{ nullptr };
@@ -2984,15 +2984,119 @@ namespace vmhook
         return true;
     }
 
+    // --- Internal helpers for typed hook API ---------------------------------
+
+    namespace detail
+    {
+        /*
+            Function trait helpers — extract the argument list from any callable so the
+            typed hook() overload can deduce Java parameter types at compile time.
+        */
+        template<typename F, typename = void>
+        struct function_traits;
+
+        template<typename Ret, typename... Args>
+        struct function_traits<Ret(*)(Args...)>
+        {
+            using args_tuple = std::tuple<Args...>;
+        };
+
+        template<typename Ret, typename... Args>
+        struct function_traits<std::function<Ret(Args...)>>
+        {
+            using args_tuple = std::tuple<Args...>;
+        };
+
+        template<typename F>
+        struct function_traits<F, std::void_t<decltype(&F::operator())>>
+            : function_traits<decltype(&F::operator())> {};
+
+        template<typename C, typename Ret, typename... Args>
+        struct function_traits<Ret(C::*)(Args...) const>
+        {
+            using args_tuple = std::tuple<Args...>;
+        };
+
+        template<typename C, typename Ret, typename... Args>
+        struct function_traits<Ret(C::*)(Args...)>
+        {
+            using args_tuple = std::tuple<Args...>;
+        };
+
+        // Drop the leading element (bool*) from a tuple type.
+        template<typename Tuple>
+        struct tuple_tail;
+
+        template<typename First, typename... Rest>
+        struct tuple_tail<std::tuple<First, Rest...>>
+        {
+            using type = std::tuple<Rest...>;
+        };
+
+        /*
+            Extract a single Java method argument from the interpreter frame, converting
+            the raw slot value to the requested C++ type T:
+              - std::string              → decoded OOP fed into read_java_string()
+              - std::unique_ptr<U>       → decoded OOP fed into the registered factory for U
+              - pointer types            → decoded compressed OOP (via get_argument<T*>)
+              - primitive / trivial types → raw slot bits via get_argument<T>
+        */
+        template<typename T>
+        auto extract_frame_arg(vmhook::hotspot::frame* const frame, const std::int32_t index)
+            -> std::remove_cvref_t<T>
+        {
+            using base_t = std::remove_cvref_t<T>;
+
+            if constexpr (std::is_same_v<base_t, std::string>)
+            {
+                void* const oop{ frame->get_argument<void*>(index) };
+                return vmhook::read_java_string(oop);
+            }
+            else if constexpr (is_unique_ptr_v<base_t>)
+            {
+                using element_t = typename base_t::element_type;
+                void* const oop{ frame->get_argument<void*>(index) };
+                if (!oop)
+                {
+                    return nullptr;
+                }
+                const auto type_it{ vmhook::type_to_class_map.find(std::type_index{ typeid(element_t) }) };
+                if (type_it == vmhook::type_to_class_map.end())
+                {
+                    return nullptr;
+                }
+                const auto factory_it{ vmhook::g_type_factory_map.find(type_it->second) };
+                if (factory_it == vmhook::g_type_factory_map.end())
+                {
+                    return nullptr;
+                }
+                return base_t{ static_cast<element_t*>(factory_it->second(oop).release()) };
+            }
+            else
+            {
+                return frame->get_argument<base_t>(index);
+            }
+        }
+    } // namespace detail
+
     // --- Hooking --------------------------------------------------------------
 
     /*
-        @brief Installs a low-level interpreter hook on a Java method.
-        @tparam T The C++ type registered for the Java class that owns the method.
-                  Must have been registered via register_class<T>() beforehand.
-        @param method_name The name of the Java method to hook (e.g., "toString", "update").
-        @param detour      The C++ function to invoke when the hooked method is intercepted.
-                           Must match: void(*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, bool*)
+        @brief Installs an interpreter hook on a Java method with typed C++ parameters.
+        @tparam wrapper_type The C++ wrapper class registered for the Java class that owns the method.
+                             Must have been registered via register_class<T>() beforehand.
+        @param method_name  The name of the Java method to hook (e.g., "toString", "update").
+        @param user_detour  A callable with signature:
+                              void(bool* cancel, T1 arg1, T2 arg2, ...)
+                            where T1, T2, ... correspond to the Java method's explicit parameters:
+                              - int / boolean / byte / short / char / float  → std::int32_t / bool / ...
+                              - long                                         → std::int64_t
+                              - double                                       → double
+                              - String                                       → std::string (or const std::string&)
+                              - Object reference                             → std::unique_ptr<WrapperClass>
+                                                                               (or const std::unique_ptr<...>&)
+                            The implicit Java 'this' is NOT included; only the explicit parameters appear.
+                            Set *cancel = true to suppress execution of the original method body.
         @return true if the hook was successfully installed or was already active, false on failure.
         @details
         The hook installation process:
@@ -3012,15 +3116,14 @@ namespace vmhook
         @see midi2i_hook, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
     */
     template<class wrapper_type>
-    static auto hook(const std::string_view method_name, const vmhook::hotspot::detour_function_t detour) 
+    static auto hook(const std::string_view method_name, auto&& user_detour)
         -> bool
     {
         try
         {
-            if (!detour)
-            {
-                throw vmhook::exception{ "Detour function pointer is null." };
-            }
+            using traits           = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
+            using all_args_tuple   = typename traits::args_tuple;
+            using method_arg_tuple = typename vmhook::detail::tuple_tail<all_args_tuple>::type;
 
             const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
             if (type_map_entry == vmhook::type_to_class_map.end())
@@ -3073,6 +3176,7 @@ namespace vmhook
             {
                 throw vmhook::exception{ "Failed to retrieve access flags." };
             }
+            const bool is_static_method{ (*flags & 0x0008u) != 0u };
             *flags |= vmhook::hotspot::NO_COMPILE;
 
             // -- Snapshot original entry points before any modification ----------
@@ -3096,7 +3200,22 @@ namespace vmhook
                 std::println("{} hook(): '{}' is interpreted - patching i2i stub.", vmhook::info_tag, method_name);
             }
 
-            vmhook::hotspot::g_hooked_methods.push_back({ found_method, detour, original_code, original_from_interpreted, original_from_compiled, was_compiled });
+            // Wrap the user callable: extract typed Java args from the frame and forward them.
+            auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour), is_static_method]
+                (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, bool* const cancel)
+            {
+                // Instance methods have an implicit 'this' at slot 0; skip it.
+                const std::int32_t slot_start{ is_static_method ? 0 : 1 };
+                auto invoke = [&]<std::size_t... Is>(std::index_sequence<Is...>)
+                {
+                    detour(cancel,
+                        vmhook::detail::extract_frame_arg<std::tuple_element_t<Is, method_arg_tuple>>(
+                            frame_pointer, slot_start + static_cast<std::int32_t>(Is))...);
+                };
+                invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple>>{});
+            };
+
+            vmhook::hotspot::g_hooked_methods.push_back({ found_method, std::move(wrapper_detour), original_code, original_from_interpreted, original_from_compiled, was_compiled });
 
             // -- Install (or reuse) the i2i stub patch ---------------------------
             bool i2i_already_patched{ false };
