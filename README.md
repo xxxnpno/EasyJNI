@@ -35,19 +35,19 @@ public:
     auto get_counter()
         -> std::int32_t
     {
-        return this->get_field("counter")->get();
+        return get_field("counter")->get();
     }
 
     auto set_counter(std::int32_t value)
         -> void
     {
-        this->get_field("counter")->set(value);
+        get_field("counter")->set(value);
     }
 
     auto tick(std::int32_t amount)
         -> void
     {
-        this->get_method("tick")->call(amount);
+        get_method("tick")->call(amount);
     }
 };
 ```
@@ -74,8 +74,8 @@ example.tick(5);
 Fields use one read function and one write function:
 
 ```cpp
-this->get_field("fieldName")->get();
-this->get_field("fieldName")->set(value);
+get_field("fieldName")->get();
+get_field("fieldName")->set(value);
 ```
 
 `get()` converts to the C++ return type selected by your wrapper method. The
@@ -85,19 +85,19 @@ same API is used for primitives, strings, object wrappers, and vectors:
 auto get_name()
     -> std::string
 {
-    return this->get_field("name")->get();
+    return get_field("name")->get();
 }
 
 auto get_flags()
     -> std::vector<bool>
 {
-    return this->get_field("flags")->get();
+    return get_field("flags")->get();
 }
 
 auto set_flags(const std::vector<bool>& value)
     -> void
 {
-    this->get_field("flags")->set(value);
+    get_field("flags")->set(value);
 }
 ```
 
@@ -145,7 +145,7 @@ double value{ example_class::get_static_double() };
 Method calls intentionally mirror fields:
 
 ```cpp
-this->get_method("methodName")->call(arg1, arg2, arg3);
+get_method("methodName")->call(arg1, arg2, arg3);
 ```
 
 Expose Java methods through wrapper methods so the rest of your C++ code never
@@ -155,7 +155,7 @@ uses raw method names:
 auto add_score(std::int32_t amount, const std::string& reason)
     -> void
 {
-    this->get_method("addScore")->call(amount, reason);
+    get_method("addScore")->call(amount, reason);
 }
 ```
 
@@ -176,7 +176,7 @@ For instance methods, call through `this`:
 auto non_static_call_me(std::int32_t value)
     -> void
 {
-    this->get_method("nonStaticCallMe")->call(value);
+    get_method("nonStaticCallMe")->call(value);
 }
 ```
 
@@ -235,8 +235,6 @@ C++ method. Use that method to initialize fields through the normal wrapper API:
 class a_class : public vmhook::object<a_class>
 {
 public:
-    a_class() = default;
-
     explicit a_class(vmhook::oop_t instance)
         : vmhook::object<a_class>{ instance }
     {
@@ -245,13 +243,13 @@ public:
     auto set_val(std::int32_t value)
         -> void
     {
-        this->get_field("val")->set(value);
+        get_field("val")->set(value);
     }
 
     auto construct(std::int32_t value)
         -> void
     {
-        this->set_val(value);
+        set_val(value);
     }
 };
 
