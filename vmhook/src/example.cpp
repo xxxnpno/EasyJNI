@@ -1192,14 +1192,14 @@ static auto WINAPI thread_entry(HMODULE module)
 
     if (instance)
     {
+        set_expected_values(*instance);
+        verify_expected_values(*instance);
         call_example_methods(*instance);
         test_method_hook(*instance);
         test_method_force_return();
         test_method_cancel(*instance);
         test_static_method_force_return();
         test_make_unique_status();
-        set_expected_values(*instance);
-        verify_expected_values(*instance);
     }
     else
     {
