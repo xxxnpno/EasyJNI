@@ -4910,7 +4910,7 @@ namespace vmhook
         }
         const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
             reinterpret_cast<const std::uint8_t*>(oop) + 8) };
-        void* const decoded{ vmhook::hotspot::klass::decode_klass_pointer(narrow) };
+        void* const decoded{ vmhook::hotspot::java_thread::decode_klass_pointer(narrow) };
         if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
         {
             return nullptr;
@@ -5022,7 +5022,7 @@ namespace vmhook
             {
                 return 0;
             }
-            return proxy->call<std::int32_t>();
+            return proxy->call();
         }
 
         auto is_empty() const noexcept -> bool

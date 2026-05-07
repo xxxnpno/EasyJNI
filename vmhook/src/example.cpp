@@ -115,7 +115,7 @@ public:
     auto protected_add(std::int32_t x)
         -> std::int32_t
     {
-        return get_method("protectedAdd")->call<std::int32_t>(x);
+        return get_method("protectedAdd")->call(x);
     }
 
     auto construct()
@@ -175,7 +175,7 @@ public:
     auto protected_add(std::int32_t x)
         -> std::int32_t
     {
-        return get_method("protectedAdd")->call<std::int32_t>(x);
+        return get_method("protectedAdd")->call(x);
     }
 };
 
