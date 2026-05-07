@@ -876,11 +876,10 @@ public:
         return get_field("listProbeSize")->get();
     }
 
-    // Returns the list as a typed vector in one step — the preferred API.
     auto get_list_of_as()
-        -> std::vector<std::unique_ptr<a_class>>
+        -> std::unique_ptr<vmhook::list>
     {
-        return get_field("listOfAs")->to_vector<a_class>();
+        return get_field("listOfAs")->get();
     }
 
     // Poly probe
@@ -1498,20 +1497,28 @@ namespace
         // Java confirmed the list has 3 elements
         check_equal("listProbeSize", example_class::get_list_probe_size(), static_cast<std::int32_t>(3));
 
-        // Read via get_field("listOfAs")->to_vector<a_class>() — one call,
-        // element type specified exactly once, no intermediate list pointer.
-        const auto vec = instance.get_list_of_as();
+        // Now read via vmhook::list::to_vector<a_class>()
+        auto list_ptr = instance.get_list_of_as();
+        check("listPtrNonNull", list_ptr != nullptr);
 
-        list_probe_size_correct.store(static_cast<std::int32_t>(vec.size()) == 3);
-        check("listToVectorSize", list_probe_size_correct.load());
-
-        bool elements_ok{ true };
-        for (const auto& elem : vec)
+        if (list_ptr)
         {
-            if (!elem) { elements_ok = false; }
+            auto vec = list_ptr->to_vector<a_class>();
+            list_probe_size_correct.store(static_cast<std::int32_t>(vec.size()) == 3);
+            check("listToVectorSize", list_probe_size_correct.load());
+
+            // Each element should be a valid a_class (counter was incremented by each A())
+            bool elements_ok{ true };
+            for (const auto& elem : vec)
+            {
+                if (!elem)
+                {
+                    elements_ok = false;
+                }
+            }
+            list_probe_elements_correct.store(elements_ok);
+            check("listToVectorElements", list_probe_elements_correct.load());
         }
-        list_probe_elements_correct.store(elements_ok);
-        check("listToVectorElements", list_probe_elements_correct.load());
     }
 
     auto test_poly_probe(example_class& instance)
