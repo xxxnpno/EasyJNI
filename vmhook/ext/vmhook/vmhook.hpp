@@ -272,59 +272,6 @@ namespace vmhook
         template<typename type>
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
 
-        /*
-            @brief Locates StubRoutines::_call_stub_entry via VMStructs.
-
-            This is HotSpot's official C++→Java call gate.  It creates a properly
-            typed "entry frame" that the JVM's GC, exception handler, and
-            frame-walker all recognise, making it safe to call Java methods from
-            native C++ code — unlike jumping directly to a c2i adapter, which
-            crashes the JVM when the garbage collector or frame walker encounters
-            an unexpected native frame above the interpreter frame.
-
-            The stub takes 8 arguments (Windows x64 calling convention):
-              rcx  = link        (return address / JavaCallWrapper*, may be -1)
-              rdx  = result      (intptr_t* where the return value is stored)
-              r8   = result_type (HotSpot BasicType enum: T_INT=10, T_VOID=14, …)
-              r9   = method      (Method*)
-              stk  = entry_point (_from_interpreted_entry of the callee)
-              stk  = parameters  (intptr_t[] — receiver + args in slot format)
-              stk  = param_count (number of intptr_t slots)
-              stk  = thread      (JavaThread*)
-
-            Returns nullptr when the VMStruct entry is absent.
-        */
-        inline auto find_call_stub_entry() noexcept -> void*
-        {
-            static const vmhook::hotspot::vm_struct_entry_t* const entry{
-                vmhook::hotspot::iterate_struct_entries("StubRoutines", "_call_stub_entry") };
-            if (!entry || !entry->address) return nullptr;
-            void* const stub{ *reinterpret_cast<void**>(entry->address) };
-            return vmhook::hotspot::is_valid_pointer(stub) ? stub : nullptr;
-        }
-
-        /*
-            @brief Maps a JVM type-descriptor character to a HotSpot BasicType int.
-            The values are stable across all JDK versions.
-        */
-        inline auto sig_char_to_basic_type(const char c) noexcept -> int
-        {
-            switch (c)
-            {
-                case 'Z': return 4;   // T_BOOLEAN
-                case 'C': return 5;   // T_CHAR
-                case 'F': return 6;   // T_FLOAT
-                case 'D': return 7;   // T_DOUBLE
-                case 'B': return 8;   // T_BYTE
-                case 'S': return 9;   // T_SHORT
-                case 'I': return 10;  // T_INT
-                case 'J': return 11;  // T_LONG
-                case 'L': return 12;  // T_OBJECT
-                case '[': return 13;  // T_ARRAY
-                case 'V': return 14;  // T_VOID
-                default:  return 12;  // T_OBJECT (fallback)
-            }
-        }
     }
 
     // --- HotSpot internals ----------------------------------------------------
@@ -4410,6 +4357,60 @@ namespace vmhook
         std::string m_signature;
         bool        m_is_static;
     };
+
+    // --- detail helpers that depend on hotspot types -------------------------
+    // (reopened here because find_call_stub_entry references hotspot types
+    //  that are not yet defined at the earlier detail block position)
+    namespace detail
+    {
+        /*
+            @brief Locates StubRoutines::_call_stub_entry via VMStructs.
+
+            HotSpot's official C++→Java call gate.  Creates a properly-typed
+            "entry frame" so the GC, exception handler, and frame-walker all
+            recognise the native→Java boundary.  Unlike jumping directly to a
+            c2i adapter, this prevents JVM fatal errors when the frame-walker
+            encounters an unexpected native frame above the interpreter frame.
+
+            Stub signature (Windows x64):
+              rcx  = link (−1 sentinel)
+              rdx  = intptr_t* result holder
+              r8   = BasicType (T_INT=10, T_VOID=14, …)
+              r9   = Method*
+              stk  = entry_point, parameters*, param_count, JavaThread*
+        */
+        inline auto find_call_stub_entry() noexcept -> void*
+        {
+            static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                vmhook::hotspot::iterate_struct_entries("StubRoutines", "_call_stub_entry") };
+            if (!entry || !entry->address) return nullptr;
+            void* const stub{ *reinterpret_cast<void**>(entry->address) };
+            return vmhook::hotspot::is_valid_pointer(stub) ? stub : nullptr;
+        }
+
+        /*
+            @brief Maps a JVM type-descriptor character to a HotSpot BasicType int.
+            Values are stable across all JDK versions 8–24+.
+        */
+        inline auto sig_char_to_basic_type(const char c) noexcept -> int
+        {
+            switch (c)
+            {
+                case 'Z': return 4;   // T_BOOLEAN
+                case 'C': return 5;   // T_CHAR
+                case 'F': return 6;   // T_FLOAT
+                case 'D': return 7;   // T_DOUBLE
+                case 'B': return 8;   // T_BYTE
+                case 'S': return 9;   // T_SHORT
+                case 'I': return 10;  // T_INT
+                case 'J': return 11;  // T_LONG
+                case 'L': return 12;  // T_OBJECT
+                case '[': return 13;  // T_ARRAY
+                case 'V': return 14;  // T_VOID
+                default:  return 12;  // T_OBJECT (fallback)
+            }
+        }
+    }
 
     // --- Method proxy ------------------------------------------------------
 
