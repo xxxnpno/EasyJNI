@@ -4352,6 +4352,30 @@ namespace vmhook
             return value;
         }
 
+        /*
+            @brief Reads this field as a Java List and converts it to
+            std::vector<std::unique_ptr<element_type>>.
+
+            @tparam element_type  C++ wrapper class for the list's Java element type.
+                                  Its constructor must accept a vmhook::oop_t.
+
+            Internally decodes the compressed OOP stored in the field, wraps it in
+            a vmhook::list<element_type>, and delegates to list::to_vector().
+            Works for ArrayList (fast direct-memory path) and other implementations.
+
+            Usage — specify the element type once, no template on to_vector():
+
+                // Java: public List<Player> players;
+                auto get_players() -> std::vector<std::unique_ptr<player_class>>
+                {
+                    return get_field("players")->to_vector<player_class>();
+                }
+        */
+        template<typename element_type>
+        auto to_vector() const noexcept
+            -> std::vector<std::unique_ptr<element_type>>;
+        // Definition after vmhook::list<element_type> is declared below.
+
     private:
         void* field_pointer;
         std::string m_signature;
@@ -5207,15 +5231,20 @@ namespace vmhook
     /*
         @brief C++ wrapper for java.util.List objects.
 
-        Provides to_vector<T>() which reads an ArrayList's backing array
-        directly from the JVM heap and returns a std::vector of unique_ptr<T>.
+        Use field_proxy::to_vector<T>() to get a typed std::vector in one step:
 
-        Usage:
+            // Java: public List<Player> players;
+            auto get_players() -> std::vector<std::unique_ptr<player_class>>
+            {
+                return get_field("players")->to_vector<player_class>();
+            }
 
-            // Java: public List<A> listOfAs;
-            auto vec = get_field("listOfAs")->get<std::unique_ptr<vmhook::list>>()
-                           ->to_vector<a_class>();
-            // vec is std::vector<std::unique_ptr<a_class>>
+        Or get a raw list pointer when you need the collection API (size, etc.)
+        and convert later:
+
+            auto lst = get_field("players")->get<std::unique_ptr<vmhook::list>>();
+            std::int32_t n = lst->size();
+            auto vec = lst->to_vector<player_class>();
     */
     class list : public vmhook::collection
     {
@@ -5226,9 +5255,7 @@ namespace vmhook
         }
 
         /*
-            @brief Converts this Java List to a std::vector<std::unique_ptr<T>>.
-            @tparam element_type  C++ wrapper class whose constructor accepts a
-                                  vmhook::oop_t (decoded Java object pointer).
+            @brief Converts this Java List to a std::vector<std::unique_ptr<element_type>>.
 
             Reads the ArrayList backing array directly from the JVM heap.
             Null Java elements become nullptr entries in the returned vector.
@@ -5323,6 +5350,22 @@ namespace vmhook
             return result;
         }
     };
+
+    // --- field_proxy::to_vector<T> out-of-line definition --------------------
+    // Defined here so that vmhook::list is complete before it is referenced.
+
+    template<typename element_type>
+    auto field_proxy::to_vector() const noexcept
+        -> std::vector<std::unique_ptr<element_type>>
+    {
+        void* const list_oop{ vmhook::hotspot::decode_oop_pointer(get_compressed_oop()) };
+        if (!list_oop || !vmhook::hotspot::is_valid_pointer(list_oop))
+        {
+            return {};
+        }
+        return vmhook::list{ static_cast<vmhook::oop_t>(list_oop) }
+                   .to_vector<element_type>();
+    }
 
     // --- Helper: read a Java String OOP to std::string ------------------------
 
