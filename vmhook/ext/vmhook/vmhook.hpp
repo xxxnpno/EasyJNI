@@ -273,55 +273,57 @@ namespace vmhook
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
 
         /*
-            @brief Allocates a per-call JIT trampoline (33 bytes, PAGE_EXECUTE_READWRITE).
-            @details
-            HotSpot's method entry points (the c2i adapter at
-            Method::_from_compiled_entry) require two JVM interpreter registers to
-            be set before the entry point is reached:
-              r15 = JavaThread*
-              rbx  = Method* being invoked
-            Windows x64 C++ code cannot set arbitrary callee-saved registers without
-            inline assembly, which MSVC does not support in x64 mode. This helper
-            allocates executable memory at runtime and writes a 33-byte stub that:
-              1. Loads r15  ← java_thread   (mov r15, imm64  :  49 BF <8 bytes>)
-              2. Loads rbx  ← method_ptr    (mov rbx, imm64  :  48 BB <8 bytes>)
-              3. Loads r10  ← entry_ptr     (mov r10, imm64  :  49 BA <8 bytes>)
-              4. JMPs to r10                (jmp r10         :  41 FF E2)
-            The Windows x64 register layout at the point of the JMP is:
-              rcx  = receiver oop  (instance method) or first arg (static)
-              rdx  = arg0, r8 = arg1, r9 = arg2
-            Return value lands in rax (integers, object refs) or xmm0 (float/double).
-            The caller MUST VirtualFree the returned pointer (MEM_RELEASE) after
-            the call returns.
+            @brief Locates StubRoutines::_call_stub_entry via VMStructs.
+
+            This is HotSpot's official C++→Java call gate.  It creates a properly
+            typed "entry frame" that the JVM's GC, exception handler, and
+            frame-walker all recognise, making it safe to call Java methods from
+            native C++ code — unlike jumping directly to a c2i adapter, which
+            crashes the JVM when the garbage collector or frame walker encounters
+            an unexpected native frame above the interpreter frame.
+
+            The stub takes 8 arguments (Windows x64 calling convention):
+              rcx  = link        (return address / JavaCallWrapper*, may be -1)
+              rdx  = result      (intptr_t* where the return value is stored)
+              r8   = result_type (HotSpot BasicType enum: T_INT=10, T_VOID=14, …)
+              r9   = method      (Method*)
+              stk  = entry_point (_from_interpreted_entry of the callee)
+              stk  = parameters  (intptr_t[] — receiver + args in slot format)
+              stk  = param_count (number of intptr_t slots)
+              stk  = thread      (JavaThread*)
+
+            Returns nullptr when the VMStruct entry is absent.
         */
-        inline auto build_java_call_trampoline(
-            void* const java_thread,
-            void* const method_ptr,
-            void* const entry_ptr
-        ) noexcept -> void*
+        inline auto find_call_stub_entry() noexcept -> void*
         {
-            void* const mem{
-                VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) };
-            if (!mem) return nullptr;
+            static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                vmhook::hotspot::iterate_struct_entries("StubRoutines", "_call_stub_entry") };
+            if (!entry || !entry->address) return nullptr;
+            void* const stub{ *reinterpret_cast<void**>(entry->address) };
+            return vmhook::hotspot::is_valid_pointer(stub) ? stub : nullptr;
+        }
 
-            std::uint8_t* p{ static_cast<std::uint8_t*>(mem) };
-
-            // mov r15, java_thread   →   49 BF <imm64>
-            *p++ = 0x49; *p++ = 0xBF;
-            std::memcpy(p, &java_thread, 8); p += 8;
-
-            // mov rbx, method_ptr   →   48 BB <imm64>
-            *p++ = 0x48; *p++ = 0xBB;
-            std::memcpy(p, &method_ptr, 8); p += 8;
-
-            // mov r10, entry_ptr    →   49 BA <imm64>
-            *p++ = 0x49; *p++ = 0xBA;
-            std::memcpy(p, &entry_ptr, 8); p += 8;
-
-            // jmp r10               →   41 FF E2
-            *p++ = 0x41; *p++ = 0xFF; *p++ = 0xE2;
-
-            return mem;
+        /*
+            @brief Maps a JVM type-descriptor character to a HotSpot BasicType int.
+            The values are stable across all JDK versions.
+        */
+        inline auto sig_char_to_basic_type(const char c) noexcept -> int
+        {
+            switch (c)
+            {
+                case 'Z': return 4;   // T_BOOLEAN
+                case 'C': return 5;   // T_CHAR
+                case 'F': return 6;   // T_FLOAT
+                case 'D': return 7;   // T_DOUBLE
+                case 'B': return 8;   // T_BYTE
+                case 'S': return 9;   // T_SHORT
+                case 'I': return 10;  // T_INT
+                case 'J': return 11;  // T_LONG
+                case 'L': return 12;  // T_OBJECT
+                case '[': return 13;  // T_ARRAY
+                case 'V': return 14;  // T_VOID
+                default:  return 12;  // T_OBJECT (fallback)
+            }
         }
     }
 
@@ -4500,24 +4502,20 @@ namespace vmhook
             or use an object wrapper.
         */
         /*
-            @brief Invokes the Java method and returns its result.
+            @brief Invokes the Java method through StubRoutines::_call_stub_entry.
             @param args  C++ values forwarded as the method's Java arguments.
                          For instance methods the receiver is added automatically
                          from the proxy's stored object pointer.
             @return value_t holding the Java return value, or monostate on failure.
 
-            @note  call() requires an active JavaThread context; it must be invoked
-                   from inside a vmhook::hook() detour where the trampoline has
-                   already set vmhook::hotspot::current_java_thread.
+            @note call() must be invoked from inside a vmhook::hook() detour where
+                  vmhook::hotspot::current_java_thread is set.
 
-                   A per-call trampoline is allocated with VirtualAlloc (33 B,
-                   PAGE_EXECUTE_READWRITE) to inject r15 and rbx before jumping to
-                   the method's _from_compiled_entry (c2i adapter).  The allocation
-                   is freed immediately after the Java call returns.
-
-                   Float / double return values are in xmm0 per the compiled Java
-                   ABI; without inline assembly the bit-pattern captured from rax
-                   may be incorrect for those types.
+                  Internally this uses HotSpot's official C++→Java call gate
+                  (StubRoutines::_call_stub_entry), which sets up a proper "entry
+                  frame" that the GC and frame-walker understand — unlike calling
+                  the c2i adapter directly, which crashes the JVM when it inspects
+                  the native frame above the interpreter.
         */
         template<typename... args_t>
         auto call(args_t&&... args) const noexcept
@@ -4531,87 +4529,107 @@ namespace vmhook
             auto* const thread{ vmhook::hotspot::current_java_thread };
             if (!thread)
             {
-                // No active JavaThread — call() must be used inside a hook callback.
                 return value_t{ std::monostate{} };
             }
 
-            void* const entry{ this->method->get_from_compiled_entry() };
+            // The call_stub entry point — located once via VMStructs.
+            void* const call_stub{ vmhook::detail::find_call_stub_entry() };
+            if (!call_stub)
+            {
+                return value_t{ std::monostate{} };
+            }
+
+            void* const entry{ this->method->get_from_interpreted_entry() };
             if (!entry || !vmhook::hotspot::is_valid_pointer(entry))
             {
                 return value_t{ std::monostate{} };
             }
 
-            // Build a per-call trampoline that injects r15 (JavaThread) and
-            // rbx (Method*) before jumping to the c2i adapter at 'entry'.
-            void* const trampoline{ vmhook::detail::build_java_call_trampoline(
-                reinterpret_cast<void*>(thread),
-                reinterpret_cast<void*>(this->method),
-                entry) };
-            if (!trampoline)
-            {
-                return value_t{ std::monostate{} };
-            }
+            // ── Return type ───────────────────────────────────────────────────
+            const std::string_view sig{ this->m_signature };
+            const std::size_t rparen{ sig.rfind(')') };
+            const char ret_char{
+                rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
+            const int result_type{ vmhook::detail::sig_char_to_basic_type(ret_char) };
 
-            // ── Pack receiver + arguments into Windows x64 register slots ──────
-            // rcx = arg_vals[0], rdx = arg_vals[1], r8 = [2], r9 = [3]
-            std::int64_t arg_vals[4]{};
-            std::size_t  arg_idx{ 0 };
+            // ── Pack receiver + arguments into the parameter slot array ───────
+            // The call_stub passes parameters[] to the interpreter as Java
+            // locals[0..n].  Each element is an intptr_t:
+            //   - primitive values are zero/sign-extended to 64 bits
+            //   - object references are uncompressed decoded OOP pointers
+            std::intptr_t params[8]{};
+            std::size_t   param_idx{ 0 };
 
             if (this->object && !this->m_is_static)
             {
-                arg_vals[arg_idx++] = reinterpret_cast<std::int64_t>(this->object);
+                params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
             }
 
             auto pack = [&](auto&& a) noexcept
             {
-                if (arg_idx >= 4) return;
+                if (param_idx >= 8) return;
                 using clean_t = std::remove_cvref_t<decltype(a)>;
                 static_assert(sizeof(clean_t) <= 8);
-                std::int64_t v{};
+                std::intptr_t v{};
                 std::memcpy(&v, &a, sizeof(clean_t));
-                arg_vals[arg_idx++] = v;
+                params[param_idx++] = v;
             };
             (pack(std::forward<args_t>(args)), ...);
 
-            // ── Dispatch ─────────────────────────────────────────────────────
-            using call_fn_t = std::int64_t(*)(std::int64_t, std::int64_t,
-                                               std::int64_t, std::int64_t);
-            const std::int64_t raw_result{
-                reinterpret_cast<call_fn_t>(trampoline)(
-                    arg_vals[0], arg_vals[1], arg_vals[2], arg_vals[3]) };
+            // ── Call the stub ─────────────────────────────────────────────────
+            // Windows x64: first 4 args in rcx/rdx/r8/r9; rest on stack with
+            // 32-byte shadow space.  The stub signature is:
+            //   void call_stub(link, result*, result_type, method*,
+            //                  entry_point, parameters*, param_count, thread*)
+            using call_stub_fn_t = void (*)(
+                void*,          // rcx: link  (return address / -1)
+                std::intptr_t*, // rdx: result holder
+                int,            // r8:  BasicType
+                void*,          // r9:  Method*
+                void*,          // stk: entry_point
+                std::intptr_t*, // stk: parameters
+                int,            // stk: size_of_parameters
+                void*           // stk: JavaThread*
+            );
 
-            VirtualFree(trampoline, 0, MEM_RELEASE);
+            std::intptr_t result_holder{ 0 };
 
-            // ── Decode return value from rax ──────────────────────────────────
-            const std::string_view sig{ this->m_signature };
-            const std::size_t rparen{ sig.rfind(')') };
-            const char ret_type{
-                rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
+            reinterpret_cast<call_stub_fn_t>(call_stub)(
+                reinterpret_cast<void*>(static_cast<std::intptr_t>(-1)), // link sentinel
+                &result_holder,
+                result_type,
+                reinterpret_cast<void*>(this->method),
+                entry,
+                params,
+                static_cast<int>(param_idx),
+                reinterpret_cast<void*>(thread)
+            );
 
-            switch (ret_type)
+            // ── Decode result ─────────────────────────────────────────────────
+            switch (ret_char)
             {
-                case 'Z': return value_t{ (raw_result & 1) != 0 };
-                case 'B': return value_t{ static_cast<std::int8_t> (raw_result) };
-                case 'S': return value_t{ static_cast<std::int16_t>(raw_result) };
-                case 'I': return value_t{ static_cast<std::int32_t>(raw_result) };
-                case 'J': return value_t{ static_cast<std::int64_t>(raw_result) };
-                case 'C': return value_t{ static_cast<std::uint16_t>(raw_result) };
+                case 'Z': return value_t{ (result_holder & 1) != 0 };
+                case 'B': return value_t{ static_cast<std::int8_t> (result_holder) };
+                case 'S': return value_t{ static_cast<std::int16_t>(result_holder) };
+                case 'I': return value_t{ static_cast<std::int32_t>(result_holder) };
+                case 'J': return value_t{ static_cast<std::int64_t>(result_holder) };
+                case 'C': return value_t{ static_cast<std::uint16_t>(result_holder) };
                 case 'F':
                 {
                     float f{};
-                    const std::int32_t bits{ static_cast<std::int32_t>(raw_result) };
+                    const std::int32_t bits{ static_cast<std::int32_t>(result_holder) };
                     std::memcpy(&f, &bits, sizeof(f));
                     return value_t{ f };
                 }
                 case 'D':
                 {
                     double d{};
-                    std::memcpy(&d, &raw_result, sizeof(d));
+                    std::memcpy(&d, &result_holder, sizeof(d));
                     return value_t{ d };
                 }
                 case 'V': return value_t{ std::monostate{} };
-                default:  // object ref — compressed OOP in rax
-                    return value_t{ static_cast<std::uint32_t>(raw_result) };
+                default:  // object ref — compressed OOP
+                    return value_t{ static_cast<std::uint32_t>(result_holder) };
             }
         }
 
