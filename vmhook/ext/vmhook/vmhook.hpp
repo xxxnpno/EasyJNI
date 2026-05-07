@@ -68,6 +68,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <type_traits>
 #include <tuple>
 #include <cstring>
@@ -220,6 +221,8 @@ namespace vmhook
     class object_base;
     template<typename derived = void> class object;
     class field_proxy;
+    class collection;
+    class list;
 
     inline auto read_java_string(void* string_oop)
         -> std::string;
@@ -1919,6 +1922,32 @@ namespace vmhook
                 }
             }
 
+            auto get_next() const noexcept
+                -> vmhook::hotspot::java_thread*
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ []()
+                    -> const vmhook::hotspot::vm_struct_entry_t*
+                    {
+                        {
+                            auto* found_entry{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_next") };
+                            if (found_entry)
+                            {
+                                return found_entry;
+                            }
+                        }
+                        return vmhook::hotspot::iterate_struct_entries("Thread", "_next");
+                    }()
+                };
+
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+
+                vmhook::hotspot::java_thread* const next_thread{ *reinterpret_cast<vmhook::hotspot::java_thread* const*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
+                return vmhook::hotspot::is_valid_pointer(next_thread) ? next_thread : nullptr;
+            }
+
             auto allocate_tlab(const std::size_t byte_size) const noexcept
                 -> void*
             {
@@ -1966,6 +1995,97 @@ namespace vmhook
         };
 
         inline thread_local vmhook::hotspot::java_thread* current_java_thread{ nullptr };
+        inline std::atomic<vmhook::hotspot::java_thread*> last_java_thread{ nullptr };
+
+        static auto find_any_java_thread() noexcept
+            -> vmhook::hotspot::java_thread*
+        {
+            static const vmhook::hotspot::vm_struct_entry_t* const thread_list_entry{
+                vmhook::hotspot::iterate_struct_entries("Threads", "_thread_list") };
+
+            if (!thread_list_entry || !thread_list_entry->address)
+            {
+                return nullptr;
+            }
+
+            vmhook::hotspot::java_thread* const head{ *reinterpret_cast<vmhook::hotspot::java_thread**>(thread_list_entry->address) };
+            return vmhook::hotspot::is_valid_pointer(head) ? head : nullptr;
+        }
+
+        static auto find_allocation_thread() noexcept
+            -> vmhook::hotspot::java_thread*
+        {
+            if (vmhook::hotspot::current_java_thread && vmhook::hotspot::is_valid_pointer(vmhook::hotspot::current_java_thread))
+            {
+                vmhook::hotspot::last_java_thread.store(vmhook::hotspot::current_java_thread, std::memory_order_relaxed);
+                return vmhook::hotspot::current_java_thread;
+            }
+
+            vmhook::hotspot::java_thread* const cached_thread{ vmhook::hotspot::last_java_thread.load(std::memory_order_relaxed) };
+            if (cached_thread && vmhook::hotspot::is_valid_pointer(cached_thread))
+            {
+                return cached_thread;
+            }
+
+            vmhook::hotspot::java_thread* const discovered_thread{ vmhook::hotspot::find_any_java_thread() };
+            if (discovered_thread)
+            {
+                vmhook::hotspot::last_java_thread.store(discovered_thread, std::memory_order_relaxed);
+            }
+            return discovered_thread;
+        }
+
+        static auto allocate_from_threads_list(const std::size_t byte_size) noexcept
+            -> void*
+        {
+            static const vmhook::hotspot::vm_struct_entry_t* const list_entry{
+                vmhook::hotspot::iterate_struct_entries("ThreadsSMRSupport", "_java_thread_list") };
+            static const vmhook::hotspot::vm_struct_entry_t* const length_entry{
+                vmhook::hotspot::iterate_struct_entries("ThreadsList", "_length") };
+            static const vmhook::hotspot::vm_struct_entry_t* const threads_entry{
+                vmhook::hotspot::iterate_struct_entries("ThreadsList", "_threads") };
+
+            if (!list_entry || !length_entry || !threads_entry || !list_entry->address)
+            {
+                return nullptr;
+            }
+
+            void* const list{ *reinterpret_cast<void**>(list_entry->address) };
+            if (!list || !vmhook::hotspot::is_valid_pointer(list))
+            {
+                return nullptr;
+            }
+
+            const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::uint8_t*>(list) + length_entry->offset) };
+            if (length <= 0 || length > 4096)
+            {
+                return nullptr;
+            }
+
+            auto** const threads{ *reinterpret_cast<vmhook::hotspot::java_thread***>(reinterpret_cast<std::uint8_t*>(list) + threads_entry->offset) };
+            if (!threads || !vmhook::hotspot::is_valid_pointer(threads))
+            {
+                return nullptr;
+            }
+
+            for (std::int32_t index{ 0 }; index < length; ++index)
+            {
+                vmhook::hotspot::java_thread* const thread{ threads[index] };
+                if (!thread || !vmhook::hotspot::is_valid_pointer(thread))
+                {
+                    continue;
+                }
+
+                void* const object{ thread->allocate_tlab(byte_size) };
+                if (object)
+                {
+                    vmhook::hotspot::last_java_thread.store(thread, std::memory_order_relaxed);
+                    return object;
+                }
+            }
+
+            return nullptr;
+        }
 
         /*
             @brief Decodes a compressed OOP to a real 64-bit pointer.
@@ -3052,6 +3172,7 @@ namespace vmhook
                         : previous{ vmhook::hotspot::current_java_thread }
                     {
                         vmhook::hotspot::current_java_thread = thread_pointer;
+                        vmhook::hotspot::last_java_thread.store(thread_pointer, std::memory_order_relaxed);
                     }
 
                     ~current_thread_guard()
@@ -3652,13 +3773,6 @@ namespace vmhook
             return nullptr;
         }
 
-        vmhook::hotspot::java_thread* const thread{ vmhook::hotspot::current_java_thread };
-        if (!thread || !vmhook::hotspot::is_valid_pointer(thread))
-        {
-            std::println("{} vmhook::make_unique<{}>(): requires a JavaThread context. Call it from a vmhook method hook.", vmhook::warning_tag, typeid(wrapper_type).name());
-            return nullptr;
-        }
-
         const std::size_t raw_size{ klass->get_instance_size() };
         const std::size_t object_size{ (raw_size + 7u) & ~static_cast<std::size_t>(7u) };
         if (object_size == 0)
@@ -3667,7 +3781,34 @@ namespace vmhook
             return nullptr;
         }
 
-        void* const object_pointer{ thread->allocate_tlab(object_size) };
+        vmhook::hotspot::java_thread* const thread{ vmhook::hotspot::find_allocation_thread() };
+        void* object_pointer{};
+        if (thread && vmhook::hotspot::is_valid_pointer(thread))
+        {
+            object_pointer = thread->allocate_tlab(object_size);
+        }
+
+        if (!object_pointer)
+        {
+            std::int32_t visited_threads{ 0 };
+            for (vmhook::hotspot::java_thread* candidate{ vmhook::hotspot::find_any_java_thread() };
+                 candidate && vmhook::hotspot::is_valid_pointer(candidate) && visited_threads < 256;
+                 candidate = candidate->get_next(), ++visited_threads)
+            {
+                object_pointer = candidate->allocate_tlab(object_size);
+                if (object_pointer)
+                {
+                    vmhook::hotspot::last_java_thread.store(candidate, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+
+        if (!object_pointer)
+        {
+            object_pointer = vmhook::hotspot::allocate_from_threads_list(object_size);
+        }
+
         if (!object_pointer)
         {
             std::println("{} vmhook::make_unique<{}>(): current JavaThread TLAB has no room for {} bytes.", vmhook::warning_tag, typeid(wrapper_type).name(), object_size);
@@ -4170,6 +4311,10 @@ namespace vmhook
                             return this->cast_for_variant<target_type>(value);
                         }, data);
             }
+
+            template<typename element_type>
+            auto to_vector() const
+                -> std::vector<std::unique_ptr<element_type>>;
         };
 
         /*
@@ -5202,6 +5347,79 @@ namespace vmhook
         {
             return size() == 0;
         }
+
+        template<typename element_type>
+        auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
+        {
+            std::vector<std::unique_ptr<element_type>> result;
+
+            if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
+            {
+                return result;
+            }
+
+            const auto size_opt{ get_field_by_oop_klass("size") };
+            const auto data_opt{ get_field_by_oop_klass("elementData") };
+
+            if (size_opt && data_opt)
+            {
+                const std::int32_t n{ size_opt->get() };
+                if (n <= 0)
+                {
+                    return result;
+                }
+
+                const std::uint32_t compressed_array{ static_cast<std::uint32_t>(data_opt->get()) };
+                void* const array_oop{ vmhook::decode_array_oop(compressed_array) };
+                if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
+                {
+                    result.reserve(static_cast<std::size_t>(n));
+                    for (std::int32_t index{ 0 }; index < n; ++index)
+                    {
+                        const std::uint32_t compressed_element{ vmhook::get_array_element<std::uint32_t>(array_oop, index) };
+                        void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed_element) };
+                        if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
+                        {
+                            result.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(element_oop)));
+                        }
+                        else
+                        {
+                            result.push_back(nullptr);
+                        }
+                    }
+                    return result;
+                }
+            }
+
+            const std::int32_t n{ size() };
+            if (n <= 0)
+            {
+                return result;
+            }
+
+            const auto get_method_opt{ get_method_by_oop_klass("get") };
+            if (!get_method_opt)
+            {
+                return result;
+            }
+
+            result.reserve(static_cast<std::size_t>(n));
+            for (std::int32_t index{ 0 }; index < n; ++index)
+            {
+                const auto element_value{ get_method_opt->call<std::uint32_t>(index) };
+                void* const element_oop{ vmhook::hotspot::decode_oop_pointer(element_value) };
+                if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
+                {
+                    result.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(element_oop)));
+                }
+                else
+                {
+                    result.push_back(nullptr);
+                }
+            }
+
+            return result;
+        }
     };
 
     /*
@@ -5323,6 +5541,20 @@ namespace vmhook
             return result;
         }
     };
+
+    template<typename element_type>
+    auto field_proxy::value_t::to_vector() const
+        -> std::vector<std::unique_ptr<element_type>>
+    {
+        const std::uint32_t compressed_collection{ static_cast<std::uint32_t>(*this) };
+        void* const collection_oop{ vmhook::hotspot::decode_oop_pointer(compressed_collection) };
+        if (!collection_oop || !vmhook::hotspot::is_valid_pointer(collection_oop))
+        {
+            return {};
+        }
+
+        return vmhook::collection{ collection_oop }.to_vector<element_type>();
+    }
 
     // --- Helper: read a Java String OOP to std::string ------------------------
 

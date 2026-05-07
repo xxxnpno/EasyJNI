@@ -1,7 +1,7 @@
 # vmhook
 
 vmhook is a C++23 single-header library for interacting with a running HotSpot
-Java Virtual Machine from native code — without JNI or JVMTI. A C++ wrapper
+Java Virtual Machine from native code, without JNI or JVMTI. A C++ wrapper
 class is registered against a Java class name; wrapper methods then read fields,
 write fields, call Java methods, and hook method execution entirely through
 HotSpot's own VMStructs, making the approach transparent to the JVM and
@@ -16,7 +16,7 @@ independent of the JNI/JVMTI permission model.
 | Requires JVM permission | Yes (attached agent / native library) | No — reads from already-mapped JVM data |
 | Visible to JVM security | Yes | No |
 | Header only | No | Yes |
-| Supported Java versions | All | HotSpot 8 – 24+ |
+| Supported Java versions | All | Java 8 – 24+ |
 
 ### How it works
 
@@ -69,22 +69,9 @@ public:
 vmhook::register_class<player_class>("com/example/Player");
 ```
 
-Then wrap a decoded OOP to access instance members:
-
-```cpp
-player_class player{ decoded_oop };
-player.set_health(100);
-player.respawn();
-```
-
 ## Fields
 
 ### Instance fields
-
-```cpp
-get_field("fieldName")->get();        // read
-get_field("fieldName")->set(value);   // write
-```
 
 `get()` converts to whatever C++ type your wrapper method returns. The same API
 works for primitives, strings, object wrappers, and vectors:
@@ -93,6 +80,14 @@ works for primitives, strings, object wrappers, and vectors:
 auto get_name()   -> std::string            { return get_field("name")->get(); }
 auto get_flags()  -> std::vector<bool>      { return get_field("flags")->get(); }
 auto get_score()  -> std::int32_t           { return get_field("score")->get(); }
+```
+
+`set(arg)` works the same as get:
+
+```cpp
+auto set_name(const std::string& value)         -> void         { return get_field("name")->set(value); }
+auto set_flags(const std::vector<bool>& value)  -> void         { return get_field("flags")->set(value); }
+auto set_score(std::int32_t value)              -> void         { return get_field("score")->set(value); }
 ```
 
 Supported scalar types: `bool`, `std::byte`, `std::int16_t`, `std::int32_t`,
@@ -105,6 +100,8 @@ returned type is a registered wrapper:
 
 ```cpp
 auto get_a() -> std::unique_ptr<a_class> { return get_field("a")->get(); }
+
+auto set_a(const std::unique_ptr<a_class>& value) -> void { return get_field("a")->set(value); }
 ```
 
 ### Static fields
@@ -125,13 +122,6 @@ static auto set_instance_count(std::int32_t v)
 ```
 
 ## Methods
-
-Method calls mirror field access:
-
-```cpp
-get_method("methodName")->call(arg1, arg2);
-get_method("methodName")->call<std::int32_t>(arg);  // typed return value
-```
 
 Instance methods:
 
@@ -174,11 +164,22 @@ class B extends A {
 ```
 
 ```cpp
-class b_class : public vmhook::object<b_class>
+class b_class;
+
+class a_class : public vmhook::object<b_class>
+{
+public:
+    explicit a_class(vmhook::oop_t instance)
+        : vmhook::object<b_class>{ instance }
+    {
+    }
+};
+
+class b_class : public a_class
 {
 public:
     explicit b_class(vmhook::oop_t instance)
-        : vmhook::object<b_class>{ instance }
+        : a_class{ instance }
     {
     }
 
@@ -198,15 +199,6 @@ public:
 vmhook::register_class<b_class>("vmhook/B");
 ```
 
-Usage:
-
-```cpp
-auto b_ptr = example.get_field("bInstance")->get<std::unique_ptr<b_class>>();
-b_ptr->get_b_int();          // 42  — own field
-b_ptr->get_protected_int();  // 1337 — inherited from A
-b_ptr->protected_add(3);     // 1340 — inherited method from A
-```
-
 ## Collections and Lists
 
 vmhook provides `vmhook::collection` and `vmhook::list` wrapper classes for
@@ -216,17 +208,14 @@ is needed and they work with any implementation (ArrayList, LinkedList, etc.).
 
 ### vmhook::collection
 
-```cpp
-vmhook::collection col{ list_oop };
-std::int32_t n = col.size();    // calls Java size()
-bool empty = col.is_empty();
-```
+`vmhook::collection` exposes `size()`, `is_empty()`, and `to_vector<T>()`.
+`to_vector<T>()` reads an ArrayList backing array directly from the JVM heap
+when possible, with a generic `get(int)` fallback for other collection/list
+implementations.
 
 ### vmhook::list
 
-`vmhook::list` extends `collection` with `to_vector<T>()`, which reads an
-ArrayList's backing array directly from the JVM heap for maximum efficiency,
-with a generic `get(int)` fallback for other List implementations.
+`vmhook::list` extends `collection`, so it has the same `to_vector<T>()` API.
 
 ```java
 // Java
@@ -235,17 +224,7 @@ public List<A> listOfAs;
 
 ```cpp
 // C++
-auto list_ptr = example.get_field("listOfAs")->get<std::unique_ptr<vmhook::list>>();
-auto vec = list_ptr->to_vector<a_class>();
-// vec is std::vector<std::unique_ptr<a_class>>
-
-for (const auto& elem : vec)
-{
-    if (elem)
-    {
-        std::println("val = {}", elem->get_val());
-    }
-}
+auto get_list_of_as() -> std::vector<std::unique_ptr<a_class>> { get_field("listOfAs")->get().to_vector<a_class>(); }
 ```
 
 Null Java elements become `nullptr` entries in the returned vector. Elements are
@@ -313,9 +292,9 @@ vmhook::shutdown_hooks();
 
 `vmhook::make_unique<T>(arg1, arg2, ...)` allocates a new Java object for the
 registered wrapper type using HotSpot internals only (no JNI, no Java
-constructor bytecode). It uses the current JavaThread's TLAB, so it must be
-called from inside a `vmhook::hook(...)` detour where vmhook has captured the
-HotSpot thread context.
+constructor bytecode). It first uses the current hook's JavaThread when one is
+available, then falls back to HotSpot's JavaThread lists, so it can be used both
+inside and outside hook detours.
 
 The function returns a `std::unique_ptr<T>`. If the wrapper class exposes
 `construct(arg1, arg2, ...)`, vmhook calls it after allocation to let you
@@ -342,6 +321,8 @@ vmhook::hook<example_class>("nonStaticCallMe",
         auto obj{ vmhook::make_unique<a_class>(1337) };
         // obj->get_val() == 1337
     });
+
+auto obj{ vmhook::make_unique<a_class>(2026) }; // also valid outside hooks
 ```
 
 ## Example
@@ -358,8 +339,8 @@ The complete example lives in `vmhook/src/example.cpp`. It demonstrates:
 - Method hooks that force a return value
 - Method hooks that cancel a void method
 - Static method hooks
-- `vmhook::make_unique<T>(...)` from inside a method hook
-- `vmhook::list::to_vector<T>()` reading an ArrayList backing array directly
+- `vmhook::make_unique<T>(...)` before hooks, inside hooks, and after hooks
+- `get_field("...")->get().to_vector<T>()` for Java collections/lists
 - Superclass field and method resolution via `vmhook::find_field` and
   `get_method` hierarchy walk
 - A GitHub Actions CI harness that writes `test_results.txt` and fails on any

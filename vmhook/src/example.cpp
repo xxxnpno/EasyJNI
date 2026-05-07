@@ -877,9 +877,9 @@ public:
     }
 
     auto get_list_of_as()
-        -> std::unique_ptr<vmhook::list>
+        -> std::vector<std::unique_ptr<a_class>>
     {
-        return get_field("listOfAs")->get();
+        return get_field("listOfAs")->get().to_vector<a_class>();
     }
 
     // Poly probe
@@ -1464,7 +1464,35 @@ namespace
         check("makeUniqueInitializedValue", make_unique_initialized_value.load());
         check("makeUniqueInitializedCounter", make_unique_initialized_counter.load());
 
+        auto made_outside_hook{ vmhook::make_unique<a_class>(2026) };
+        check("makeUniqueOutsideHookAllocated", made_outside_hook != nullptr);
+        if (made_outside_hook)
+        {
+            check_equal("makeUniqueOutsideHookValue", made_outside_hook->get_val(), static_cast<std::int32_t>(2026));
+            check_equal("makeUniqueOutsideHookCounter", a_class::get_counter(), static_cast<std::int32_t>(2));
+        }
+
         vmhook::shutdown_hooks();
+    }
+
+    auto test_make_unique_before_hooks()
+        -> void
+    {
+        /*
+            This runs before any method hook is installed. make_unique must find
+            a HotSpot JavaThread from VM metadata instead of relying on the hook
+            trampoline's current_java_thread.
+        */
+        a_class::set_counter(0);
+
+        auto made{ vmhook::make_unique<a_class>(9090) };
+        check("makeUniqueBeforeHooksAllocated", made != nullptr);
+
+        if (made)
+        {
+            check_equal("makeUniqueBeforeHooksValue", made->get_val(), static_cast<std::int32_t>(9090));
+            check_equal("makeUniqueBeforeHooksCounter", a_class::get_counter(), static_cast<std::int32_t>(1));
+        }
     }
 
     auto test_list_probe(example_class& instance)
@@ -1497,16 +1525,13 @@ namespace
         // Java confirmed the list has 3 elements
         check_equal("listProbeSize", example_class::get_list_probe_size(), static_cast<std::int32_t>(3));
 
-        // Now read via vmhook::list::to_vector<a_class>()
-        auto list_ptr = instance.get_list_of_as();
-        check("listPtrNonNull", list_ptr != nullptr);
+        // Now read via field_proxy::value_t::to_vector<a_class>()
+        auto vec = instance.get_list_of_as();
+        list_probe_size_correct.store(static_cast<std::int32_t>(vec.size()) == 3);
+        check("listToVectorSize", list_probe_size_correct.load());
 
-        if (list_ptr)
+        if (!vec.empty())
         {
-            auto vec = list_ptr->to_vector<a_class>();
-            list_probe_size_correct.store(static_cast<std::int32_t>(vec.size()) == 3);
-            check("listToVectorSize", list_probe_size_correct.load());
-
             // Each element should be a valid a_class (counter was incremented by each A())
             bool elements_ok{ true };
             for (const auto& elem : vec)
@@ -1687,6 +1712,7 @@ static auto WINAPI thread_entry(HMODULE module)
 
     if (instance)
     {
+        test_make_unique_before_hooks();
         set_expected_values(*instance);
         verify_expected_values(*instance);
         call_example_methods(*instance);
