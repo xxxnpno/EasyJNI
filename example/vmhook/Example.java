@@ -113,6 +113,11 @@ public class Example
     public static volatile boolean polyProbeInheritedMethod = false;
     public static volatile boolean polyProbeOwnField = false;
 
+    // method-call-return-value probe
+    // The hook on nonStaticCallMe calls nonStaticReturnMe(5) and stores the result here.
+    public static volatile boolean methodCallReturnProbeRequested = false;
+    public static volatile boolean methodCallReturnProbeDone = false;
+
     public static void staticCallMe(final int value)
     {
         staticCalled++;

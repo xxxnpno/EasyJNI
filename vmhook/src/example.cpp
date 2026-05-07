@@ -930,6 +930,41 @@ public:
     {
         return get_field("bInstance")->get();
     }
+
+    // Call nonStaticReturnMe(v) on this instance and return the Java method's result.
+    // Used by test_method_call_return_value() to exercise method_proxy::call() returning
+    // a value — must be invoked from inside a hook callback where current_java_thread
+    // is set.
+    auto call_return_me(std::int32_t v)
+        -> std::int32_t
+    {
+        return get_method("nonStaticReturnMe")->call(v);
+    }
+
+    // Method-call-return-value probe accessors
+    static auto get_method_call_return_probe_requested()
+        -> bool
+    {
+        return get_field("methodCallReturnProbeRequested")->get();
+    }
+
+    static auto set_method_call_return_probe_requested(bool v)
+        -> void
+    {
+        get_field("methodCallReturnProbeRequested")->set(v);
+    }
+
+    static auto get_method_call_return_probe_done()
+        -> bool
+    {
+        return get_field("methodCallReturnProbeDone")->get();
+    }
+
+    static auto set_method_call_return_probe_done(bool v)
+        -> void
+    {
+        get_field("methodCallReturnProbeDone")->set(v);
+    }
 };
 
 namespace
@@ -963,6 +998,7 @@ namespace
     std::atomic_bool poly_probe_inherited_field{};
     std::atomic_bool poly_probe_inherited_method{};
     std::atomic_bool poly_probe_own_field{};
+    std::atomic<std::int32_t> method_call_return_observed{ -1 };
 
 
     auto write_result(const std::string& line)
@@ -1531,20 +1567,80 @@ namespace
             poly_probe_inherited_field.store(protected_int_val == 1337);
             check_equal("polyInheritedInt", protected_int_val, static_cast<std::int32_t>(1337));
 
-            // Inherited protected method from A — verify that the method proxy
-            // is findable via the superclass hierarchy walk (the proxy exists),
-            // then trust the Java-side result for the actual return value
-            // (method_proxy::call is not yet a full JVM call implementation).
-            const auto method_opt{ b_ptr->get_method("protectedAdd") };
-            const bool method_found{ method_opt.has_value() };
-            poly_probe_inherited_method.store(method_found);
-            check("polyInheritedMethodFound", method_found);
+            // Inherited protected method from A — call it and verify the return value.
+            // This exercises both the superclass method lookup (find_method walks
+            // the hierarchy) and the method_proxy::call() trampoline mechanism.
+            const std::int32_t add_result{ b_ptr->protected_add(3) };
+            poly_probe_inherited_method.store(add_result == 1340);
+            check_equal("polyInheritedMethod", add_result, static_cast<std::int32_t>(1340));
 
             // Verify Java side saw the same values
             check("polyJavaInheritedField", example_class::get_poly_probe_inherited_field());
             check("polyJavaInheritedMethod", example_class::get_poly_probe_inherited_method());
             check("polyJavaOwnField", example_class::get_poly_probe_own_field());
         }
+    }
+
+    /*
+        test_method_call_return_value — exercises method_proxy::call() returning a value.
+
+        Hooks nonStaticCallMe (which the Java main loop calls when
+        methodCallReturnProbeRequested is set). Inside the hook the detour calls
+        nonStaticReturnMe(5) on the same instance via method_proxy::call() and stores
+        the returned value in an atomic. After the hook fires the test reads that
+        atomic and verifies it equals 6 (5 + 1, the Java method's body).
+
+        This demonstrates the pattern:
+            return get_method("nonStaticReturnMe")->call(5);  // → value_t{6}
+    */
+    auto test_method_call_return_value(example_class& instance)
+        -> void
+    {
+        method_call_return_observed.store(-1);
+
+        example_class::set_method_call_return_probe_done(false);
+        example_class::set_method_call_return_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticCallMe",
+            [](vmhook::return_value& /*retval*/,
+               const std::unique_ptr<example_class>& self,
+               std::int32_t /*trigger_value*/)
+            {
+                if (self)
+                {
+                    // Call nonStaticReturnMe(5) on the same Java instance.
+                    // method_proxy::call() invokes the Java interpreter via the
+                    // per-call trampoline and returns the Java result (5 + 1 = 6).
+                    const std::int32_t ret{ self->call_return_me(5) };
+                    method_call_return_observed.store(ret);
+                }
+            }) };
+        check("methodCallReturnHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        example_class::set_method_call_return_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+        for (std::int32_t i{ 0 }; i < max_wait_iterations; ++i)
+        {
+            if (example_class::get_method_call_return_probe_done()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+
+        example_class::set_method_call_return_probe_requested(false);
+
+        check("methodCallReturnProbeDone", example_class::get_method_call_return_probe_done());
+
+        // nonStaticReturnMe(5) returns value + 1 == 6
+        check_equal("methodCallReturnValue",
+            method_call_return_observed.load(),
+            static_cast<std::int32_t>(6));
+
+        vmhook::shutdown_hooks();
     }
 }
 
@@ -1574,6 +1670,7 @@ static auto WINAPI thread_entry(HMODULE module)
         test_make_unique_status();
         test_list_probe(*instance);
         test_poly_probe(*instance);
+        test_method_call_return_value(*instance);
     }
     else
     {

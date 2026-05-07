@@ -271,6 +271,58 @@ namespace vmhook
 
         template<typename type>
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
+
+        /*
+            @brief Allocates a per-call JIT trampoline (33 bytes, PAGE_EXECUTE_READWRITE).
+            @details
+            HotSpot's method entry points (the c2i adapter at
+            Method::_from_compiled_entry) require two JVM interpreter registers to
+            be set before the entry point is reached:
+              r15 = JavaThread*
+              rbx  = Method* being invoked
+            Windows x64 C++ code cannot set arbitrary callee-saved registers without
+            inline assembly, which MSVC does not support in x64 mode. This helper
+            allocates executable memory at runtime and writes a 33-byte stub that:
+              1. Loads r15  ← java_thread   (mov r15, imm64  :  49 BF <8 bytes>)
+              2. Loads rbx  ← method_ptr    (mov rbx, imm64  :  48 BB <8 bytes>)
+              3. Loads r10  ← entry_ptr     (mov r10, imm64  :  49 BA <8 bytes>)
+              4. JMPs to r10                (jmp r10         :  41 FF E2)
+            The Windows x64 register layout at the point of the JMP is:
+              rcx  = receiver oop  (instance method) or first arg (static)
+              rdx  = arg0, r8 = arg1, r9 = arg2
+            Return value lands in rax (integers, object refs) or xmm0 (float/double).
+            The caller MUST VirtualFree the returned pointer (MEM_RELEASE) after
+            the call returns.
+        */
+        inline auto build_java_call_trampoline(
+            void* const java_thread,
+            void* const method_ptr,
+            void* const entry_ptr
+        ) noexcept -> void*
+        {
+            void* const mem{
+                VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) };
+            if (!mem) return nullptr;
+
+            std::uint8_t* p{ static_cast<std::uint8_t*>(mem) };
+
+            // mov r15, java_thread   →   49 BF <imm64>
+            *p++ = 0x49; *p++ = 0xBF;
+            std::memcpy(p, &java_thread, 8); p += 8;
+
+            // mov rbx, method_ptr   →   48 BB <imm64>
+            *p++ = 0x48; *p++ = 0xBB;
+            std::memcpy(p, &method_ptr, 8); p += 8;
+
+            // mov r10, entry_ptr    →   49 BA <imm64>
+            *p++ = 0x49; *p++ = 0xBA;
+            std::memcpy(p, &entry_ptr, 8); p += 8;
+
+            // jmp r10               →   41 FF E2
+            *p++ = 0x41; *p++ = 0xFF; *p++ = 0xE2;
+
+            return mem;
+        }
     }
 
     // --- HotSpot internals ----------------------------------------------------
@@ -4447,8 +4499,28 @@ namespace vmhook
             For reference-type arguments (strings, objects), pass std::string for class name
             or use an object wrapper.
         */
+        /*
+            @brief Invokes the Java method and returns its result.
+            @param args  C++ values forwarded as the method's Java arguments.
+                         For instance methods the receiver is added automatically
+                         from the proxy's stored object pointer.
+            @return value_t holding the Java return value, or monostate on failure.
+
+            @note  call() requires an active JavaThread context; it must be invoked
+                   from inside a vmhook::hook() detour where the trampoline has
+                   already set vmhook::hotspot::current_java_thread.
+
+                   A per-call trampoline is allocated with VirtualAlloc (33 B,
+                   PAGE_EXECUTE_READWRITE) to inject r15 and rbx before jumping to
+                   the method's _from_compiled_entry (c2i adapter).  The allocation
+                   is freed immediately after the Java call returns.
+
+                   Float / double return values are in xmm0 per the compiled Java
+                   ABI; without inline assembly the bit-pattern captured from rax
+                   may be incorrect for those types.
+        */
         template<typename... args_t>
-        auto call(args_t&&... args) const noexcept 
+        auto call(args_t&&... args) const noexcept
             -> value_t
         {
             if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
@@ -4456,14 +4528,91 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            // For now, return a default-constructed value_t
-            // Full implementation would:
-            // 1. Parse signature to determine argument/return types
-            // 2. Convert C++ args to JVM format
-            // 3. Set up interpreter frame
-            // 4. Call through i2i entry point
-            // 5. Convert return value to C++ type
-            return value_t{ std::monostate{} };
+            auto* const thread{ vmhook::hotspot::current_java_thread };
+            if (!thread)
+            {
+                // No active JavaThread — call() must be used inside a hook callback.
+                return value_t{ std::monostate{} };
+            }
+
+            void* const entry{ this->method->get_from_compiled_entry() };
+            if (!entry || !vmhook::hotspot::is_valid_pointer(entry))
+            {
+                return value_t{ std::monostate{} };
+            }
+
+            // Build a per-call trampoline that injects r15 (JavaThread) and
+            // rbx (Method*) before jumping to the c2i adapter at 'entry'.
+            void* const trampoline{ vmhook::detail::build_java_call_trampoline(
+                reinterpret_cast<void*>(thread),
+                reinterpret_cast<void*>(this->method),
+                entry) };
+            if (!trampoline)
+            {
+                return value_t{ std::monostate{} };
+            }
+
+            // ── Pack receiver + arguments into Windows x64 register slots ──────
+            // rcx = arg_vals[0], rdx = arg_vals[1], r8 = [2], r9 = [3]
+            std::int64_t arg_vals[4]{};
+            std::size_t  arg_idx{ 0 };
+
+            if (this->object && !this->m_is_static)
+            {
+                arg_vals[arg_idx++] = reinterpret_cast<std::int64_t>(this->object);
+            }
+
+            auto pack = [&](auto&& a) noexcept
+            {
+                if (arg_idx >= 4) return;
+                using clean_t = std::remove_cvref_t<decltype(a)>;
+                static_assert(sizeof(clean_t) <= 8);
+                std::int64_t v{};
+                std::memcpy(&v, &a, sizeof(clean_t));
+                arg_vals[arg_idx++] = v;
+            };
+            (pack(std::forward<args_t>(args)), ...);
+
+            // ── Dispatch ─────────────────────────────────────────────────────
+            using call_fn_t = std::int64_t(*)(std::int64_t, std::int64_t,
+                                               std::int64_t, std::int64_t);
+            const std::int64_t raw_result{
+                reinterpret_cast<call_fn_t>(trampoline)(
+                    arg_vals[0], arg_vals[1], arg_vals[2], arg_vals[3]) };
+
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+
+            // ── Decode return value from rax ──────────────────────────────────
+            const std::string_view sig{ this->m_signature };
+            const std::size_t rparen{ sig.rfind(')') };
+            const char ret_type{
+                rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
+
+            switch (ret_type)
+            {
+                case 'Z': return value_t{ (raw_result & 1) != 0 };
+                case 'B': return value_t{ static_cast<std::int8_t> (raw_result) };
+                case 'S': return value_t{ static_cast<std::int16_t>(raw_result) };
+                case 'I': return value_t{ static_cast<std::int32_t>(raw_result) };
+                case 'J': return value_t{ static_cast<std::int64_t>(raw_result) };
+                case 'C': return value_t{ static_cast<std::uint16_t>(raw_result) };
+                case 'F':
+                {
+                    float f{};
+                    const std::int32_t bits{ static_cast<std::int32_t>(raw_result) };
+                    std::memcpy(&f, &bits, sizeof(f));
+                    return value_t{ f };
+                }
+                case 'D':
+                {
+                    double d{};
+                    std::memcpy(&d, &raw_result, sizeof(d));
+                    return value_t{ d };
+                }
+                case 'V': return value_t{ std::monostate{} };
+                default:  // object ref — compressed OOP in rax
+                    return value_t{ static_cast<std::uint32_t>(raw_result) };
+            }
         }
 
         /*

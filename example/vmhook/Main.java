@@ -76,6 +76,14 @@ public class Main
                 Example.polyProbeDone = true;
             }
 
+            if (Example.methodCallReturnProbeRequested && !Example.methodCallReturnProbeDone)
+            {
+                // The C++ hook on nonStaticCallMe will call nonStaticReturnMe(5) inside
+                // the detour and store 6 back through an atomic; we just trigger the call.
+                Example.instance.nonStaticCallMe(99);
+                Example.methodCallReturnProbeDone = true;
+            }
+
             Thread.sleep(1);
         }
 
