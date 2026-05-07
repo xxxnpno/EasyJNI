@@ -1635,6 +1635,11 @@ namespace
 
         check("methodCallReturnProbeDone", example_class::get_method_call_return_probe_done());
 
+        // Diagnose whether the call_stub was found at all.
+        // If find_call_stub_entry() returns nullptr, call() silently returns 0;
+        // if the stub is found and the method runs, the result is 6 (5+1).
+        check("callStubFound", vmhook::detail::find_call_stub_entry() != nullptr);
+
         // nonStaticReturnMe(5) returns value + 1 == 6
         check_equal("methodCallReturnValue",
             method_call_return_observed.load(),
