@@ -4401,20 +4401,22 @@ namespace vmhook
 
             /*
                 @brief Converts the stored value to T via static_cast.
+                Falls back to a default-constructed T for variant alternatives
+                that cannot be cast to the target type (std::monostate, std::string).
             */
             template<typename target_type>
             operator target_type() const noexcept
             {
-                return std::visit([](auto v) noexcept 
-                    -> target_type 
+                return std::visit([](auto v) noexcept
+                    -> target_type
                     {
-                        if constexpr (std::is_same_v<decltype(v), std::monostate>) 
-                        {
-                            return target_type{};
-                        }
-                        else 
+                        if constexpr (requires { static_cast<target_type>(v); })
                         {
                             return static_cast<target_type>(v);
+                        }
+                        else
+                        {
+                            return target_type{};
                         }
                     }
                 , data);
