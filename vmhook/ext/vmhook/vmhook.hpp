@@ -4802,53 +4802,61 @@ namespace vmhook
         using object_base::object_base;
 
         /*
-            @brief get_field / get_method — static, callable from both static and
-            non-static C++ methods with identical syntax:
+            @brief Instance get_field / get_method — C++23 deducing-this overloads.
 
-                auto get_health() -> int        { return get_field("health")->get(); }
-                static auto get_version() -> ... { return get_field("version")->get(); }
+            A deducing-this function requires an explicit object to be called.
+            MSVC (and all conformant compilers) correctly exclude it from the
+            overload set when there is no 'this' in scope (i.e. inside a static
+            C++ method).  This avoids the C2352 "non-static member requires object"
+            that MSVC erroneously fires when a regular non-static overload is the
+            best type match from static context.
 
-            The static overloads below are found by name lookup in both contexts.
-            They forward through a null-OOP derived instance so that
-            object_base::get_field() can resolve the registered klass.
+            From instance context, string literals are an exact match for
+            const char*, so these deducing-this overloads win over the static
+            string_view overloads below.  The call is forwarded to
+            object_base::get_field / get_method, which carries the live OOP
+            pointer needed for instance Java fields.
 
-            For static Java fields the klass mirror is used and the instance OOP
-            is not needed.  For instance Java fields called from a non-static C++
-            method, object_base::get_field() (inherited via 'using' below) is also
-            in scope and will be preferred by conformant overload resolution; MSVC
-            resolves correctly here because the 'using'-introduced overload and the
-            static overload have the same parameter type (std::string_view), so
-            neither is a strictly better match — MSVC picks the static one from a
-            static context (only viable candidate) and the base-class one from an
-            instance context via the implicit object parameter ranking.
+            Usage:
+                auto get_health()  -> int  { return get_field("health")->get(); }
+                auto set_health(int v)     { get_field("health")->set(v); }
+        */
+        auto get_field(this const object_base& self, const char* const name)
+            -> std::optional<vmhook::field_proxy>
+        {
+            return self.object_base::get_field(name);
+        }
+
+        auto get_method(this const object_base& self, const char* const name)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return self.object_base::get_method(name);
+        }
+
+        /*
+            @brief Static get_field / get_method — for static Java fields called
+            from static C++ methods.
+
+            From a static C++ method the deducing-this overloads above are not
+            in the candidate set (no object), so these static overloads are the
+            only viable candidates.  They resolve the class via type_index (no
+            OOP needed for the Java mirror that backs static fields).
+
+            Usage:
+                static auto get_version() -> std::string { return get_field("version")->get(); }
+                static auto reset()        -> void        { get_method("reset")->call(); }
         */
         static auto get_field(const std::string_view name)
             -> std::optional<vmhook::field_proxy>
         {
-            derived null_inst{ static_cast<vmhook::oop_t>(nullptr) };
-            return null_inst.object_base::get_field(name);
+            return object_base::get_field(std::type_index{ typeid(derived) }, name);
         }
 
         static auto get_method(const std::string_view name)
             -> std::optional<vmhook::method_proxy>
         {
-            derived null_inst{ static_cast<vmhook::oop_t>(nullptr) };
-            return null_inst.object_base::get_method(name);
+            return object_base::get_method(std::type_index{ typeid(derived) }, name);
         }
-
-        /*
-            Re-expose the object_base instance overloads so that non-static C++
-            methods can still resolve get_field / get_method to the base-class
-            implementations that carry the live OOP pointer (needed for instance
-            Java fields).  When both this and the static overload above are
-            candidates in an instance context, they have identical string_view
-            parameter types; MSVC treats the base-class overload (introduced by
-            'using') as lower-ranked than the directly-declared static one only
-            in a static context, and picks the base-class one from instance context
-            through the implicit-object-parameter ranking rules.
-        */
-        using object_base::get_field;
-        using object_base::get_method;
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
