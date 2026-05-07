@@ -4503,20 +4503,22 @@ namespace vmhook
             or use an object wrapper.
         */
         /*
-            @brief Invokes the Java method through StubRoutines::_call_stub_entry.
+            @brief Invokes the Java method and returns its result.
             @param args  C++ values forwarded as the method's Java arguments.
                          For instance methods the receiver is added automatically
                          from the proxy's stored object pointer.
-            @return value_t holding the Java return value, or monostate on failure.
+            @return value_t holding the Java return value, or monostate if the
+                    call gate is unavailable.
 
-            @note call() must be invoked from inside a vmhook::hook() detour where
-                  vmhook::hotspot::current_java_thread is set.
+            @note  Calling Java methods from native C++ requires HotSpot's
+                   StubRoutines::_call_stub_entry, which sets up a properly-typed
+                   "entry frame" that the GC and frame-walker understand.
+                   This address is located via VMStructs at runtime; if the
+                   VMStruct entry is absent (removed in some JDK releases), call()
+                   falls back to returning monostate without invoking the method.
 
-                  Internally this uses HotSpot's official C++→Java call gate
-                  (StubRoutines::_call_stub_entry), which sets up a proper "entry
-                  frame" that the GC and frame-walker understand — unlike calling
-                  the c2i adapter directly, which crashes the JVM when it inspects
-                  the native frame above the interpreter.
+                   call() must be invoked from inside a vmhook::hook() detour
+                   where vmhook::hotspot::current_java_thread is set.
         */
         template<typename... args_t>
         auto call(args_t&&... args) const noexcept
@@ -4533,7 +4535,9 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            // The call_stub entry point — located once via VMStructs.
+            // Locate HotSpot's C++→Java call gate via VMStructs.
+            // StubRoutines::_call_stub_entry was removed from the VMStruct
+            // export table in some JDK releases; check availability at runtime.
             void* const call_stub{ vmhook::detail::find_call_stub_entry() };
             if (!call_stub)
             {
@@ -4553,11 +4557,10 @@ namespace vmhook
                 rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
             const int result_type{ vmhook::detail::sig_char_to_basic_type(ret_char) };
 
-            // ── Pack receiver + arguments into the parameter slot array ───────
-            // The call_stub passes parameters[] to the interpreter as Java
-            // locals[0..n].  Each element is an intptr_t:
-            //   - primitive values are zero/sign-extended to 64 bits
-            //   - object references are uncompressed decoded OOP pointers
+            // ── Parameter slot array ──────────────────────────────────────────
+            // The call_stub passes parameters[] to the interpreter as locals[].
+            // Each slot is an intptr_t: primitives are zero-extended, object
+            // references are uncompressed decoded OOP pointers.
             std::intptr_t params[8]{};
             std::size_t   param_idx{ 0 };
 
@@ -4578,25 +4581,26 @@ namespace vmhook
             (pack(std::forward<args_t>(args)), ...);
 
             // ── Call the stub ─────────────────────────────────────────────────
-            // Windows x64: first 4 args in rcx/rdx/r8/r9; rest on stack with
-            // 32-byte shadow space.  The stub signature is:
-            //   void call_stub(link, result*, result_type, method*,
-            //                  entry_point, parameters*, param_count, thread*)
+            // Windows x64 calling convention — 8 arguments:
+            //   rcx = link  (return address for stub frame, -1 sentinel)
+            //   rdx = result* (where the Java return value is written)
+            //   r8  = result_type (BasicType enum)
+            //   r9  = Method*
+            //   stk = entry_point, parameters*, param_count, JavaThread*
             using call_stub_fn_t = void (*)(
-                void*,          // rcx: link  (return address / -1)
-                std::intptr_t*, // rdx: result holder
-                int,            // r8:  BasicType
-                void*,          // r9:  Method*
-                void*,          // stk: entry_point
-                std::intptr_t*, // stk: parameters
-                int,            // stk: size_of_parameters
-                void*           // stk: JavaThread*
+                void*,          // link
+                std::intptr_t*, // result
+                int,            // result_type
+                void*,          // method
+                void*,          // entry_point
+                std::intptr_t*, // parameters
+                int,            // size_of_parameters
+                void*           // thread
             );
 
             std::intptr_t result_holder{ 0 };
-
             reinterpret_cast<call_stub_fn_t>(call_stub)(
-                reinterpret_cast<void*>(static_cast<std::intptr_t>(-1)), // link sentinel
+                reinterpret_cast<void*>(static_cast<std::intptr_t>(-1)),
                 &result_holder,
                 result_type,
                 reinterpret_cast<void*>(this->method),
@@ -4629,8 +4633,7 @@ namespace vmhook
                     return value_t{ d };
                 }
                 case 'V': return value_t{ std::monostate{} };
-                default:  // object ref — compressed OOP
-                    return value_t{ static_cast<std::uint32_t>(result_holder) };
+                default:  return value_t{ static_cast<std::uint32_t>(result_holder) };
             }
         }
 
