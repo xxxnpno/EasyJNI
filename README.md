@@ -1,212 +1,295 @@
 # vmhook
 
 vmhook is a C++23 single-header library for interacting with a running HotSpot
-Java Virtual Machine from native code without JNI or JVMTI. A C++ wrapper class
-is registered against a Java class name, then wrapper methods read fields, write
-fields, and call Java methods through a small proxy API.
+Java Virtual Machine from native code — without JNI or JVMTI. A C++ wrapper
+class is registered against a Java class name; wrapper methods then read fields,
+write fields, call Java methods, and hook method execution entirely through
+HotSpot's own VMStructs, making the approach transparent to the JVM and
+independent of the JNI/JVMTI permission model.
+
+## Architecture
+
+### Why not JNI / JVMTI?
+
+| Aspect | JNI / JVMTI | vmhook |
+|---|---|---|
+| Requires JVM permission | Yes (attached agent / native library) | No — reads from already-mapped JVM data |
+| Visible to JVM security | Yes | No |
+| Header only | No | Yes |
+| Supported Java versions | All | HotSpot 8 – 24+ |
+
+### How it works
+
+1. **VMStructs** — HotSpot exports a global symbol `gHotSpotVMStructs` that
+   describes every internal field by name, type, and offset. vmhook parses this
+   table at startup to locate fields inside `InstanceKlass`, `Method`, `Symbol`,
+   and other internal types without hardcoding any offsets.
+
+2. **ClassLoaderDataGraph** — vmhook walks the `ClassLoaderDataGraph` to find
+   the `InstanceKlass*` for a registered Java class name. The result is cached
+   for the process lifetime.
+
+3. **OOP decoding** — compressed oops and compressed klass pointers are decoded
+   using the base/shift values from VMStructs (`CompressedOops`,
+   `CompressedKlassPointers`, or `Universe` depending on the JDK version).
+
+4. **Method hooks** — vmhook patches the interpreter entry point of a `Method`
+   object. The trampoline saves registers, calls the C++ detour, and either
+   returns the native-supplied value or falls through to the original bytecode.
 
 ## Platform
 
-vmhook currently targets Windows and MSVC.
+Windows x64, MSVC (C++23 or later required).
 
 ```powershell
 MSBuild vmhook.slnx /p:Configuration=Release /p:Platform=x64 /m
 ```
 
-## Basic Model
+## Quick start
 
-Include the header:
+Include the header and register your wrapper classes once at startup:
 
 ```cpp
 #include <vmhook/vmhook.hpp>
-```
 
-Create one C++ wrapper class for each Java class you want to use:
-
-```cpp
-class example_class : public vmhook::object<example_class>
+class player_class : public vmhook::object<player_class>
 {
 public:
-    explicit example_class(vmhook::oop_t instance)
-        : vmhook::object<example_class>{ instance }
+    explicit player_class(vmhook::oop_t instance)
+        : vmhook::object<player_class>{ instance }
     {
     }
 
-    auto get_counter()
-        -> std::int32_t
-    {
-        return get_field("counter")->get();
-    }
-
-    auto set_counter(std::int32_t value)
-        -> void
-    {
-        get_field("counter")->set(value);
-    }
-
-    auto tick(std::int32_t amount)
-        -> void
-    {
-        get_method("tick")->call(amount);
-    }
+    auto get_health() -> std::int32_t { return get_field("health")->get(); }
+    auto set_health(std::int32_t v)   { get_field("health")->set(v); }
+    auto respawn()                    { get_method("respawn")->call(); }
 };
+
+// Call once before any wrapper usage:
+vmhook::register_class<player_class>("com/example/Player");
 ```
 
-Register the wrapper once before using it:
+Then wrap a decoded OOP to access instance members:
 
 ```cpp
-vmhook::register_class<example_class>("vmhook/Example");
-```
-
-Wrap a decoded Java object pointer when you need instance fields or instance
-methods:
-
-```cpp
-example_class example{ instance_oop };
-
-std::int32_t counter{ example.get_counter() };
-example.set_counter(counter + 1);
-example.tick(5);
+player_class player{ decoded_oop };
+player.set_health(100);
+player.respawn();
 ```
 
 ## Fields
 
-Fields use one read function and one write function:
+### Instance fields
 
 ```cpp
-get_field("fieldName")->get();
-get_field("fieldName")->set(value);
+get_field("fieldName")->get();        // read
+get_field("fieldName")->set(value);   // write
 ```
 
-`get()` converts to the C++ return type selected by your wrapper method. The
-same API is used for primitives, strings, object wrappers, and vectors:
+`get()` converts to whatever C++ type your wrapper method returns. The same API
+works for primitives, strings, object wrappers, and vectors:
 
 ```cpp
-auto get_name()
-    -> std::string
-{
-    return get_field("name")->get();
-}
-
-auto get_flags()
-    -> std::vector<bool>
-{
-    return get_field("flags")->get();
-}
-
-auto set_flags(const std::vector<bool>& value)
-    -> void
-{
-    get_field("flags")->set(value);
-}
+auto get_name()   -> std::string            { return get_field("name")->get(); }
+auto get_flags()  -> std::vector<bool>      { return get_field("flags")->get(); }
+auto get_score()  -> std::int32_t           { return get_field("score")->get(); }
 ```
 
-## Static Fields
+Supported scalar types: `bool`, `std::byte`, `std::int16_t`, `std::int32_t`,
+`std::int64_t`, `float`, `double`, `char`, `std::string`.
 
-Static Java fields use the same `get_field(...)` API. Expose them as static
-C++ methods, then call `get_field(...)` directly:
+Supported vector types: `std::vector<T>` for each scalar above.
+
+Object-reference fields return a `std::unique_ptr<wrapper_type>` when the
+returned type is a registered wrapper:
 
 ```cpp
-class example_class : public vmhook::object<example_class>
-{
-public:
-    example_class() = default;
-
-    explicit example_class(vmhook::oop_t instance)
-        : vmhook::object<example_class>{ instance }
-    {
-    }
-
-
-    static auto get_static_double()
-        -> double
-    {
-        return get_field("staticDouble")->get();
-    }
-
-    static auto set_static_double(double value)
-        -> void
-    {
-        get_field("staticDouble")->set(value);
-    }
-};
+auto get_a() -> std::unique_ptr<a_class> { return get_field("a")->get(); }
 ```
 
-Static wrapper calls resolve through the registered Java class metadata and
-read/write the `java.lang.Class` mirror.
+### Static fields
+
+Static Java fields use the same `get_field(...)` API. Expose them as C++ static
+methods:
 
 ```cpp
-example_class::set_static_double(2.0);
-double value{ example_class::get_static_double() };
+static auto get_instance_count() -> std::int32_t
+{
+    return get_field("instanceCount")->get();
+}
+
+static auto set_instance_count(std::int32_t v)
+{
+    get_field("instanceCount")->set(v);
+}
 ```
 
 ## Methods
 
-Method calls intentionally mirror fields:
+Method calls mirror field access:
 
 ```cpp
-get_method("methodName")->call(arg1, arg2, arg3);
+get_method("methodName")->call(arg1, arg2);
+get_method("methodName")->call<std::int32_t>(arg);  // typed return value
 ```
 
-Expose Java methods through wrapper methods so the rest of your C++ code never
-uses raw method names:
+Instance methods:
 
 ```cpp
-auto add_score(std::int32_t amount, const std::string& reason)
-    -> void
+auto add_score(std::int32_t amount) -> void
 {
-    get_method("addScore")->call(amount, reason);
+    get_method("addScore")->call(amount);
+}
+
+auto compute(std::int32_t x) -> std::int32_t
+{
+    return get_method("compute")->call<std::int32_t>(x);
 }
 ```
 
-Static Java methods use the same `get_method(...)` API:
+Static methods use the same syntax and can be called from static C++ methods:
 
 ```cpp
-
-static auto static_call_me(std::int32_t value)
-    -> void
+static auto global_reset() -> void
 {
-    get_method("staticCallMe")->call(value);
+    get_method("globalReset")->call();
 }
 ```
 
-For instance methods, call through `this`:
+## Inheritance and Polymorphism
 
-```cpp
-auto non_static_call_me(std::int32_t value)
-    -> void
-{
-    get_method("nonStaticCallMe")->call(value);
+vmhook automatically walks the superclass chain when resolving fields and
+methods. If a field or method is not declared on the concrete class, vmhook
+searches each superclass in order.
+
+```java
+// Java
+class A {
+    protected int protectedInt = 1337;
+    protected int protectedAdd(int x) { return x + protectedInt; }
+}
+class B extends A {
+    public int bInt = 42;
 }
 ```
+
+```cpp
+class b_class : public vmhook::object<b_class>
+{
+public:
+    explicit b_class(vmhook::oop_t instance)
+        : vmhook::object<b_class>{ instance }
+    {
+    }
+
+    // own field on B
+    auto get_b_int()        -> std::int32_t { return get_field("bInt")->get(); }
+
+    // inherited field from A — find_field walks the superclass chain
+    auto get_protected_int() -> std::int32_t { return get_field("protectedInt")->get(); }
+
+    // inherited method from A — get_method walks the superclass chain
+    auto protected_add(std::int32_t x) -> std::int32_t
+    {
+        return get_method("protectedAdd")->call<std::int32_t>(x);
+    }
+};
+
+vmhook::register_class<b_class>("vmhook/B");
+```
+
+Usage:
+
+```cpp
+auto b_ptr = example.get_field("bInstance")->get<std::unique_ptr<b_class>>();
+b_ptr->get_b_int();          // 42  — own field
+b_ptr->get_protected_int();  // 1337 — inherited from A
+b_ptr->protected_add(3);     // 1340 — inherited method from A
+```
+
+## Collections and Lists
+
+vmhook provides `vmhook::collection` and `vmhook::list` wrapper classes for
+`java.util.Collection` and `java.util.List` objects. These wrappers resolve the
+concrete klass directly from the object header so no `register_class<T>()` call
+is needed and they work with any implementation (ArrayList, LinkedList, etc.).
+
+### vmhook::collection
+
+```cpp
+vmhook::collection col{ list_oop };
+std::int32_t n = col.size();    // calls Java size()
+bool empty = col.is_empty();
+```
+
+### vmhook::list
+
+`vmhook::list` extends `collection` with `to_vector<T>()`, which reads an
+ArrayList's backing array directly from the JVM heap for maximum efficiency,
+with a generic `get(int)` fallback for other List implementations.
+
+```java
+// Java
+public List<A> listOfAs;
+```
+
+```cpp
+// C++
+auto list_ptr = example.get_field("listOfAs")->get<std::unique_ptr<vmhook::list>>();
+auto vec = list_ptr->to_vector<a_class>();
+// vec is std::vector<std::unique_ptr<a_class>>
+
+for (const auto& elem : vec)
+{
+    if (elem)
+    {
+        std::println("val = {}", elem->get_val());
+    }
+}
+```
+
+Null Java elements become `nullptr` entries in the returned vector. Elements are
+wrapped with `std::make_unique<element_type>(oop)`, so `element_type` must
+accept a `vmhook::oop_t` in its constructor.
 
 ## Hooks
 
-Hooks receive `vmhook::return_value&` first, followed by the decoded Java
-arguments. Instance methods receive the wrapped `this` object as the first Java
-argument:
+Hooks receive `vmhook::return_value&` as the first argument, followed by
+decoded Java arguments. Instance method hooks receive the wrapped `this` as the
+first Java argument.
 
 ```cpp
+// Observe an instance method call without modifying behaviour:
 vmhook::hook<example_class>("nonStaticCallMe",
-    [](vmhook::return_value& return_value, const std::unique_ptr<example_class>& self, std::int32_t value)
+    [](vmhook::return_value& /*retval*/,
+       const std::unique_ptr<example_class>& self,
+       std::int32_t value)
     {
-        // Leave return_value untouched to let the original Java method run.
+        // Leave retval untouched — original Java body runs normally.
     });
 ```
 
-To skip the original method body, set or cancel the return slot:
+To replace the return value, call `retval.set(...)`:
 
 ```cpp
 vmhook::hook<example_class>("nonStaticReturnMe",
-    [](vmhook::return_value& return_value, const std::unique_ptr<example_class>& self, std::int32_t value)
+    [](vmhook::return_value& retval,
+       const std::unique_ptr<example_class>& self,
+       std::int32_t value)
     {
-        return_value.set(static_cast<std::int32_t>(12345));
+        retval.set(static_cast<std::int32_t>(12345));
     });
+```
 
-vmhook::hook<example_class>("nonStaticVoidMethod",
-    [](vmhook::return_value& return_value, const std::unique_ptr<example_class>& self)
+To cancel a void method (skip the original body):
+
+```cpp
+vmhook::hook<example_class>("nonStaticCancelMe",
+    [](vmhook::return_value& retval,
+       const std::unique_ptr<example_class>& self,
+       std::int32_t value)
     {
-        return_value.cancel();
+        retval.cancel();
     });
 ```
 
@@ -214,22 +297,29 @@ Static method hooks omit the wrapper argument:
 
 ```cpp
 vmhook::hook<example_class>("staticReturnMe",
-    [](vmhook::return_value& return_value, std::int32_t value)
+    [](vmhook::return_value& retval, std::int32_t value)
     {
-        return_value.set(static_cast<std::int32_t>(24680));
+        retval.set(static_cast<std::int32_t>(24680));
     });
+```
+
+Remove all installed hooks when done:
+
+```cpp
+vmhook::shutdown_hooks();
 ```
 
 ## Object Construction
 
-`vmhook::make_unique<T>(arg1, arg2, ...)` allocates a Java object for the
-registered wrapper type with HotSpot internals only. It uses the current
-JavaThread's TLAB, so call it from a `vmhook::hook(...)` detour where vmhook has
-captured the HotSpot JavaThread.
+`vmhook::make_unique<T>(arg1, arg2, ...)` allocates a new Java object for the
+registered wrapper type using HotSpot internals only (no JNI, no Java
+constructor bytecode). It uses the current JavaThread's TLAB, so it must be
+called from inside a `vmhook::hook(...)` detour where vmhook has captured the
+HotSpot thread context.
 
-The function returns a `std::unique_ptr<T>` wrapping the new OOP. After allocation
-it calls `wrapper.construct(arg1, arg2, ...)` when the wrapper exposes a matching
-C++ method. Use that method to initialize fields through the normal wrapper API:
+The function returns a `std::unique_ptr<T>`. If the wrapper class exposes
+`construct(arg1, arg2, ...)`, vmhook calls it after allocation to let you
+initialize fields via the normal wrapper API:
 
 ```cpp
 class a_class : public vmhook::object<a_class>
@@ -240,49 +330,47 @@ public:
     {
     }
 
-    auto set_val(std::int32_t value)
-        -> void
-    {
-        get_field("val")->set(value);
-    }
-
-    auto construct(std::int32_t value)
-        -> void
-    {
-        set_val(value);
-    }
+    auto set_val(std::int32_t value)   { get_field("val")->set(value); }
+    auto construct(std::int32_t value) { set_val(value); }
 };
 
 vmhook::hook<example_class>("nonStaticCallMe",
-    [](vmhook::return_value& return_value,
+    [](vmhook::return_value& /*retval*/,
        const std::unique_ptr<example_class>& self,
        std::int32_t value)
     {
-        auto object{ vmhook::make_unique<a_class>(1337) };
+        auto obj{ vmhook::make_unique<a_class>(1337) };
+        // obj->get_val() == 1337
     });
 ```
-
-`make_unique` does not use JNI and does not invoke Java constructor bytecode.
-Keep constructor-style initialization in the wrapper's `construct(...)` method.
 
 ## Example
 
 The complete example lives in `vmhook/src/example.cpp`. It demonstrates:
 
-- wrapper classes for `vmhook.Main`, `vmhook.Example`, and `vmhook.A`
-- static field getters and setters as static C++ methods
-- instance field getters and setters as instance C++ methods
-- `get()` for all supported field reads
-- `set(...)` for all supported field writes
-- `get_method("...")->call(...)` for method calls
-- method hooks that observe arguments and allow the original method
-- method hooks that force a return value
-- method hooks that cancel a void method
-- static method hooks
-- `vmhook::make_unique<T>(...)` from a method hook
-- a GitHub Actions test harness that writes `test_results.txt`
+- Wrapper classes for `vmhook.Main`, `vmhook.Example`, `vmhook.A`, and
+  `vmhook.B`
+- Static field getters and setters as static C++ methods
+- Instance field getters and setters as instance C++ methods
+- `get()` and `set(...)` for all supported primitive and array field types
+- `get_method("...")->call(...)` for instance and static method calls
+- Method hooks that observe arguments and allow the original method
+- Method hooks that force a return value
+- Method hooks that cancel a void method
+- Static method hooks
+- `vmhook::make_unique<T>(...)` from inside a method hook
+- `vmhook::list::to_vector<T>()` reading an ArrayList backing array directly
+- Superclass field and method resolution via `vmhook::find_field` and
+  `get_method` hierarchy walk
+- A GitHub Actions CI harness that writes `test_results.txt` and fails on any
+  `[FAIL]` line
 
 ## Notes
 
-vmhook works directly with HotSpot internals. Field names and method names must
-match the Java class exactly, and wrapper classes must be registered before use.
+- Field names and method names must match the Java source exactly.
+- Wrapper classes must be registered with `vmhook::register_class<T>(name)`
+  before any wrapper methods are called.
+- vmhook targets x64 HotSpot. Compressed oops and compressed class pointers are
+  assumed to be enabled (the default for heaps under 32 GB).
+- Class unloading is not handled — klass pointers cached by vmhook are only safe
+  for process-lifetime injection scenarios.

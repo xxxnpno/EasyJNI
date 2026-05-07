@@ -56,6 +56,129 @@ public:
     }
 };
 
+class a_class : public vmhook::object<a_class>
+{
+public:
+    explicit a_class(vmhook::oop_t instance)
+        : vmhook::object<a_class>{ instance }
+    {
+    }
+
+    auto get_string()
+        -> std::string
+    {
+        return get_field("string")->get();
+    }
+
+    auto set_string(const std::string& value)
+        -> void
+    {
+        get_field("string")->set(value);
+    }
+
+    static auto get_counter()
+        -> std::int32_t
+    {
+        return get_field("counter")->get();
+    }
+
+    static auto set_counter(std::int32_t value)
+        -> void
+    {
+        get_field("counter")->set(value);
+    }
+
+    auto get_val()
+        -> std::int32_t
+    {
+        return get_field("val")->get();
+    }
+
+    auto set_val(std::int32_t value)
+        -> void
+    {
+        get_field("val")->set(value);
+    }
+
+    auto get_protected_int()
+        -> std::int32_t
+    {
+        return get_field("protectedInt")->get();
+    }
+
+    auto get_protected_string()
+        -> std::string
+    {
+        return get_field("protectedString")->get();
+    }
+
+    auto protected_add(std::int32_t x)
+        -> std::int32_t
+    {
+        return get_method("protectedAdd")->call<std::int32_t>(x);
+    }
+
+    auto construct()
+        -> void
+    {
+        set_counter(get_counter() + 1);
+    }
+
+    auto construct(std::int32_t value)
+        -> void
+    {
+        this->set_val(value);
+        this->construct();
+    }
+};
+
+class b_class : public vmhook::object<b_class>
+{
+public:
+    explicit b_class(vmhook::oop_t instance)
+        : vmhook::object<b_class>{ instance }
+    {
+    }
+
+    // Own field
+    auto get_b_int()
+        -> std::int32_t
+    {
+        return get_field("bInt")->get();
+    }
+
+    auto set_b_int(std::int32_t v)
+        -> void
+    {
+        get_field("bInt")->set(v);
+    }
+
+    auto get_b_string()
+        -> std::string
+    {
+        return get_field("bString")->get();
+    }
+
+    // Inherited field from A (tests superclass hierarchy walk in find_field)
+    auto get_protected_int()
+        -> std::int32_t
+    {
+        return get_field("protectedInt")->get();
+    }
+
+    auto get_protected_string()
+        -> std::string
+    {
+        return get_field("protectedString")->get();
+    }
+
+    auto protected_add(std::int32_t x)
+        -> std::int32_t
+    {
+        return get_method("protectedAdd")->call<std::int32_t>(x);
+    }
+};
+
 class example_class : public vmhook::object<example_class>
 {
 public:
@@ -721,63 +844,91 @@ public:
     {
         get_method("useA")->call(value);
     }
-};
 
-class a_class : public vmhook::object<a_class>
-{
-public:
-    explicit a_class(vmhook::oop_t instance)
-        : vmhook::object<a_class>{ instance }
+    // List probe
+    static auto get_list_probe_requested()
+        -> bool
     {
+        return get_field("listProbeRequested")->get();
     }
 
-    auto get_string()
-        -> std::string
-    {
-        return get_field("string")->get();
-    }
-
-    auto set_string(const std::string& value)
+    static auto set_list_probe_requested(bool v)
         -> void
     {
-        get_field("string")->set(value);
+        get_field("listProbeRequested")->set(v);
     }
 
-    static auto get_counter()
+    static auto get_list_probe_done()
+        -> bool
+    {
+        return get_field("listProbeDone")->get();
+    }
+
+    static auto set_list_probe_done(bool v)
+        -> void
+    {
+        get_field("listProbeDone")->set(v);
+    }
+
+    static auto get_list_probe_size()
         -> std::int32_t
     {
-        return get_field("counter")->get();
+        return get_field("listProbeSize")->get();
     }
 
-    static auto set_counter(std::int32_t value)
+    auto get_list_of_as()
+        -> std::unique_ptr<vmhook::list>
+    {
+        return get_field("listOfAs")->get();
+    }
+
+    // Poly probe
+    static auto get_poly_probe_requested()
+        -> bool
+    {
+        return get_field("polyProbeRequested")->get();
+    }
+
+    static auto set_poly_probe_requested(bool v)
         -> void
     {
-        get_field("counter")->set(value);
+        get_field("polyProbeRequested")->set(v);
     }
 
-    auto get_val()
-        -> std::int32_t
+    static auto get_poly_probe_done()
+        -> bool
     {
-        return get_field("val")->get();
+        return get_field("polyProbeDone")->get();
     }
 
-    auto set_val(std::int32_t value)
+    static auto set_poly_probe_done(bool v)
         -> void
     {
-        get_field("val")->set(value);
+        get_field("polyProbeDone")->set(v);
     }
 
-    auto construct()
-        -> void
+    static auto get_poly_probe_inherited_field()
+        -> bool
     {
-        set_counter(get_counter() + 1);
+        return get_field("polyProbeInheritedField")->get();
     }
 
-    auto construct(std::int32_t value)
-        -> void
+    static auto get_poly_probe_inherited_method()
+        -> bool
     {
-        this->set_val(value);
-        this->construct();
+        return get_field("polyProbeInheritedMethod")->get();
+    }
+
+    static auto get_poly_probe_own_field()
+        -> bool
+    {
+        return get_field("polyProbeOwnField")->get();
+    }
+
+    auto get_b_instance()
+        -> std::unique_ptr<b_class>
+    {
+        return get_field("bInstance")->get();
     }
 };
 
@@ -807,6 +958,11 @@ namespace
     std::atomic_bool make_unique_saw_argument{};
     std::atomic_bool make_unique_initialized_value{};
     std::atomic_bool make_unique_initialized_counter{};
+    std::atomic_bool list_probe_size_correct{};
+    std::atomic_bool list_probe_elements_correct{};
+    std::atomic_bool poly_probe_inherited_field{};
+    std::atomic_bool poly_probe_inherited_method{};
+    std::atomic_bool poly_probe_own_field{};
 
 
     auto write_result(const std::string& line)
@@ -1274,6 +1430,118 @@ namespace
 
         vmhook::shutdown_hooks();
     }
+
+    auto test_list_probe(example_class& instance)
+        -> void
+    {
+        /*
+            Reads Example.listOfAs (a java.util.ArrayList<A>) directly from the
+            JVM heap via vmhook::list::to_vector<a_class>() and validates the
+            element count and content.
+        */
+        list_probe_size_correct.store(false);
+        list_probe_elements_correct.store(false);
+
+        example_class::set_list_probe_done(false);
+        example_class::set_list_probe_requested(false);
+
+        example_class::set_list_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+        for (std::int32_t i{ 0 }; i < max_wait_iterations; ++i)
+        {
+            if (example_class::get_list_probe_done()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+
+        example_class::set_list_probe_requested(false);
+
+        check("listProbeDone", example_class::get_list_probe_done());
+
+        // Java confirmed the list has 3 elements
+        check_equal("listProbeSize", example_class::get_list_probe_size(), static_cast<std::int32_t>(3));
+
+        // Now read via vmhook::list::to_vector<a_class>()
+        auto list_ptr = instance.get_list_of_as();
+        check("listPtrNonNull", list_ptr != nullptr);
+
+        if (list_ptr)
+        {
+            auto vec = list_ptr->to_vector<a_class>();
+            list_probe_size_correct.store(static_cast<std::int32_t>(vec.size()) == 3);
+            check("listToVectorSize", list_probe_size_correct.load());
+
+            // Each element should be a valid a_class (counter was incremented by each A())
+            bool elements_ok{ true };
+            for (const auto& elem : vec)
+            {
+                if (!elem)
+                {
+                    elements_ok = false;
+                }
+            }
+            list_probe_elements_correct.store(elements_ok);
+            check("listToVectorElements", list_probe_elements_correct.load());
+        }
+    }
+
+    auto test_poly_probe(example_class& instance)
+        -> void
+    {
+        /*
+            Gets the B instance stored in Example.bInstance (type B extends A) and
+            verifies that vmhook can read:
+              - B's own field  bInt  (declared on B)
+              - A's protected field  protectedInt  (declared on A, inherited by B)
+            This exercises the superclass chain walk added to vmhook::find_field().
+        */
+        poly_probe_inherited_field.store(false);
+        poly_probe_inherited_method.store(false);
+        poly_probe_own_field.store(false);
+
+        example_class::set_poly_probe_done(false);
+        example_class::set_poly_probe_requested(false);
+
+        example_class::set_poly_probe_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+        for (std::int32_t i{ 0 }; i < max_wait_iterations; ++i)
+        {
+            if (example_class::get_poly_probe_done()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+
+        example_class::set_poly_probe_requested(false);
+
+        check("polyProbeDone", example_class::get_poly_probe_done());
+
+        // Get B instance
+        auto b_ptr = instance.get_b_instance();
+        check("bInstanceNonNull", b_ptr != nullptr);
+
+        if (b_ptr)
+        {
+            // Own field on B
+            const std::int32_t b_int_val{ b_ptr->get_b_int() };
+            poly_probe_own_field.store(b_int_val == 42);
+            check_equal("polyBInt", b_int_val, static_cast<std::int32_t>(42));
+
+            // Inherited protected field from A
+            const std::int32_t protected_int_val{ b_ptr->get_protected_int() };
+            poly_probe_inherited_field.store(protected_int_val == 1337);
+            check_equal("polyInheritedInt", protected_int_val, static_cast<std::int32_t>(1337));
+
+            // Inherited protected method from A
+            const std::int32_t add_result{ b_ptr->protected_add(3) };
+            poly_probe_inherited_method.store(add_result == 1340);
+            check_equal("polyInheritedMethod", add_result, static_cast<std::int32_t>(1340));
+
+            // Verify Java side saw the same values
+            check("polyJavaInheritedField", example_class::get_poly_probe_inherited_field());
+            check("polyJavaInheritedMethod", example_class::get_poly_probe_inherited_method());
+            check("polyJavaOwnField", example_class::get_poly_probe_own_field());
+        }
+    }
 }
 
 static auto WINAPI thread_entry(HMODULE module)
@@ -1286,6 +1554,7 @@ static auto WINAPI thread_entry(HMODULE module)
     vmhook::register_class<main_class>("vmhook/Main");
     vmhook::register_class<example_class>("vmhook/Example");
     vmhook::register_class<a_class>("vmhook/A");
+    vmhook::register_class<b_class>("vmhook/B");
 
     const auto instance{ example_class::get_instance() };
 
@@ -1299,6 +1568,8 @@ static auto WINAPI thread_entry(HMODULE module)
         test_method_cancel(*instance);
         test_static_method_force_return();
         test_make_unique_status();
+        test_list_probe(*instance);
+        test_poly_probe(*instance);
     }
     else
     {

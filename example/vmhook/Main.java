@@ -21,6 +21,7 @@ public class Main
 
         // to make sure Example class exists in the JVM
         Class.forName("vmhook.Example");
+        Class.forName("vmhook.B");
 
         // we let vmhook.dll do its things in the jvm
         // vmhook has to get_field("stopJVM")->set(true) to stop the JVM
@@ -59,6 +60,20 @@ public class Main
                     throw new IllegalStateException("unreachable");
                 }
                 Example.makeUniqueProbeDone = true;
+            }
+
+            if (Example.listProbeRequested && !Example.listProbeDone)
+            {
+                Example.listProbeSize = Example.instance.listOfAs.size();
+                Example.listProbeDone = true;
+            }
+
+            if (Example.polyProbeRequested && !Example.polyProbeDone)
+            {
+                Example.polyProbeInheritedField = (Example.instance.bInstance.protectedInt == 1337);
+                Example.polyProbeInheritedMethod = (Example.instance.bInstance.protectedAdd(3) == 1340);
+                Example.polyProbeOwnField = (Example.instance.bInstance.bInt == 42);
+                Example.polyProbeDone = true;
             }
 
             Thread.sleep(1);

@@ -1,5 +1,7 @@
 package vmhook;
 
+import java.util.List;
+
 // here we store every java types to handle the unit tests
 public class Example
 {
@@ -67,6 +69,14 @@ public class Example
     // since it can access static fields withour an instance it wiil get this one and then it will be able to obtain non static fields and methods
     public static Example instance = new Example();
 
+    public Example()
+    {
+        listOfAs = new java.util.ArrayList<>();
+        listOfAs.add(new A());
+        listOfAs.add(new A());
+        listOfAs.add(new A());
+    }
+
     // this one will store how many times did staticCallMe got called
     public static int staticCalled = 0;
 
@@ -87,6 +97,21 @@ public class Example
     public static volatile int staticForceReturnProbeValue = 0;
     public static volatile boolean makeUniqueProbeRequested = false;
     public static volatile boolean makeUniqueProbeDone = false;
+
+    // list probe
+    public List<A> listOfAs;
+    public static volatile boolean listProbeRequested = false;
+    public static volatile boolean listProbeDone = false;
+    public static volatile int listProbeSize = 0;
+    public static volatile boolean listProbeElementsCorrect = false;
+
+    // polymorphism / inheritance probe
+    public B bInstance = new B();
+    public static volatile boolean polyProbeRequested = false;
+    public static volatile boolean polyProbeDone = false;
+    public static volatile boolean polyProbeInheritedField = false;
+    public static volatile boolean polyProbeInheritedMethod = false;
+    public static volatile boolean polyProbeOwnField = false;
 
     public static void staticCallMe(final int value)
     {

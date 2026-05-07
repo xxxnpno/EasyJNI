@@ -1170,6 +1170,23 @@ namespace vmhook
                 }
             }
 
+            /*
+                @brief Returns the super-klass of this klass, or nullptr for java.lang.Object.
+            */
+            auto get_super() const noexcept -> klass*
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                    vmhook::hotspot::iterate_struct_entries("Klass", "_super") };
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+                auto* const super{
+                    *reinterpret_cast<klass**>(reinterpret_cast<std::uint8_t*>(
+                        const_cast<klass*>(this)) + entry->offset) };
+                return vmhook::hotspot::is_valid_pointer(super) ? super : nullptr;
+            }
+
             auto get_instance_size() const noexcept
                 -> std::size_t
             {
@@ -3728,7 +3745,7 @@ namespace vmhook
         On the first call for a given (target_klass, name) pair the full InstanceKlass._fields
         array is walked; subsequent calls return the cached result directly.
     */
-    static auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name) 
+    static auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name)
         -> std::optional<vmhook::hotspot::field_entry_t>
     {
         if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
@@ -3745,16 +3762,19 @@ namespace vmhook
             return field_cache_entry->second;
         }
 
-        const auto entry{ target_klass->find_field(name) };
-
-        if (!entry)
+        // Walk the superclass chain so that inherited fields are found.
+        for (vmhook::hotspot::klass* k{ target_klass }; k != nullptr; k = k->get_super())
         {
-            std::println("{} vmhook::find_field() for '{}': field not declared on klass.", vmhook::error_tag, name);
-            return std::nullopt;
+            const auto entry{ k->find_field(name) };
+            if (entry)
+            {
+                class_fields.emplace(name_str, *entry);
+                return entry;
+            }
         }
 
-        class_fields.emplace(name_str, *entry);
-        return entry;
+        std::println("{} vmhook::find_field() for '{}': field not found in class hierarchy.", vmhook::error_tag, name);
+        return std::nullopt;
     }
 
     /*
@@ -4696,7 +4716,7 @@ namespace vmhook
                     return get_method("takeValues")->call(a, b);
                 }
         */
-        auto get_method(const std::string_view method_name) const 
+        auto get_method(const std::string_view method_name) const
             -> std::optional<vmhook::method_proxy>
         {
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
@@ -4705,20 +4725,25 @@ namespace vmhook
                 return std::nullopt;
             }
 
-            const std::int32_t method_count{ resolved_klass->get_methods_count() };
-            vmhook::hotspot::method** const methods_array{ resolved_klass->get_methods_ptr() };
-
-            if (!methods_array || method_count <= 0)
+            // Walk the superclass chain so inherited methods are found.
+            for (vmhook::hotspot::klass* k{ resolved_klass }; k != nullptr; k = k->get_super())
             {
-                return std::nullopt;
-            }
+                const std::int32_t method_count{ k->get_methods_count() };
+                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
 
-            for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
-            {
-                vmhook::hotspot::method* const current_method{ methods_array[method_index] };
-                if (current_method && vmhook::hotspot::is_valid_pointer(current_method) && current_method->get_name() == method_name)
+                if (!methods_array || method_count <= 0)
                 {
-                    return vmhook::method_proxy{ this->instance, current_method, current_method->get_signature() };
+                    continue;
+                }
+
+                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+                {
+                    vmhook::hotspot::method* const current_method{ methods_array[method_index] };
+                    if (current_method && vmhook::hotspot::is_valid_pointer(current_method)
+                        && current_method->get_name() == method_name)
+                    {
+                        return vmhook::method_proxy{ this->instance, current_method, current_method->get_signature() };
+                    }
                 }
             }
 
@@ -4734,20 +4759,25 @@ namespace vmhook
                 return std::nullopt;
             }
 
-            const std::int32_t method_count{ resolved_klass->get_methods_count() };
-            vmhook::hotspot::method** const methods_array{ resolved_klass->get_methods_ptr() };
-
-            if (!methods_array || method_count <= 0)
+            // Walk the superclass chain so inherited methods are found.
+            for (vmhook::hotspot::klass* k{ resolved_klass }; k != nullptr; k = k->get_super())
             {
-                return std::nullopt;
-            }
+                const std::int32_t method_count{ k->get_methods_count() };
+                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
 
-            for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
-            {
-                vmhook::hotspot::method* const current_method{ methods_array[method_index] };
-                if (current_method && vmhook::hotspot::is_valid_pointer(current_method) && current_method->get_name() == method_name)
+                if (!methods_array || method_count <= 0)
                 {
-                    return vmhook::method_proxy{ nullptr, current_method, current_method->get_signature() };
+                    continue;
+                }
+
+                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+                {
+                    vmhook::hotspot::method* const current_method{ methods_array[method_index] };
+                    if (current_method && vmhook::hotspot::is_valid_pointer(current_method)
+                        && current_method->get_name() == method_name)
+                    {
+                        return vmhook::method_proxy{ nullptr, current_method, current_method->get_signature() };
+                    }
                 }
             }
 
@@ -4856,6 +4886,268 @@ namespace vmhook
             -> std::optional<vmhook::method_proxy>
         {
             return object_base::get_method(std::type_index{ typeid(derived) }, name);
+        }
+    };
+
+    // --- Built-in Java collection wrappers ------------------------------------
+
+    /*
+        @brief Resolves the HotSpot klass* directly from a decoded OOP header.
+
+        On x64 HotSpot (compressed class pointers enabled, the default):
+          offset 0  : mark word (8 bytes)
+          offset 8  : narrow klass (uint32_t, 4 bytes)
+        The narrow klass is decoded the same way as regular narrow oops but using
+        the klass base/shift instead of the oop base/shift.
+
+        Returns nullptr if the pointer is invalid or decoding fails.
+    */
+    inline auto klass_from_oop(void* const oop) noexcept -> vmhook::hotspot::klass*
+    {
+        if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+        {
+            return nullptr;
+        }
+        const std::uint32_t narrow{ *reinterpret_cast<const std::uint32_t*>(
+            reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+        void* const decoded{ vmhook::hotspot::klass::decode_klass_pointer(narrow) };
+        if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+        {
+            return nullptr;
+        }
+        return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
+    }
+
+    /*
+        @brief C++ wrapper for java.util.Collection objects.
+
+        Uses the live OOP's klass pointer (read from its object header) to
+        resolve fields and methods, so no register_class<T>() call is needed
+        and it works with any concrete Collection implementation
+        (ArrayList, LinkedList, HashSet, etc.).
+
+        Typical usage (from a hook detour where you received a List OOP):
+
+            collection col{ list_oop };
+            std::int32_t n = col.size();
+    */
+    class collection : public vmhook::object_base
+    {
+    public:
+        explicit collection(vmhook::oop_t oop) noexcept
+            : vmhook::object_base{ oop }
+        {
+        }
+
+    protected:
+        /*
+            @brief Returns the klass by reading the narrow klass slot in the OOP header.
+            Falls back to nullptr if the OOP is invalid.
+        */
+        auto oop_klass() const noexcept -> vmhook::hotspot::klass*
+        {
+            return vmhook::klass_from_oop(this->instance);
+        }
+
+        /*
+            @brief get_field variant that uses the live OOP's klass, not the C++ type registry.
+        */
+        auto get_field_by_oop_klass(const std::string_view name) const
+            -> std::optional<vmhook::field_proxy>
+        {
+            vmhook::hotspot::klass* const k{ oop_klass() };
+            if (!k)
+            {
+                return std::nullopt;
+            }
+            const auto entry{ vmhook::find_field(k, name) };
+            if (!entry)
+            {
+                return std::nullopt;
+            }
+            if (entry->is_static)
+            {
+                void* const mirror{ k->get_java_mirror() };
+                if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
+                {
+                    return std::nullopt;
+                }
+                void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
+                return vmhook::field_proxy{ field_pointer, entry->signature, true };
+            }
+            if (!this->instance)
+            {
+                return std::nullopt;
+            }
+            void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
+            return vmhook::field_proxy{ field_pointer, entry->signature, false };
+        }
+
+        /*
+            @brief get_method variant that searches the live OOP's klass hierarchy.
+        */
+        auto get_method_by_oop_klass(const std::string_view method_name) const
+            -> std::optional<vmhook::method_proxy>
+        {
+            for (vmhook::hotspot::klass* k{ oop_klass() }; k != nullptr; k = k->get_super())
+            {
+                const std::int32_t method_count{ k->get_methods_count() };
+                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
+                if (!methods_array || method_count <= 0)
+                {
+                    continue;
+                }
+                for (std::int32_t i{ 0 }; i < method_count; ++i)
+                {
+                    vmhook::hotspot::method* const m{ methods_array[i] };
+                    if (m && vmhook::hotspot::is_valid_pointer(m) && m->get_name() == method_name)
+                    {
+                        return vmhook::method_proxy{ this->instance, m, m->get_signature() };
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+
+    public:
+        /*
+            @brief Returns the number of elements via the Java size() method.
+            Resolves through the concrete class's virtual dispatch table,
+            so it works for ArrayList, LinkedList, HashSet, etc.
+        */
+        auto size() const noexcept -> std::int32_t
+        {
+            const auto proxy{ get_method_by_oop_klass("size") };
+            if (!proxy)
+            {
+                return 0;
+            }
+            return proxy->call<std::int32_t>();
+        }
+
+        auto is_empty() const noexcept -> bool
+        {
+            return size() == 0;
+        }
+    };
+
+    /*
+        @brief C++ wrapper for java.util.List objects.
+
+        Provides to_vector<T>() which reads an ArrayList's backing array
+        directly from the JVM heap and returns a std::vector of unique_ptr<T>.
+
+        Usage:
+
+            // Java: public List<A> listOfAs;
+            auto vec = get_field("listOfAs")->get<std::unique_ptr<vmhook::list>>()
+                           ->to_vector<a_class>();
+            // vec is std::vector<std::unique_ptr<a_class>>
+    */
+    class list : public vmhook::collection
+    {
+    public:
+        explicit list(vmhook::oop_t oop) noexcept
+            : vmhook::collection{ oop }
+        {
+        }
+
+        /*
+            @brief Converts this Java List to a std::vector<std::unique_ptr<T>>.
+            @tparam element_type  C++ wrapper class whose constructor accepts a
+                                  vmhook::oop_t (decoded Java object pointer).
+
+            Reads the ArrayList backing array directly from the JVM heap.
+            Null Java elements become nullptr entries in the returned vector.
+            Works on all Java versions supported by vmhook (8–24+).
+
+            For non-ArrayList implementations the method falls back to calling
+            the Java get(int) method for each index.
+        */
+        template<typename element_type>
+        auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
+        {
+            std::vector<std::unique_ptr<element_type>> result;
+
+            if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
+            {
+                return result;
+            }
+
+            // ── ArrayList fast path ─────────────────────────────────────────
+            // ArrayList stores its live element count in a field named "size"
+            // and its backing Object[] in a field named "elementData".
+            const auto size_opt{ get_field_by_oop_klass("size") };
+            const auto data_opt{ get_field_by_oop_klass("elementData") };
+
+            if (size_opt && data_opt)
+            {
+                const std::int32_t n{ size_opt->get() };
+                if (n > 0)
+                {
+                    // elementData is stored as a compressed OOP (uint32_t)
+                    const std::uint32_t compressed_array{
+                        static_cast<std::uint32_t>(data_opt->get()) };
+                    void* const array_oop{ vmhook::decode_array_oop(compressed_array) };
+
+                    if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
+                    {
+                        result.reserve(static_cast<std::size_t>(n));
+                        for (std::int32_t i{ 0 }; i < n; ++i)
+                        {
+                            const std::uint32_t compressed_elem{
+                                vmhook::get_array_element<std::uint32_t>(array_oop, i) };
+                            void* const elem_oop{
+                                vmhook::hotspot::decode_oop_pointer(compressed_elem) };
+
+                            if (elem_oop && vmhook::hotspot::is_valid_pointer(elem_oop))
+                            {
+                                result.push_back(std::make_unique<element_type>(
+                                    static_cast<vmhook::oop_t>(elem_oop)));
+                            }
+                            else
+                            {
+                                result.push_back(nullptr);
+                            }
+                        }
+                        return result;
+                    }
+                }
+                else
+                {
+                    return result;  // empty list
+                }
+            }
+
+            // ── Generic fallback: call Java List.get(int) ───────────────────
+            const std::int32_t n{ size() };
+            if (n <= 0)
+            {
+                return result;
+            }
+            result.reserve(static_cast<std::size_t>(n));
+
+            const auto get_method_opt{ get_method_by_oop_klass("get") };
+            if (!get_method_opt)
+            {
+                return result;
+            }
+
+            for (std::int32_t i{ 0 }; i < n; ++i)
+            {
+                const auto elem_val{ get_method_opt->call<std::uint32_t>(i) };
+                void* const elem_oop{ vmhook::hotspot::decode_oop_pointer(elem_val) };
+                if (elem_oop && vmhook::hotspot::is_valid_pointer(elem_oop))
+                {
+                    result.push_back(std::make_unique<element_type>(
+                        static_cast<vmhook::oop_t>(elem_oop)));
+                }
+                else
+                {
+                    result.push_back(nullptr);
+                }
+            }
+            return result;
         }
     };
 

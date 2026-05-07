@@ -85,7 +85,7 @@ jobs:
         shell: cmd
         run: |
           mkdir out 2>nul || true
-          javac -d out example\vmhook\Main.java example\vmhook\Example.java example\vmhook\A.java
+          javac -d out example\vmhook\Main.java example\vmhook\Example.java example\vmhook\A.java example\vmhook\B.java
 
       # The test sequence:
       #  1. Start java.exe in the background (Main waits for stopJVM = true).
