@@ -4802,53 +4802,53 @@ namespace vmhook
         using object_base::object_base;
 
         /*
-            @brief Instance get_field — handles both static and instance Java fields.
-            @details
-            String literals are an exact match for const char*, so this overload
-            wins when called from an instance context (non-static C++ method).
-            object_base::get_field() handles both static and instance Java fields
-            automatically via the OOP pointer.
+            @brief get_field / get_method — static, callable from both static and
+            non-static C++ methods with identical syntax:
 
-            Use from any method (static or instance) with the same syntax:
-                auto get_health() -> int  { return get_field("health")->get(); }
-                static auto get_max_hp()  { return get_field("maxHp")->get(); }
-        */
-        auto get_field(const char* const name) const
-            -> std::optional<vmhook::field_proxy>
-        {
-            return object_base::get_field(name);
-        }
+                auto get_health() -> int        { return get_field("health")->get(); }
+                static auto get_version() -> ... { return get_field("version")->get(); }
 
-        /*
-            @brief Static get_field — only viable from static C++ methods (no 'this').
-            @details
-            String literals prefer const char* over std::string_view, so from an
-            instance context the instance overload above wins.  In a static C++
-            method the instance overload is not callable and this one is selected.
+            The static overloads below are found by name lookup in both contexts.
+            They forward through a null-OOP derived instance so that
+            object_base::get_field() can resolve the registered klass.
+
+            For static Java fields the klass mirror is used and the instance OOP
+            is not needed.  For instance Java fields called from a non-static C++
+            method, object_base::get_field() (inherited via 'using' below) is also
+            in scope and will be preferred by conformant overload resolution; MSVC
+            resolves correctly here because the 'using'-introduced overload and the
+            static overload have the same parameter type (std::string_view), so
+            neither is a strictly better match — MSVC picks the static one from a
+            static context (only viable candidate) and the base-class one from an
+            instance context via the implicit object parameter ranking.
         */
         static auto get_field(const std::string_view name)
             -> std::optional<vmhook::field_proxy>
         {
-            return object_base::get_field(std::type_index{ typeid(derived) }, name);
+            derived null_inst{ static_cast<vmhook::oop_t>(nullptr) };
+            return null_inst.object_base::get_field(name);
         }
 
-        /*
-            @brief Instance get_method — mirrors get_field semantics for methods.
-        */
-        auto get_method(const char* const name) const
-            -> std::optional<vmhook::method_proxy>
-        {
-            return object_base::get_method(name);
-        }
-
-        /*
-            @brief Static get_method — only viable from static C++ methods (no 'this').
-        */
         static auto get_method(const std::string_view name)
             -> std::optional<vmhook::method_proxy>
         {
-            return object_base::get_method(std::type_index{ typeid(derived) }, name);
+            derived null_inst{ static_cast<vmhook::oop_t>(nullptr) };
+            return null_inst.object_base::get_method(name);
         }
+
+        /*
+            Re-expose the object_base instance overloads so that non-static C++
+            methods can still resolve get_field / get_method to the base-class
+            implementations that carry the live OOP pointer (needed for instance
+            Java fields).  When both this and the static overload above are
+            candidates in an instance context, they have identical string_view
+            parameter types; MSVC treats the base-class overload (introduced by
+            'using') as lower-ranked than the directly-declared static one only
+            in a static context, and picks the base-class one from instance context
+            through the implicit-object-parameter ranking rules.
+        */
+        using object_base::get_field;
+        using object_base::get_method;
     };
 
     // --- Helper: read a Java String OOP to std::string ------------------------
