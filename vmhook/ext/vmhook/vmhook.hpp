@@ -75,6 +75,7 @@
 #include <optional>
 #include <variant>
 #include <functional>
+#include <limits>
 
 #include <windows.h>
 
@@ -104,7 +105,7 @@ namespace vmhook
 
         }
 
-        auto what() const noexcept 
+        auto what() const noexcept
             -> const char* override
         {
             return this->message.c_str();
@@ -151,7 +152,7 @@ namespace vmhook
         {
             static_assert(sizeof(T) <= sizeof(std::int64_t), "return type too large for hook slot");
             slot_->cancel = true;
-            slot_->retval  = 0;
+            slot_->retval = 0;
             std::memcpy(&slot_->retval, &value, sizeof(T));
         }
 
@@ -183,11 +184,19 @@ namespace vmhook
         struct i2i_hook_data;
         struct field_entry_t;
 
-        static auto decode_oop_pointer(std::uint32_t compressed) noexcept 
+        static auto decode_oop_pointer(std::uint32_t compressed) noexcept
             -> void*;
 
         static auto encode_oop_pointer(void* decoded) noexcept
             -> std::uint32_t;
+
+        static auto ensure_current_java_thread() noexcept
+            -> bool;
+    }
+
+    namespace detail
+    {
+        inline auto find_call_stub_entry() noexcept -> void*;
     }
 
     /*
@@ -215,7 +224,7 @@ namespace vmhook
     inline std::unordered_map<std::string, type_factory_function_t> g_type_factory_map{};
 
     template<class wrapper_type>
-    static auto register_class(std::string_view class_name) noexcept 
+    static auto register_class(std::string_view class_name) noexcept
         -> bool;
 
     class object_base;
@@ -226,6 +235,9 @@ namespace vmhook
 
     inline auto read_java_string(void* string_oop)
         -> std::string;
+
+    inline auto make_java_string(std::string_view value) noexcept
+        -> void*;
 
     inline auto write_java_string(void* string_oop, std::string_view value) noexcept
         -> void;
@@ -306,7 +318,7 @@ namespace vmhook
         /*
             @brief Returns the module handle for jvm.dll loaded in the current process.
         */
-        inline auto get_jvm_module() noexcept 
+        inline auto get_jvm_module() noexcept
             -> HMODULE
         {
             static HMODULE module{ GetModuleHandleA("jvm.dll") };
@@ -319,7 +331,7 @@ namespace vmhook
             Resolves gHotSpotVMTypes from jvm.dll via GetProcAddress on first call
             and caches the typed pointer so subsequent calls are free.
         */
-        inline auto get_vm_types() noexcept 
+        inline auto get_vm_types() noexcept
             -> vmhook::hotspot::vm_type_entry_t*
         {
             static FARPROC procedure_address{ GetProcAddress(vmhook::hotspot::get_jvm_module(), "gHotSpotVMTypes") };
@@ -333,7 +345,7 @@ namespace vmhook
             Resolves gHotSpotVMStructs from jvm.dll via GetProcAddress on first call
             and caches the typed pointer so subsequent calls are free.
         */
-        inline auto get_vm_structs() noexcept 
+        inline auto get_vm_structs() noexcept
             -> vmhook::hotspot::vm_struct_entry_t*
         {
             static FARPROC procedure_address{ GetProcAddress(vmhook::hotspot::get_jvm_module(), "gHotSpotVMStructs") };
@@ -344,7 +356,7 @@ namespace vmhook
         /*
             @brief Searches the gHotSpotVMTypes array for a type entry by name.
         */
-        static auto iterate_type_entries(const char* const type_name) noexcept 
+        static auto iterate_type_entries(const char* const type_name) noexcept
             -> vmhook::hotspot::vm_type_entry_t*
         {
             for (vmhook::hotspot::vm_type_entry_t* entry{ vmhook::hotspot::get_vm_types() }; entry && entry->type_name; ++entry)
@@ -360,7 +372,7 @@ namespace vmhook
         /*
             @brief Searches the gHotSpotVMStructs array for a field entry by type and field name.
         */
-        static auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept 
+        static auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept
             -> vmhook::hotspot::vm_struct_entry_t*
         {
             for (vmhook::hotspot::vm_struct_entry_t* entry{ vmhook::hotspot::get_vm_structs() }; entry && entry->type_name; ++entry)
@@ -379,7 +391,7 @@ namespace vmhook
             Extends is_valid_pointer with a VirtualQuery call to verify that the memory
             region containing pointer is actually committed and readable.
         */
-        static auto is_readable_pointer(const void* const pointer) noexcept 
+        static auto is_readable_pointer(const void* const pointer) noexcept
             -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
@@ -404,7 +416,7 @@ namespace vmhook
             Filters out null pointers, low sentinel values used by HotSpot to mark
             the end of linked lists, and kernel-space addresses above 0x00007FFFFFFFFFFF.
         */
-        inline static auto is_valid_pointer(const void* const pointer) noexcept 
+        inline static auto is_valid_pointer(const void* const pointer) noexcept
             -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
@@ -417,7 +429,7 @@ namespace vmhook
             Masking with 0x00007FFFFFFFFFFF strips high GC tag bits and recovers
             the underlying canonical user-space address.
         */
-        inline static auto untag_pointer(const void* const pointer) noexcept 
+        inline static auto untag_pointer(const void* const pointer) noexcept
             -> const void*
         {
             return reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(pointer) & 0x00007FFFFFFFFFFF);
@@ -427,7 +439,7 @@ namespace vmhook
             @brief Reads a 32-bit pointer field from a JVM structure and zero-extends it.
         */
         template<typename structure_type>
-        inline static auto read_pointer(const void* const base, const std::uint64_t offset) noexcept 
+        inline static auto read_pointer(const void* const base, const std::uint64_t offset) noexcept
             -> structure_type*
         {
             const std::uint32_t raw{ *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(base) + offset) };
@@ -441,7 +453,7 @@ namespace vmhook
             access violation. Pre-checks filter out null, low, non-canonical, and unaligned
             addresses before calling ReadProcessMemory.
         */
-        static auto safe_read_pointer(const void* const pointer) noexcept 
+        static auto safe_read_pointer(const void* const pointer) noexcept
             -> const void*
         {
             if (!pointer)
@@ -481,7 +493,7 @@ namespace vmhook
                 @return A std::string containing a copy of the symbol's character data,
                         or an empty string on failure.
             */
-            auto to_string() const 
+            auto to_string() const
                 -> std::string
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const length_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_length") };
@@ -543,7 +555,7 @@ namespace vmhook
                 The size of the header is read at runtime from gHotSpotVMTypes so this works
                 across all JDK versions regardless of header size changes.
             */
-            auto get_base() const 
+            auto get_base() const
                 -> void**
             {
                 static const vmhook::hotspot::vm_type_entry_t* const entry{ vmhook::hotspot::iterate_type_entries("ConstantPool") };
@@ -577,7 +589,7 @@ namespace vmhook
             /*
                 @brief Returns a pointer to the constant pool of the owning class.
             */
-            auto get_constants() const 
+            auto get_constants() const
                 -> vmhook::hotspot::constant_pool*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("ConstMethod", "_constants") };
@@ -601,7 +613,7 @@ namespace vmhook
             /*
                 @brief Returns the symbol representing the name of this method.
             */
-            auto get_name() const 
+            auto get_name() const
                 -> vmhook::hotspot::symbol*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("ConstMethod", "_name_index") };
@@ -626,7 +638,7 @@ namespace vmhook
             /*
                 @brief Returns the symbol representing the signature of this method.
             */
-            auto get_signature() const 
+            auto get_signature() const
                 -> vmhook::hotspot::symbol*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("ConstMethod", "_signature_index") };
@@ -667,7 +679,7 @@ namespace vmhook
                 calls another interpreted method. It is used as the hook location target
                 in midi2i_hook.
             */
-            auto get_i2i_entry() const 
+            auto get_i2i_entry() const
                 -> void*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_i2i_entry") };
@@ -691,7 +703,7 @@ namespace vmhook
             /*
                 @brief Returns the from-interpreted entry point of this method.
             */
-            auto get_from_interpreted_entry() const 
+            auto get_from_interpreted_entry() const
                 -> void*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_interpreted_entry") };
@@ -718,7 +730,7 @@ namespace vmhook
                 Access flags encode Java visibility modifiers (public, private, static, etc.)
                 as well as JVM-internal flags such as NO_COMPILE.
             */
-            auto get_access_flags() const 
+            auto get_access_flags() const
                 -> std::uint32_t*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_access_flags") };
@@ -744,25 +756,17 @@ namespace vmhook
                 @details
                 These flags encode HotSpot-internal method properties such as _dont_inline.
             */
-            auto get_flags() const 
+            auto get_flags() const
                 -> std::uint16_t*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_flags") };
 
-                try
+                if (!entry)
                 {
-                    if (!entry)
-                    {
-                        throw vmhook::exception{ "Failed to find Method._flags entry." };
-                    }
-
-                    return reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
-                }
-                catch (const std::exception& exception)
-                {
-                    std::println("{} method.get_flags() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
+
+                return reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
             }
 
             /*
@@ -792,7 +796,7 @@ namespace vmhook
             /*
                 @brief Returns the name of this method as a std::string.
             */
-            auto get_name() const 
+            auto get_name() const
                 -> std::string
             {
                 const vmhook::hotspot::const_method* const const_method_pointer{ this->get_const_method() };
@@ -822,7 +826,7 @@ namespace vmhook
             /*
                 @brief Returns the signature of this method as a std::string.
             */
-            auto get_signature() const 
+            auto get_signature() const
                 -> std::string
             {
                 const vmhook::hotspot::const_method* const const_method_pointer{ this->get_const_method() };
@@ -855,7 +859,7 @@ namespace vmhook
                          Writing null forces HotSpot dispatch to treat the method as uncompiled
                          without freeing the compiled code.
             */
-            auto get_code() const noexcept 
+            auto get_code() const noexcept
                 -> void*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_code") };
@@ -867,7 +871,7 @@ namespace vmhook
                 return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
             }
 
-            auto set_code(void* const code) noexcept 
+            auto set_code(void* const code) noexcept
                 -> void
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_code") };
@@ -884,16 +888,16 @@ namespace vmhook
                 @details Reset to _i2i_entry during deoptimisation so interpreted callers
                          route through the interpreter entry stub (which we have patched).
             */
-            auto set_from_interpreted_entry(void* const entry_point) noexcept 
+            auto set_from_interpreted_entry(void* const entry_point) noexcept
                 -> void
             {
-                static const vmhook::hotspot::vm_struct_entry_t* const entry{vmhook::hotspot::iterate_struct_entries("Method", "_from_interpreted_entry") };
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_interpreted_entry") };
                 if (!entry)
                 {
                     return;
                 }
 
-                *reinterpret_cast<void**>( reinterpret_cast<std::uint8_t*>(this) + entry->offset) = entry_point;
+                *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(this) + entry->offset) = entry_point;
             }
 
             /*
@@ -903,11 +907,11 @@ namespace vmhook
                          JDK 21+   → "_from_compiled_entry"
                          Both names are tried at first call; the result is cached.
             */
-            auto get_from_compiled_entry() const noexcept 
+            auto get_from_compiled_entry() const noexcept
                 -> void*
             {
-                static const vmhook::hotspot::vm_struct_entry_t* const entry{ []() noexcept 
-                    -> const vmhook::hotspot::vm_struct_entry_t* 
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ []() noexcept
+                    -> const vmhook::hotspot::vm_struct_entry_t*
                         {
                             const vmhook::hotspot::vm_struct_entry_t* found_entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
                             if (!found_entry)
@@ -916,7 +920,7 @@ namespace vmhook
                             }
 
                             return found_entry;
-                        }() 
+                        }()
                 };
                 if (!entry)
                 {
@@ -931,11 +935,11 @@ namespace vmhook
                 @details Set to the c2i adapter during deoptimisation so compiled callers
                          transition to the interpreter (and reach our patched i2i stub).
             */
-            auto set_from_compiled_entry(void* const entry_point) noexcept 
+            auto set_from_compiled_entry(void* const entry_point) noexcept
                 -> void
             {
-                static const vmhook::hotspot::vm_struct_entry_t* const entry{ []() noexcept 
-                    -> const vmhook::hotspot::vm_struct_entry_t* 
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ []() noexcept
+                    -> const vmhook::hotspot::vm_struct_entry_t*
                     {
                         const vmhook::hotspot::vm_struct_entry_t* found_entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
                         if (!found_entry)
@@ -944,7 +948,7 @@ namespace vmhook
                         }
 
                         return found_entry;
-                    }() 
+                    }()
                 };
                 if (!entry)
                 {
@@ -959,7 +963,7 @@ namespace vmhook
                 @details Stores the calling-convention adapters (i2c / c2i) for this method.
                          Used to obtain the c2i entry when deoptimising a compiled method.
             */
-            auto get_adapter() const noexcept 
+            auto get_adapter() const noexcept
                 -> void*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_adapter") };
@@ -1000,7 +1004,7 @@ namespace vmhook
                 @return Pointer to the symbol containing the class name using '/' separators,
                         or nullptr on failure.
             */
-            auto get_name() const 
+            auto get_name() const
                 -> vmhook::hotspot::symbol*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_name") };
@@ -1032,7 +1036,7 @@ namespace vmhook
             /*
                 @brief Returns the next sibling klass in the ClassLoaderData klass linked list.
             */
-            auto get_next_link() const 
+            auto get_next_link() const
                 -> vmhook::hotspot::klass*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_next_link") };
@@ -1059,7 +1063,7 @@ namespace vmhook
                 the Array<Method*>::_length field at offset 0 of the array.
                 @note This klass* must be an InstanceKlass* (i.e. a regular Java class).
             */
-            auto get_methods_count() const noexcept 
+            auto get_methods_count() const noexcept
                 -> std::int32_t
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_methods") };
@@ -1087,7 +1091,7 @@ namespace vmhook
                 Data starts at offset 8 from the array base pointer.
                 @note This klass* must be an InstanceKlass* (i.e. a regular Java class).
             */
-            auto get_methods_ptr() const noexcept 
+            auto get_methods_ptr() const noexcept
                 -> vmhook::hotspot::method**
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_methods") };
@@ -1120,7 +1124,7 @@ namespace vmhook
                 java.lang.Class instance. Static field values are stored inside this mirror.
                 @return Pointer to the java.lang.Class object, or nullptr on failure.
             */
-            auto get_java_mirror() const noexcept 
+            auto get_java_mirror() const noexcept
                 -> void*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_java_mirror") };
@@ -1248,7 +1252,7 @@ namespace vmhook
                   Stop after the first byte b_i where b_i < 192 (a "low byte").
                   Byte 0 is never emitted; it marks the stream End and returns ~0u.
             */
-            inline static auto decode_u5(const std::uint8_t* data, int& stream_pos) noexcept 
+            inline static auto decode_u5(const std::uint8_t* data, int& stream_pos) noexcept
                 -> std::uint32_t
             {
                 std::uint32_t sum{ 0 };
@@ -1281,7 +1285,7 @@ namespace vmhook
                            [group        if field_flags & 0x10]
                 All integers encoded with UNSIGNED5 (see decode_u5).
             */
-            auto find_field_in_stream(const std::string_view name,void** constant_pool_base) const noexcept 
+            auto find_field_in_stream(const std::string_view name, void** constant_pool_base) const noexcept
                 -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const fis_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
@@ -1310,7 +1314,7 @@ namespace vmhook
                     return std::nullopt;
                 }
 
-                const std::uint8_t* const data{reinterpret_cast<const std::uint8_t*>(arr_ptr) + 4 };
+                const std::uint8_t* const data{ reinterpret_cast<const std::uint8_t*>(arr_ptr) + 4 };
 
                 std::int32_t stream_pos{ 0 };
 
@@ -1368,7 +1372,7 @@ namespace vmhook
                                     signature = signature_symbol->to_string();
                                 }
                             }
-                             return vmhook::hotspot::field_entry_t{ field_offset, is_static, signature };
+                            return vmhook::hotspot::field_entry_t{ field_offset, is_static, signature };
                         }
                     }
                 }
@@ -1393,7 +1397,7 @@ namespace vmhook
                 @note Searches only fields declared directly on this class.
                       Walk the superclass chain to find inherited fields.
             */
-            auto find_field(const std::string_view name) const noexcept 
+            auto find_field(const std::string_view name) const noexcept
                 -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const fields_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields") };
@@ -1517,7 +1521,7 @@ namespace vmhook
                 @details
                 Reads ClassLoaderData::_klasses using its offset from gHotSpotVMStructs.
             */
-            auto get_klasses() const 
+            auto get_klasses() const
                 -> vmhook::hotspot::klass*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_klasses") };
@@ -1549,7 +1553,7 @@ namespace vmhook
             /*
                 @brief Returns the next ClassLoaderData node in the global linked list.
             */
-            auto get_next() const 
+            auto get_next() const
                 -> vmhook::hotspot::class_loader_data*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ iterate_struct_entries("ClassLoaderData", "_next") };
@@ -1580,7 +1584,7 @@ namespace vmhook
             /*
                 @brief Returns the Dictionary associated with this classloader.
             */
-            auto get_dictionary() const 
+            auto get_dictionary() const
                 -> vmhook::hotspot::dictionary*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_dictionary") };
@@ -1589,7 +1593,7 @@ namespace vmhook
                 {
                     if (!entry)
                     {
-                        throw vmhook::exception{ "Failed to find ClassLoaderData._dictionary entry." };
+                        return nullptr;
                     }
 
                     if (!vmhook::hotspot::is_valid_pointer(this))
@@ -1633,7 +1637,7 @@ namespace vmhook
                   +4  (4 bytes alignment padding)
                   +8  HashtableBucket* _buckets
             */
-            inline auto get_table_size() const noexcept 
+            inline auto get_table_size() const noexcept
                 -> std::int32_t
             {
                 // _table_size is the first field of BasicHashtable at offset 0.
@@ -1647,7 +1651,7 @@ namespace vmhook
                 _table_size int32 + 4 bytes padding on x64).
                 Each element is a pointer to the head of a singly-linked DictionaryEntry chain.
             */
-            inline auto get_buckets() const noexcept 
+            inline auto get_buckets() const noexcept
                 -> const std::uint8_t*
             {
                 // +8 bytes = sizeof(int32_t _table_size) + 4 bytes alignment padding.
@@ -1657,7 +1661,7 @@ namespace vmhook
             /*
                 @brief Searches this dictionary for a klass by its internal name.
             */
-            auto find_klass(const std::string_view class_name) const 
+            auto find_klass(const std::string_view class_name) const
                 -> vmhook::hotspot::klass*
             {
                 const std::int32_t table_size{ this->get_table_size() };
@@ -1709,7 +1713,7 @@ namespace vmhook
             /*
                 @brief Returns the head of the global ClassLoaderData linked list.
             */
-            auto get_head() const 
+            auto get_head() const
                 -> vmhook::hotspot::class_loader_data*
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("ClassLoaderDataGraph", "_head") };
@@ -1741,7 +1745,7 @@ namespace vmhook
                 Walks the full ClassLoaderDataGraph using only HotSpot internal structures
                 resolved via gHotSpotVMStructs, without any JNI or JVMTI calls.
             */
-            auto find_klass(const std::string_view class_name) const 
+            auto find_klass(const std::string_view class_name) const
                 -> vmhook::hotspot::klass*
             {
                 // Adaptive strategy - detected once at startup via VMStructs presence:
@@ -1853,7 +1857,7 @@ namespace vmhook
             /*
                 @brief Returns the current execution state of this thread.
             */
-            auto get_thread_state() const 
+            auto get_thread_state() const
                 -> vmhook::hotspot::java_thread_state
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
@@ -1878,7 +1882,7 @@ namespace vmhook
                 @brief Sets the execution state of this thread.
                 @warning Incorrect use of this function can corrupt the JVM thread state machine.
             */
-            auto set_thread_state(const vmhook::hotspot::java_thread_state state) const 
+            auto set_thread_state(const vmhook::hotspot::java_thread_state state) const
                 -> void
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_thread_state") };
@@ -1901,7 +1905,7 @@ namespace vmhook
             /*
                 @brief Returns the current suspension flags of this thread.
             */
-            auto get_suspend_flags() const 
+            auto get_suspend_flags() const
                 -> std::uint32_t
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_suspend_flags") };
@@ -1946,6 +1950,41 @@ namespace vmhook
 
                 vmhook::hotspot::java_thread* const next_thread{ *reinterpret_cast<vmhook::hotspot::java_thread* const*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset) };
                 return vmhook::hotspot::is_valid_pointer(next_thread) ? next_thread : nullptr;
+            }
+
+            auto get_os_thread_id() const noexcept
+                -> DWORD
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const osthread_entry{ []()
+                    -> const vmhook::hotspot::vm_struct_entry_t*
+                    {
+                        if (auto* const entry{ vmhook::hotspot::iterate_struct_entries("JavaThread", "_osthread") })
+                        {
+                            return entry;
+                        }
+
+                        return vmhook::hotspot::iterate_struct_entries("Thread", "_osthread");
+                    }()
+                };
+                static const vmhook::hotspot::vm_struct_entry_t* const thread_id_entry{ []()
+                    -> const vmhook::hotspot::vm_struct_entry_t*
+                    {
+                        return vmhook::hotspot::iterate_struct_entries("OSThread", "_thread_id");
+                    }()
+                };
+
+                if (!osthread_entry || !thread_id_entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return 0;
+                }
+
+                void* const os_thread{ *reinterpret_cast<void* const*>(reinterpret_cast<const std::uint8_t*>(this) + osthread_entry->offset) };
+                if (!os_thread || !vmhook::hotspot::is_valid_pointer(os_thread))
+                {
+                    return 0;
+                }
+
+                return *reinterpret_cast<const DWORD*>(reinterpret_cast<const std::uint8_t*>(os_thread) + thread_id_entry->offset);
             }
 
             auto allocate_tlab(const std::size_t byte_size) const noexcept
@@ -1995,6 +2034,7 @@ namespace vmhook
         };
 
         inline thread_local vmhook::hotspot::java_thread* current_java_thread{ nullptr };
+        inline thread_local void* current_jni_env{ nullptr };
         inline std::atomic<vmhook::hotspot::java_thread*> last_java_thread{ nullptr };
 
         static auto find_any_java_thread() noexcept
@@ -2010,6 +2050,181 @@ namespace vmhook
 
             vmhook::hotspot::java_thread* const head{ *reinterpret_cast<vmhook::hotspot::java_thread**>(thread_list_entry->address) };
             return vmhook::hotspot::is_valid_pointer(head) ? head : nullptr;
+        }
+
+        static auto find_java_thread_by_os_thread_id(const DWORD os_thread_id) noexcept
+            -> vmhook::hotspot::java_thread*
+        {
+            if (os_thread_id == 0)
+            {
+                return nullptr;
+            }
+
+            std::int32_t visited_threads{ 0 };
+            for (vmhook::hotspot::java_thread* thread{ vmhook::hotspot::find_any_java_thread() };
+                thread && vmhook::hotspot::is_valid_pointer(thread) && visited_threads < 4096;
+                thread = thread->get_next(), ++visited_threads)
+            {
+                if (thread->get_os_thread_id() == os_thread_id)
+                {
+                    return thread;
+                }
+            }
+
+            static const vmhook::hotspot::vm_struct_entry_t* const list_entry{
+                vmhook::hotspot::iterate_struct_entries("ThreadsSMRSupport", "_java_thread_list") };
+            static const vmhook::hotspot::vm_struct_entry_t* const length_entry{
+                vmhook::hotspot::iterate_struct_entries("ThreadsList", "_length") };
+            static const vmhook::hotspot::vm_struct_entry_t* const threads_entry{
+                vmhook::hotspot::iterate_struct_entries("ThreadsList", "_threads") };
+
+            if (!list_entry || !length_entry || !threads_entry || !list_entry->address)
+            {
+                return nullptr;
+            }
+
+            void* const list{ *reinterpret_cast<void**>(list_entry->address) };
+            if (!list || !vmhook::hotspot::is_valid_pointer(list))
+            {
+                return nullptr;
+            }
+
+            const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::uint8_t*>(list) + length_entry->offset) };
+            if (length <= 0 || length > 4096)
+            {
+                return nullptr;
+            }
+
+            auto** const threads{ *reinterpret_cast<vmhook::hotspot::java_thread***>(reinterpret_cast<std::uint8_t*>(list) + threads_entry->offset) };
+            if (!threads || !vmhook::hotspot::is_valid_pointer(threads))
+            {
+                return nullptr;
+            }
+
+            for (std::int32_t index{ 0 }; index < length; ++index)
+            {
+                vmhook::hotspot::java_thread* const thread{ threads[index] };
+                if (thread && vmhook::hotspot::is_valid_pointer(thread) && thread->get_os_thread_id() == os_thread_id)
+                {
+                    return thread;
+                }
+            }
+
+            return nullptr;
+        }
+
+        static auto attach_current_native_thread() noexcept
+            -> bool
+        {
+            HMODULE const jvm_module{ GetModuleHandleA("jvm.dll") };
+            if (!jvm_module)
+            {
+                return false;
+            }
+
+            using jint = int;
+            struct JNIEnv__;
+            struct JavaVM__;
+            using JNIEnv = JNIEnv__;
+            using JavaVM = JavaVM__;
+
+            struct JNIInvokeInterface_
+            {
+                void* reserved0;
+                void* reserved1;
+                void* reserved2;
+                jint (*DestroyJavaVM)(JavaVM*);
+                jint (*AttachCurrentThread)(JavaVM*, void**, void*);
+                jint (*DetachCurrentThread)(JavaVM*);
+                jint (*GetEnv)(JavaVM*, void**, jint);
+                jint (*AttachCurrentThreadAsDaemon)(JavaVM*, void**, void*);
+            };
+
+            struct JavaVM__
+            {
+                const JNIInvokeInterface_* functions;
+            };
+
+            using get_created_java_vms_t = jint (*)(JavaVM**, jint, jint*);
+            auto* const get_created_java_vms{ reinterpret_cast<get_created_java_vms_t>(GetProcAddress(jvm_module, "JNI_GetCreatedJavaVMs")) };
+            if (!get_created_java_vms)
+            {
+                return false;
+            }
+
+            JavaVM* vm{};
+            jint vm_count{};
+            if (get_created_java_vms(&vm, 1, &vm_count) != 0 || vm_count <= 0 || !vm || !vm->functions)
+            {
+                return false;
+            }
+
+            constexpr jint jni_version_1_8{ 0x00010008 };
+            void* env{};
+            if (vm->functions->GetEnv && vm->functions->GetEnv(vm, &env, jni_version_1_8) == 0)
+            {
+                vmhook::hotspot::current_jni_env = env;
+                return true;
+            }
+
+            if (vm->functions->AttachCurrentThreadAsDaemon && vm->functions->AttachCurrentThreadAsDaemon(vm, &env, nullptr) == 0)
+            {
+                vmhook::hotspot::current_jni_env = env;
+                return true;
+            }
+
+            if (vm->functions->AttachCurrentThread && vm->functions->AttachCurrentThread(vm, &env, nullptr) == 0)
+            {
+                vmhook::hotspot::current_jni_env = env;
+                return true;
+            }
+
+            return false;
+        }
+
+        static auto ensure_current_java_thread() noexcept
+            -> bool
+        {
+            if (vmhook::hotspot::current_java_thread && vmhook::hotspot::is_valid_pointer(vmhook::hotspot::current_java_thread))
+            {
+                if (!vmhook::hotspot::current_jni_env)
+                {
+                    vmhook::hotspot::attach_current_native_thread();
+                }
+
+                return true;
+            }
+
+            const DWORD current_os_thread_id{ GetCurrentThreadId() };
+            if (vmhook::hotspot::java_thread* const existing_thread{ vmhook::hotspot::find_java_thread_by_os_thread_id(current_os_thread_id) })
+            {
+                vmhook::hotspot::current_java_thread = existing_thread;
+                vmhook::hotspot::last_java_thread.store(existing_thread, std::memory_order_relaxed);
+                std::println("{} ensure_current_java_thread(): adopted JavaThread 0x{:016X} for OS thread {}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(existing_thread), current_os_thread_id);
+                return true;
+            }
+
+            if (!vmhook::hotspot::attach_current_native_thread())
+            {
+                std::println("{} ensure_current_java_thread(): AttachCurrentThread failed for OS thread {}", vmhook::error_tag, current_os_thread_id);
+                return false;
+            }
+
+            for (std::int32_t attempt{ 0 }; attempt < 64; ++attempt)
+            {
+                if (vmhook::hotspot::java_thread* const attached_thread{ vmhook::hotspot::find_java_thread_by_os_thread_id(current_os_thread_id) })
+                {
+                    vmhook::hotspot::current_java_thread = attached_thread;
+                    vmhook::hotspot::last_java_thread.store(attached_thread, std::memory_order_relaxed);
+                    std::println("{} ensure_current_java_thread(): attached JavaThread 0x{:016X} for OS thread {}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(attached_thread), current_os_thread_id);
+                    return true;
+                }
+
+                std::this_thread::yield();
+            }
+
+            std::println("{} ensure_current_java_thread(): attached thread was not found in HotSpot thread list for OS thread {}", vmhook::error_tag, current_os_thread_id);
+            return false;
         }
 
         static auto find_allocation_thread() noexcept
@@ -2104,7 +2319,7 @@ namespace vmhook
             Both values are read from CompressedOops::_narrow_oop.{_base,_shift} via
             gHotSpotVMStructs so this works across all JDK versions.
         */
-        static auto decode_oop_pointer(const std::uint32_t compressed) noexcept 
+        static auto decode_oop_pointer(const std::uint32_t compressed) noexcept
             -> void*
         {
             if (!compressed)
@@ -2116,8 +2331,8 @@ namespace vmhook
             //   JDK  8-16: Universe::_narrow_oop._base/shift
             //   JDK 17-24: CompressedOops::_narrow_oop._base/shift
             //   JDK 25+  : CompressedOops::_base/shift  (_narrow_oop. prefix dropped)
-            static const vmhook::hotspot::vm_struct_entry_t* const base_entry{ []() 
-                -> const vmhook::hotspot::vm_struct_entry_t* 
+            static const vmhook::hotspot::vm_struct_entry_t* const base_entry{ []()
+                -> const vmhook::hotspot::vm_struct_entry_t*
                 {
                     {
                         auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._base") };
@@ -2137,8 +2352,8 @@ namespace vmhook
                 }()
             };
 
-            static const vmhook::hotspot::vm_struct_entry_t* const shift_entry{ []() 
-                -> const vmhook::hotspot::vm_struct_entry_t* 
+            static const vmhook::hotspot::vm_struct_entry_t* const shift_entry{ []()
+                -> const vmhook::hotspot::vm_struct_entry_t*
                 {
                     {
                         auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedOops", "_narrow_oop._shift") };
@@ -2249,7 +2464,7 @@ namespace vmhook
             stored in CompressedKlassPointers::_narrow_klass.{_base,_shift}.
             The decoding formula is identical: real_address = base + (compressed << shift).
         */
-        static auto decode_klass_pointer(const std::uint32_t compressed) noexcept 
+        static auto decode_klass_pointer(const std::uint32_t compressed) noexcept
             -> void*
         {
             if (!compressed)
@@ -2261,8 +2476,8 @@ namespace vmhook
             //   JDK  8-16: Universe::_narrow_klass._base/shift
             //   JDK 17-24: CompressedKlassPointers::_narrow_klass._base/shift
             //   JDK 25+  : CompressedKlassPointers::_base/shift
-            static const vmhook::hotspot::vm_struct_entry_t* const base_entry{ []() 
-                -> const vmhook::hotspot::vm_struct_entry_t* 
+            static const vmhook::hotspot::vm_struct_entry_t* const base_entry{ []()
+                -> const vmhook::hotspot::vm_struct_entry_t*
                 {
                     {
                         auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._base") };
@@ -2281,8 +2496,8 @@ namespace vmhook
                     return vmhook::hotspot::iterate_struct_entries("Universe", "_narrow_klass._base");
                 }()
             };
-            static const vmhook::hotspot::vm_struct_entry_t* const shift_entry{ []() 
-                -> const vmhook::hotspot::vm_struct_entry_t* 
+            static const vmhook::hotspot::vm_struct_entry_t* const shift_entry{ []()
+                -> const vmhook::hotspot::vm_struct_entry_t*
                 {
                     {
                         auto* entry{ vmhook::hotspot::iterate_struct_entries("CompressedKlassPointers", "_narrow_klass._shift") };
@@ -2384,7 +2599,7 @@ namespace vmhook
             @details
             A pattern byte of 0x00 acts as a wildcard and always matches.
         */
-        inline static auto match_pattern(const std::uint8_t* const address, const std::uint8_t* const pattern, const std::size_t size) 
+        inline static auto match_pattern(const std::uint8_t* const address, const std::uint8_t* const pattern, const std::size_t size)
             -> bool
         {
             for (std::size_t byte_index{ 0 }; byte_index < size; ++byte_index)
@@ -2406,7 +2621,7 @@ namespace vmhook
             @details
             A pattern byte of 0x00 acts as a wildcard and always matches.
         */
-        inline static auto scan(const std::uint8_t* const start, const std::size_t range, const std::uint8_t* pattern, const std::size_t size) 
+        inline static auto scan(const std::uint8_t* const start, const std::size_t range, const std::uint8_t* pattern, const std::size_t size)
             -> std::uint8_t*
         {
             for (std::size_t scan_offset{ 0 }; scan_offset < range; ++scan_offset)
@@ -2426,7 +2641,7 @@ namespace vmhook
             Uses VirtualQuery to retrieve the memory region information and computes
             how many bytes remain from start to the end of the region, capped at 0x2000.
         */
-        static auto find_stub_size(const std::uint8_t* start) 
+        static auto find_stub_size(const std::uint8_t* start)
             -> std::size_t
         {
             MEMORY_BASIC_INFORMATION mbi{};
@@ -2458,7 +2673,7 @@ namespace vmhook
                   2. Fallback (JDK 21 release / JDK 22+): just mov BYTE PTR [r15+??],??
                      Hook injected at the start of that instruction directly.
         */
-        static auto find_hook_location(const void* i2i_entry) 
+        static auto find_hook_location(const void* i2i_entry)
             -> void*
         {
             /*
@@ -2551,26 +2766,125 @@ namespace vmhook
             @brief Allocates a block of executable memory within a 32-bit relative jump range
                    of a given address.
             @details
-            Iterates outward from nearby_addr in steps of 65536 bytes (Windows allocation
-            granularity) up to +/- 0x7FFFFFFF bytes, attempting VirtualAlloc at each step.
-            This ensures the allocated block can be reached by a 5-byte relative JMP.
+            Walks the process address space with VirtualQuery and allocates inside a free
+            region that is reachable by a 5-byte relative JMP. HotSpot often reserves dense
+            areas around code stubs, so blindly probing exact offsets with VirtualAlloc can
+            fail even when a usable nearby free region exists.
         */
-        static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect) noexcept 
+        static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect) noexcept
             -> std::uint8_t*
         {
-            for (std::int64_t distance_step{ 65536 }; distance_step < 0x7FFFFFFF; distance_step += 65536)
+            if (!nearby_addr || size == 0)
             {
-                std::uint8_t* allocated{ reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr + distance_step, size, MEM_COMMIT | MEM_RESERVE, protect)) };
-                if (allocated)
+                return nullptr;
+            }
+
+            SYSTEM_INFO system_info{};
+            GetSystemInfo(&system_info);
+
+            const std::uintptr_t minimum_application_address{ reinterpret_cast<std::uintptr_t>(system_info.lpMinimumApplicationAddress) };
+            const std::uintptr_t maximum_application_address{ reinterpret_cast<std::uintptr_t>(system_info.lpMaximumApplicationAddress) };
+            const std::uintptr_t allocation_granularity{ static_cast<std::uintptr_t>(system_info.dwAllocationGranularity) };
+            const std::uintptr_t target_address{ reinterpret_cast<std::uintptr_t>(nearby_addr) };
+            const std::uintptr_t relative_limit{ static_cast<std::uintptr_t>((std::numeric_limits<std::int32_t>::max)()) };
+
+            const auto align_up = [](const std::uintptr_t value, const std::uintptr_t alignment) noexcept
+                -> std::uintptr_t
+            {
+                return (value + alignment - 1) & ~(alignment - 1);
+            };
+
+            const auto align_down = [](const std::uintptr_t value, const std::uintptr_t alignment) noexcept
+                -> std::uintptr_t
+            {
+                return value & ~(alignment - 1);
+            };
+
+            const std::uintptr_t search_min{
+                (std::max)(minimum_application_address, target_address > relative_limit ? target_address - relative_limit : minimum_application_address)
+            };
+            const std::uintptr_t search_max{
+                target_address > maximum_application_address - relative_limit ? maximum_application_address : (std::min)(maximum_application_address, target_address + relative_limit)
+            };
+
+            auto try_allocate_in_region = [&](const std::uintptr_t region_base, const std::uintptr_t region_end) noexcept
+                -> std::uint8_t*
+            {
+                if (region_end <= region_base || region_end - region_base < size)
                 {
-                    return allocated;
+                    return nullptr;
                 }
 
-                allocated = reinterpret_cast<std::uint8_t*>(VirtualAlloc(nearby_addr - distance_step, size, MEM_COMMIT | MEM_RESERVE, protect));
-                if (allocated)
+                const std::uintptr_t usable_begin{ (std::max)(region_base, search_min) };
+                const std::uintptr_t usable_end{ (std::min)(region_end, search_max + 1) };
+                if (usable_end <= usable_begin || usable_end - usable_begin < size)
                 {
-                    return allocated;
+                    return nullptr;
                 }
+
+                const std::uintptr_t first_candidate{ align_up(usable_begin, allocation_granularity) };
+                const std::uintptr_t last_candidate{ align_down(usable_end - size, allocation_granularity) };
+                if (first_candidate > last_candidate)
+                {
+                    return nullptr;
+                }
+
+                const std::uintptr_t preferred_candidate{
+                    target_address < first_candidate ? first_candidate :
+                    target_address > last_candidate ? last_candidate :
+                    align_down(target_address, allocation_granularity)
+                };
+
+                if (void* const allocated{ VirtualAlloc(reinterpret_cast<void*>(preferred_candidate), size, MEM_COMMIT | MEM_RESERVE, protect) })
+                {
+                    return reinterpret_cast<std::uint8_t*>(allocated);
+                }
+
+                if (preferred_candidate != first_candidate)
+                {
+                    if (void* const allocated{ VirtualAlloc(reinterpret_cast<void*>(first_candidate), size, MEM_COMMIT | MEM_RESERVE, protect) })
+                    {
+                        return reinterpret_cast<std::uint8_t*>(allocated);
+                    }
+                }
+
+                if (preferred_candidate != last_candidate && first_candidate != last_candidate)
+                {
+                    if (void* const allocated{ VirtualAlloc(reinterpret_cast<void*>(last_candidate), size, MEM_COMMIT | MEM_RESERVE, protect) })
+                    {
+                        return reinterpret_cast<std::uint8_t*>(allocated);
+                    }
+                }
+
+                return nullptr;
+            };
+
+            MEMORY_BASIC_INFORMATION memory_basic_info{};
+            for (std::uintptr_t current{ search_min }; current < search_max; )
+            {
+                if (!VirtualQuery(reinterpret_cast<void*>(current), &memory_basic_info, sizeof(memory_basic_info)))
+                {
+                    current += system_info.dwPageSize;
+                    continue;
+                }
+
+                const std::uintptr_t region_base{ reinterpret_cast<std::uintptr_t>(memory_basic_info.BaseAddress) };
+                const std::uintptr_t region_size{ memory_basic_info.RegionSize };
+                const std::uintptr_t region_end{ region_base + region_size };
+
+                if (memory_basic_info.State == MEM_FREE)
+                {
+                    if (std::uint8_t* const allocated{ try_allocate_in_region(region_base, region_end) })
+                    {
+                        return allocated;
+                    }
+                }
+
+                if (region_end <= current)
+                {
+                    break;
+                }
+                current = region_end;
             }
 
             return nullptr;
@@ -2584,58 +2898,58 @@ namespace vmhook
             Returned by frame::get_arguments() (no template parameters). Stores raw decoded
             OOP pointers and class names. Call as<T>() to construct a wrapper on demand.
         */
-    struct method_args
-    {
-        struct argument_entry
+        struct method_args
         {
-            void* decoded_oop;
-            std::string class_name;
+            struct argument_entry
+            {
+                void* decoded_oop;
+                std::string class_name;
+            };
+
+            /*
+                @brief Returns the raw decoded OOP at the given index.
+                @param index Zero-based argument index (0 = this / first parameter).
+            */
+            auto operator[](const std::size_t index) const noexcept
+                -> void*
+            {
+                if (index >= this->arguments.size())
+                {
+                    return nullptr;
+                }
+                return this->arguments[index].decoded_oop;
+            }
+
+            /*
+                @brief Returns the argument at the given index as a C++ wrapper.
+                @tparam wrapper_type The C++ wrapper class (must be constructible from void* OOP).
+                @param index Zero-based argument index.
+                @return A new wrapper_type* constructed from the decoded OOP, or nullptr.
+            */
+            template<typename wrapper_type>
+            auto as(const std::size_t index) const noexcept
+                -> wrapper_type*
+            {
+                if (index >= this->arguments.size())
+                {
+                    return nullptr;
+                }
+                void* const raw{ this->arguments[index].decoded_oop };
+                if (!raw)
+                {
+                    return nullptr;
+                }
+                return new wrapper_type{ raw };
+            }
+
+            auto size() const noexcept
+                -> std::size_t
+            {
+                return this->arguments.size();
+            }
+
+            std::vector<argument_entry> arguments{};
         };
-
-        /*
-            @brief Returns the raw decoded OOP at the given index.
-            @param index Zero-based argument index (0 = this / first parameter).
-        */
-        auto operator[](const std::size_t index) const noexcept 
-            -> void*
-        {
-            if (index >= this->arguments.size())
-            {
-                return nullptr;
-            }
-            return this->arguments[index].decoded_oop;
-        }
-
-        /*
-            @brief Returns the argument at the given index as a C++ wrapper.
-            @tparam wrapper_type The C++ wrapper class (must be constructible from void* OOP).
-            @param index Zero-based argument index.
-            @return A new wrapper_type* constructed from the decoded OOP, or nullptr.
-        */
-        template<typename wrapper_type>
-        auto as(const std::size_t index) const noexcept 
-            -> wrapper_type*
-        {
-            if (index >= this->arguments.size())
-            {
-                return nullptr;
-            }
-            void* const raw{ this->arguments[index].decoded_oop };
-            if (!raw)
-            {
-                return nullptr;
-            }
-            return new wrapper_type{ raw };
-        }
-
-        auto size() const noexcept 
-            -> std::size_t
-        {
-            return this->arguments.size();
-        }
-
-        std::vector<argument_entry> arguments{};
-    };
 
 
         /*
@@ -2661,7 +2975,7 @@ namespace vmhook
                 This corresponds to interpreter_frame_method_offset = -3 words = -24 bytes
                 as defined in frame_x86.hpp.
             */
-            inline auto get_method() const noexcept 
+            inline auto get_method() const noexcept
                 -> vmhook::hotspot::method*
             {
                 // -24 bytes = -3 * sizeof(void*): the Method* slot in the interpreter frame.
@@ -2677,7 +2991,7 @@ namespace vmhook
                 The actual offset within the frame is determined at hook time by scanning the i2i
                 stub backwards for `mov r14, QWORD PTR [rbp+??]; ret`.  Defaults to -56.
             */
-            inline auto get_locals() const noexcept 
+            inline auto get_locals() const noexcept
                 -> void**
             {
                 /*
@@ -2735,7 +3049,7 @@ namespace vmhook
                 For index 0 on instance methods, this holds the implicit `this` reference.
             */
             template<typename... types>
-            auto get_arguments() const noexcept 
+            auto get_arguments() const noexcept
                 -> std::tuple<types...>
             {
                 std::int32_t index{ 0 };
@@ -2756,7 +3070,7 @@ namespace vmhook
                     auto args = frame->get_arguments();
                     auto* player = args.as<test_target>(0);  // first ref arg
             */
-            auto get_arguments() const noexcept 
+            auto get_arguments() const noexcept
                 -> vmhook::hotspot::method_args
             {
                 vmhook::hotspot::method_args result{};
@@ -2878,7 +3192,7 @@ namespace vmhook
                 - Primitive types (sizeof <= 8): the bits are copied verbatim via std::memcpy.
             */
             template<typename argument_type>
-            auto get_argument(const std::int32_t index) const noexcept 
+            auto get_argument(const std::int32_t index) const noexcept
                 -> argument_type
             {
                 void** const locals{ this->get_locals() };
@@ -3220,7 +3534,7 @@ namespace vmhook
             The _dont_inline flag is stored in Method._flags at bit position 2.
             When set, it prevents the JIT from inlining this method at any call site.
         */
-        static auto set_dont_inline(const vmhook::hotspot::method* const method_pointer, const bool enabled) noexcept 
+        static auto set_dont_inline(const vmhook::hotspot::method* const method_pointer, const bool enabled) noexcept
             -> void
         {
             std::uint16_t* const flags{ method_pointer->get_flags() };
@@ -3250,7 +3564,7 @@ namespace vmhook
             AdapterHandlerEntry._c2i_entry is exported via gHotSpotVMStructs on all
             supported JDK versions (8 – 26).
         */
-        static auto get_c2i_entry_from_adapter(void* const adapter) noexcept 
+        static auto get_c2i_entry_from_adapter(void* const adapter) noexcept
             -> void*
         {
             if (!adapter || !vmhook::hotspot::is_valid_pointer(adapter))
@@ -3265,6 +3579,12 @@ namespace vmhook
 
             return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(adapter) + entry->offset);
         }
+    }
+
+    namespace detail
+    {
+        inline auto jni_find_class_with_context_loader(const std::string_view class_name) noexcept
+            -> vmhook::hotspot::klass*;
     }
 
     // --- Cache and class lookup -----------------------------------------------
@@ -3288,7 +3608,7 @@ namespace vmhook
         the HotSpot ClassLoaderDataGraph entirely via gHotSpotVMStructs, without any
         JNI or JVMTI calls. Results are cached on first lookup.
     */
-    static auto find_class(const std::string_view class_name) 
+    static auto find_class(const std::string_view class_name)
         -> vmhook::hotspot::klass*
     {
         const auto cache_entry{ vmhook::klass_lookup_cache.find(std::string{ class_name }) };
@@ -3300,11 +3620,15 @@ namespace vmhook
         try
         {
             const vmhook::hotspot::class_loader_data_graph graph{};
-            vmhook::hotspot::klass* const found_klass{ graph.find_klass(class_name) };
+            vmhook::hotspot::klass* found_klass{ graph.find_klass(class_name) };
 
             if (!found_klass)
             {
-                return nullptr;
+                found_klass = vmhook::detail::jni_find_class_with_context_loader(class_name);
+                if (!found_klass)
+                {
+                    return nullptr;
+                }
             }
 
             vmhook::klass_lookup_cache.insert({ std::string{ class_name }, found_klass });
@@ -3329,7 +3653,7 @@ namespace vmhook
         Registration is required before calling hook<T>().
     */
     template<class wrapper_type>
-    static auto register_class(const std::string_view class_name) noexcept 
+    static auto register_class(const std::string_view class_name) noexcept
         -> bool
     {
         vmhook::hotspot::klass* const verified_klass{ vmhook::find_class(class_name) };
@@ -3344,8 +3668,8 @@ namespace vmhook
 
         // Store a factory function so field_proxy::get_as<T>() and frame::get_arguments()
         // can construct C++ wrapper objects from decoded Java object references.
-        vmhook::g_type_factory_map.emplace( std::string{ class_name }, +[](void* instance) 
-            -> std::unique_ptr<object_base> 
+        vmhook::g_type_factory_map.emplace(std::string{ class_name }, +[](void* instance)
+            -> std::unique_ptr<object_base>
             {
                 return std::make_unique<wrapper_type>(instance);
             }
@@ -3379,7 +3703,8 @@ namespace vmhook
 
         template<typename F>
         struct function_traits<F, std::void_t<decltype(&F::operator())>>
-            : function_traits<decltype(&F::operator())> {};
+            : function_traits<decltype(&F::operator())> {
+        };
 
         template<typename C, typename Ret, typename... Args>
         struct function_traits<Ret(C::*)(Args...) const>
@@ -3429,13 +3754,13 @@ namespace vmhook
 
             // Decode a compressed OOP (32-bit narrow value) to a full 64-bit pointer.
             auto decode_oop = [](void* rv) -> void*
-            {
-                if (!rv) return nullptr;
-                const std::uintptr_t bits{ reinterpret_cast<std::uintptr_t>(rv) };
-                return (bits <= 0xFFFFFFFFull)
-                    ? vmhook::hotspot::decode_oop_pointer(static_cast<std::uint32_t>(bits))
-                    : rv;
-            };
+                {
+                    if (!rv) return nullptr;
+                    const std::uintptr_t bits{ reinterpret_cast<std::uintptr_t>(rv) };
+                    return (bits <= 0xFFFFFFFFull)
+                        ? vmhook::hotspot::decode_oop_pointer(static_cast<std::uint32_t>(bits))
+                        : rv;
+                };
 
             if constexpr (std::is_same_v<base_t, std::string>)
             {
@@ -3507,14 +3832,16 @@ namespace vmhook
         3. Disable JIT compilation by setting NO_COMPILE in Method._access_flags
            and _dont_inline in Method._flags.
         4. Register the method and its detour in g_hooked_methods for dispatch by common_detour.
-        5. Check whether the i2i entry point has already been patched; if so, reuse it.
-        6. If the i2i entry is new, locate the injection point via find_hook_location(),
+        5. If the method is already compiled, clear Method._code and restore the
+           interpreted entry so future dispatch reaches the interpreter hook.
+        6. Check whether the i2i entry point has already been patched; if so, reuse it.
+        7. If the i2i entry is new, locate the injection point via find_hook_location(),
            allocate a trampoline via midi2i_hook, and register it in g_hooked_i2i_entries.
 
         @note Unlike the JNI/JVMTI version, this implementation does not force a class
-              retransformation to flush existing JIT-compiled code. Hooking a method that
-              has already been JIT-compiled by the time hook() is called will not intercept
-              calls that execute through compiled code. Hook early, before the method is called.
+              retransformation to flush existing inline caches. Hooking early is still best:
+              compiled callers that already cached an nmethod can keep bypassing the hook
+              until HotSpot repairs that call site at a safepoint.
         @see midi2i_hook, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
     */
     template<class wrapper_type>
@@ -3523,8 +3850,8 @@ namespace vmhook
     {
         try
         {
-            using traits           = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
-            using all_args_tuple   = typename traits::args_tuple;
+            using traits = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
+            using all_args_tuple = typename traits::args_tuple;
             using method_arg_tuple = typename vmhook::detail::tuple_tail<all_args_tuple>::type;
 
             const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
@@ -3594,7 +3921,7 @@ namespace vmhook
 
             if (was_compiled)
             {
-                std::println("{} hook(): '{}' is JIT-compiled (_code=0x{:016X}) - deoptimising.", vmhook::info_tag, method_name,  reinterpret_cast<std::uintptr_t>(original_code));
+                std::println("{} hook(): '{}' is JIT-compiled (_code=0x{:016X}) - deoptimising.", vmhook::info_tag, method_name, reinterpret_cast<std::uintptr_t>(original_code));
             }
             else
             {
@@ -3603,18 +3930,18 @@ namespace vmhook
 
             // Wrap the user callable: extract typed Java args from the frame and forward them.
             auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour)]
-                (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot* const slot)
-            {
-                vmhook::return_value retval{ slot };
-                // Slots indexed from 0: instance methods have 'this' at slot 0.
-                auto invoke = [&]<std::size_t... Is>(std::index_sequence<Is...>)
+            (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot* const slot)
                 {
-                    detour(retval,
-                        vmhook::detail::extract_frame_arg<std::tuple_element_t<Is, method_arg_tuple>>(
-                            frame_pointer, static_cast<std::int32_t>(Is))...);
+                    vmhook::return_value retval{ slot };
+                    // Slots indexed from 0: instance methods have 'this' at slot 0.
+                    auto invoke = [&]<std::size_t... Is>(std::index_sequence<Is...>)
+                    {
+                        detour(retval,
+                            vmhook::detail::extract_frame_arg<std::tuple_element_t<Is, method_arg_tuple>>(
+                                frame_pointer, static_cast<std::int32_t>(Is))...);
+                    };
+                    invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple>>{});
                 };
-                invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple>>{});
-            };
 
             vmhook::hotspot::g_hooked_methods.push_back({ found_method, std::move(wrapper_detour), original_code, original_from_interpreted, original_from_compiled, was_compiled });
 
@@ -3650,7 +3977,7 @@ namespace vmhook
             // -- Deoptimise JIT-compiled methods ---------------------------------
             // Problem:  when _code != nullptr, _from_interpreted_entry points to the i2c
             //           adapter (not the i2i stub), so calls bypass our patch entirely.
-            // Fix:      null _code and reset both entry points so the JVM dispatches
+            // Fix:      null _code and reset the interpreted entry so the JVM dispatches
             //           through the interpreter - and therefore through our patched i2i stub.
             // Limitation: compiled callers with stale monomorphic inline caches still call
             //             the old nmethod directly.  Those caches will be repaired the next
@@ -3659,7 +3986,6 @@ namespace vmhook
             {
                 void* const adapter{ found_method->get_adapter() };
                 void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
-
                 // 1. Redirect interpreted callers to the (now-patched) i2i stub.
                 found_method->set_from_interpreted_entry(i2i);
 
@@ -3671,10 +3997,10 @@ namespace vmhook
                 }
                 else
                 {
-                    // Fallback: no c2i adapter available; point at the i2i stub directly.
-                    // Compiled callers with fresh dispatch will still reach the hook.
-                    found_method->set_from_compiled_entry(i2i);
-                    std::println("{} hook():   _from_compiled_entry → i2i (c2i adapter unavailable)", vmhook::warning_tag);
+                    // Do not point compiled callers directly at i2i: the compiled-call ABI
+                    // expects a c2i adapter. Leaving this entry unchanged is safer; once
+                    // _code is cleared, normal interpreted dispatch reaches the hook.
+                    std::println("{} hook():   c2i adapter unavailable; leaving _from_compiled_entry unchanged.", vmhook::info_tag);
                 }
 
                 // 3. Clear _code last so the above entry-point writes are visible first.
@@ -3701,7 +4027,7 @@ namespace vmhook
         Order within phase 3:  entry points first, then _code - this ensures callers have a valid
         destination before the JVM re-enables compiled dispatch.
     */
-    static auto shutdown_hooks() noexcept 
+    static auto shutdown_hooks() noexcept
         -> void
     {
         for (const vmhook::hotspot::i2i_hook_data& hook_data_entry : vmhook::hotspot::g_hooked_i2i_entries)
@@ -3740,6 +4066,470 @@ namespace vmhook
         vmhook::hotspot::g_hooked_i2i_entries.clear();
     }
 
+    namespace detail
+    {
+        union jni_value
+        {
+            bool z;
+            std::int8_t b;
+            std::uint16_t c;
+            std::int16_t s;
+            std::int32_t i;
+            std::int64_t j;
+            float f;
+            double d;
+            void* l;
+        };
+
+        template<std::size_t index, typename function_type>
+        inline auto jni_function(void* const env) noexcept
+            -> function_type
+        {
+            if (!env)
+            {
+                return nullptr;
+            }
+
+            void** const table{ *reinterpret_cast<void***>(env) };
+            if (!table)
+            {
+                return nullptr;
+            }
+
+            return reinterpret_cast<function_type>(table[index]);
+        }
+
+        inline auto jni_decode_object(void* const object_handle) noexcept
+            -> void*
+        {
+            if (!object_handle)
+            {
+                return nullptr;
+            }
+
+            void* const oop{ *reinterpret_cast<void**>(object_handle) };
+            return vmhook::hotspot::is_valid_pointer(oop) ? oop : nullptr;
+        }
+
+        inline auto jni_oop_handle(void* const oop, void*& handle_storage) noexcept
+            -> void*
+        {
+            handle_storage = oop;
+            return &handle_storage;
+        }
+
+        inline auto jni_find_class(const std::string_view class_name) noexcept
+            -> void*
+        {
+            if (!vmhook::hotspot::ensure_current_java_thread())
+            {
+                return nullptr;
+            }
+
+            using find_class_t = void* (*)(void*, const char*);
+            find_class_t const find_class{ vmhook::detail::jni_function<6, find_class_t>(vmhook::hotspot::current_jni_env) };
+            if (!find_class)
+            {
+                return nullptr;
+            }
+
+            const std::string name{ class_name };
+            return find_class(vmhook::hotspot::current_jni_env, name.c_str());
+        }
+
+        inline auto jni_exception_clear() noexcept
+            -> void
+        {
+            using exception_check_t = bool (*)(void*);
+            using exception_clear_t = void (*)(void*);
+            exception_check_t const exception_check{ vmhook::detail::jni_function<228, exception_check_t>(vmhook::hotspot::current_jni_env) };
+            exception_clear_t const exception_clear{ vmhook::detail::jni_function<17, exception_clear_t>(vmhook::hotspot::current_jni_env) };
+            if (exception_check && exception_clear && exception_check(vmhook::hotspot::current_jni_env))
+            {
+                exception_clear(vmhook::hotspot::current_jni_env);
+            }
+        }
+
+        inline auto jni_get_object_class(void* const object_handle) noexcept
+            -> void*
+        {
+            using get_object_class_t = void* (*)(void*, void*);
+            get_object_class_t const get_object_class{ vmhook::detail::jni_function<31, get_object_class_t>(vmhook::hotspot::current_jni_env) };
+            return get_object_class ? get_object_class(vmhook::hotspot::current_jni_env, object_handle) : nullptr;
+        }
+
+        inline auto jni_get_method_id(void* const klass, const std::string& name, const std::string& signature) noexcept
+            -> void*
+        {
+            using get_method_id_t = void* (*)(void*, void*, const char*, const char*);
+            get_method_id_t const get_method_id{ vmhook::detail::jni_function<33, get_method_id_t>(vmhook::hotspot::current_jni_env) };
+            return get_method_id ? get_method_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
+        }
+
+        inline auto jni_new_string_utf(const std::string_view value) noexcept
+            -> void*;
+
+        inline auto jni_get_static_method_id(void* const klass, const std::string& name, const std::string& signature) noexcept
+            -> void*
+        {
+            using get_static_method_id_t = void* (*)(void*, void*, const char*, const char*);
+            get_static_method_id_t const get_static_method_id{ vmhook::detail::jni_function<113, get_static_method_id_t>(vmhook::hotspot::current_jni_env) };
+            return get_static_method_id ? get_static_method_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
+        }
+
+        inline auto jni_get_static_field_id(void* const klass, const std::string& name, const std::string& signature) noexcept
+            -> void*
+        {
+            using get_static_field_id_t = void* (*)(void*, void*, const char*, const char*);
+            get_static_field_id_t const get_static_field_id{ vmhook::detail::jni_function<144, get_static_field_id_t>(vmhook::hotspot::current_jni_env) };
+            return get_static_field_id ? get_static_field_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
+        }
+
+        inline auto jni_get_static_object_field(void* const klass, void* const field_id) noexcept
+            -> void*
+        {
+            using get_static_object_field_t = void* (*)(void*, void*, void*);
+            get_static_object_field_t const get_static_object_field{ vmhook::detail::jni_function<145, get_static_object_field_t>(vmhook::hotspot::current_jni_env) };
+            return get_static_object_field ? get_static_object_field(vmhook::hotspot::current_jni_env, klass, field_id) : nullptr;
+        }
+
+        inline auto jni_call_object_method(void* const object, void* const method_id, const vmhook::detail::jni_value* const args = nullptr) noexcept
+            -> void*
+        {
+            using call_object_method_a_t = void* (*)(void*, void*, void*, const vmhook::detail::jni_value*);
+            call_object_method_a_t const call_object_method_a{ vmhook::detail::jni_function<36, call_object_method_a_t>(vmhook::hotspot::current_jni_env) };
+            return call_object_method_a ? call_object_method_a(vmhook::hotspot::current_jni_env, object, method_id, args) : nullptr;
+        }
+
+        inline auto jni_call_static_object_method(void* const klass, void* const method_id, const vmhook::detail::jni_value* const args = nullptr) noexcept
+            -> void*
+        {
+            using call_static_object_method_a_t = void* (*)(void*, void*, void*, const vmhook::detail::jni_value*);
+            call_static_object_method_a_t const call_static_object_method_a{ vmhook::detail::jni_function<116, call_static_object_method_a_t>(vmhook::hotspot::current_jni_env) };
+            return call_static_object_method_a ? call_static_object_method_a(vmhook::hotspot::current_jni_env, klass, method_id, args) : nullptr;
+        }
+
+        inline auto jni_klass_from_class_mirror(void* const class_handle) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            void* const class_oop{ vmhook::detail::jni_decode_object(class_handle) };
+            if (!class_oop || !vmhook::hotspot::is_valid_pointer(class_oop))
+            {
+                return nullptr;
+            }
+
+            static const vmhook::hotspot::vm_struct_entry_t* const klass_offset{ vmhook::hotspot::iterate_struct_entries("java_lang_Class", "_klass_offset") };
+            if (!klass_offset || !klass_offset->address)
+            {
+                return nullptr;
+            }
+
+            const int offset{ *reinterpret_cast<const int*>(klass_offset->address) };
+            void* const raw_klass{ const_cast<void*>(vmhook::hotspot::safe_read_pointer(reinterpret_cast<const std::uint8_t*>(class_oop) + offset)) };
+            return vmhook::hotspot::is_valid_pointer(raw_klass) ? reinterpret_cast<vmhook::hotspot::klass*>(const_cast<void*>(vmhook::hotspot::untag_pointer(raw_klass))) : nullptr;
+        }
+
+        inline auto jni_find_class_with_context_loader(const std::string_view class_name) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            if (!vmhook::hotspot::ensure_current_java_thread())
+            {
+                return nullptr;
+            }
+
+            auto load_with_loader = [&](void* const class_loader) noexcept
+                -> vmhook::hotspot::klass*
+            {
+                if (!class_loader)
+                {
+                    return nullptr;
+                }
+
+                void* const class_loader_class{ vmhook::detail::jni_find_class("java/lang/ClassLoader") };
+                if (!class_loader_class)
+                {
+                    vmhook::detail::jni_exception_clear();
+                    return nullptr;
+                }
+
+                void* const load_class_id{ vmhook::detail::jni_get_method_id(class_loader_class, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") };
+                if (!load_class_id)
+                {
+                    vmhook::detail::jni_exception_clear();
+                    return nullptr;
+                }
+
+                std::string dotted_name{ class_name };
+                std::replace(dotted_name.begin(), dotted_name.end(), '/', '.');
+                void* const name_string{ vmhook::detail::jni_new_string_utf(dotted_name) };
+                if (!name_string)
+                {
+                    vmhook::detail::jni_exception_clear();
+                    return nullptr;
+                }
+
+                vmhook::detail::jni_value args[1]{};
+                args[0].l = name_string;
+
+                void* const class_mirror{ vmhook::detail::jni_call_object_method(class_loader, load_class_id, args) };
+                vmhook::hotspot::klass* const klass{ vmhook::detail::jni_klass_from_class_mirror(class_mirror) };
+                vmhook::detail::jni_exception_clear();
+                return klass;
+            };
+
+            void* const thread_class{ vmhook::detail::jni_find_class("java/lang/Thread") };
+            if (thread_class)
+            {
+                void* const current_thread_id{ vmhook::detail::jni_get_static_method_id(thread_class, "currentThread", "()Ljava/lang/Thread;") };
+                void* const get_context_loader_id{ vmhook::detail::jni_get_method_id(thread_class, "getContextClassLoader", "()Ljava/lang/ClassLoader;") };
+                if (current_thread_id && get_context_loader_id)
+                {
+                    void* const current_thread{ vmhook::detail::jni_call_static_object_method(thread_class, current_thread_id) };
+                    void* const context_loader{ current_thread ? vmhook::detail::jni_call_object_method(current_thread, get_context_loader_id) : nullptr };
+                    if (vmhook::hotspot::klass* const klass{ load_with_loader(context_loader) })
+                    {
+                        return klass;
+                    }
+                }
+            }
+            vmhook::detail::jni_exception_clear();
+
+            void* const class_loader_class{ vmhook::detail::jni_find_class("java/lang/ClassLoader") };
+            if (class_loader_class)
+            {
+                void* const get_system_loader_id{ vmhook::detail::jni_get_static_method_id(class_loader_class, "getSystemClassLoader", "()Ljava/lang/ClassLoader;") };
+                void* const system_loader{ get_system_loader_id ? vmhook::detail::jni_call_static_object_method(class_loader_class, get_system_loader_id) : nullptr };
+                if (vmhook::hotspot::klass* const klass{ load_with_loader(system_loader) })
+                {
+                    return klass;
+                }
+            }
+            vmhook::detail::jni_exception_clear();
+
+            void* const launch_class{ vmhook::detail::jni_find_class("net/minecraft/launchwrapper/Launch") };
+            if (!launch_class)
+            {
+                vmhook::detail::jni_exception_clear();
+                return nullptr;
+            }
+
+            void* const class_loader_field{ vmhook::detail::jni_get_static_field_id(launch_class, "classLoader", "Lnet/minecraft/launchwrapper/LaunchClassLoader;") };
+            void* const launch_loader{ class_loader_field ? vmhook::detail::jni_get_static_object_field(launch_class, class_loader_field) : nullptr };
+            if (vmhook::hotspot::klass* const klass{ load_with_loader(launch_loader) })
+            {
+                return klass;
+            }
+
+            vmhook::detail::jni_exception_clear();
+            return nullptr;
+        }
+
+        inline auto jni_new_string_utf(const std::string_view value) noexcept
+            -> void*
+        {
+            using new_string_utf_t = void* (*)(void*, const char*);
+            new_string_utf_t const new_string_utf{ vmhook::detail::jni_function<167, new_string_utf_t>(vmhook::hotspot::current_jni_env) };
+            if (!new_string_utf)
+            {
+                return nullptr;
+            }
+
+            const std::string text{ value };
+            return new_string_utf(vmhook::hotspot::current_jni_env, text.c_str());
+        }
+
+        inline auto jni_get_string_utf(void* const string_handle) noexcept
+            -> std::string
+        {
+            if (!string_handle)
+            {
+                return {};
+            }
+
+            using get_string_utf_chars_t = const char* (*)(void*, void*, bool*);
+            using release_string_utf_chars_t = void (*)(void*, void*, const char*);
+            get_string_utf_chars_t const get_string_utf_chars{ vmhook::detail::jni_function<169, get_string_utf_chars_t>(vmhook::hotspot::current_jni_env) };
+            release_string_utf_chars_t const release_string_utf_chars{ vmhook::detail::jni_function<170, release_string_utf_chars_t>(vmhook::hotspot::current_jni_env) };
+            if (!get_string_utf_chars)
+            {
+                return {};
+            }
+
+            bool is_copy{};
+            const char* const chars{ get_string_utf_chars(vmhook::hotspot::current_jni_env, string_handle, &is_copy) };
+            if (!chars)
+            {
+                return {};
+            }
+
+            std::string result{ chars };
+            if (release_string_utf_chars)
+            {
+                release_string_utf_chars(vmhook::hotspot::current_jni_env, string_handle, chars);
+            }
+            return result;
+        }
+
+        template<typename arg_type>
+        inline auto jni_signature_for_arg() noexcept
+            -> std::string
+        {
+            using clean_t = std::decay_t<arg_type>;
+
+            if constexpr (std::is_same_v<clean_t, std::string> || std::is_same_v<clean_t, std::string_view> || std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
+            {
+                return "Ljava/lang/String;";
+            }
+            else if constexpr (std::is_same_v<clean_t, bool>)
+            {
+                return "Z";
+            }
+            else if constexpr (std::is_same_v<clean_t, std::int8_t> || std::is_same_v<clean_t, std::uint8_t>)
+            {
+                return "B";
+            }
+            else if constexpr (std::is_same_v<clean_t, std::int16_t>)
+            {
+                return "S";
+            }
+            else if constexpr (std::is_same_v<clean_t, std::uint16_t>)
+            {
+                return "C";
+            }
+            else if constexpr (std::is_same_v<clean_t, std::int64_t> || std::is_same_v<clean_t, std::uint64_t>)
+            {
+                return "J";
+            }
+            else if constexpr (std::is_same_v<clean_t, float>)
+            {
+                return "F";
+            }
+            else if constexpr (std::is_same_v<clean_t, double>)
+            {
+                return "D";
+            }
+            else
+            {
+                return "I";
+            }
+        }
+
+        template<typename arg_type>
+        inline auto append_jni_arg(std::vector<vmhook::detail::jni_value>& values, std::vector<void*>& object_handles, arg_type&& arg) noexcept
+            -> void
+        {
+            using clean_t = std::decay_t<arg_type>;
+            vmhook::detail::jni_value value{};
+
+            if constexpr (std::is_same_v<clean_t, std::string>)
+            {
+                value.l = vmhook::detail::jni_new_string_utf(arg);
+            }
+            else if constexpr (std::is_same_v<clean_t, std::string_view>)
+            {
+                value.l = vmhook::detail::jni_new_string_utf(arg);
+            }
+            else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
+            {
+                value.l = vmhook::detail::jni_new_string_utf(arg ? std::string_view{ arg } : std::string_view{});
+            }
+            else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+            {
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
+                if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
+                {
+                    object_handles.push_back(arg ? arg->get_instance() : nullptr);
+                    value.l = object_handles.empty() ? nullptr : &object_handles.back();
+                }
+            }
+            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
+            {
+                object_handles.push_back(arg.get_instance());
+                value.l = &object_handles.back();
+            }
+            else if constexpr (std::is_same_v<clean_t, bool>)
+            {
+                value.z = arg;
+            }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) <= sizeof(std::int32_t))
+            {
+                value.i = static_cast<std::int32_t>(arg);
+            }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == sizeof(std::int64_t))
+            {
+                value.j = static_cast<std::int64_t>(arg);
+            }
+            else if constexpr (std::is_same_v<clean_t, float>)
+            {
+                value.f = arg;
+            }
+            else if constexpr (std::is_same_v<clean_t, double>)
+            {
+                value.d = arg;
+            }
+
+            values.push_back(value);
+        }
+
+        template<typename... args_t>
+        inline auto make_jni_args(std::vector<void*>& object_handles, args_t&&... args) noexcept
+            -> std::vector<vmhook::detail::jni_value>
+        {
+            std::vector<vmhook::detail::jni_value> values{};
+            values.reserve(sizeof...(args_t));
+            object_handles.reserve(sizeof...(args_t));
+            (vmhook::detail::append_jni_arg(values, object_handles, std::forward<args_t>(args)), ...);
+            return values;
+        }
+
+        template<typename wrapper_type, typename... args_t>
+        inline auto jni_make_unique(const std::string& class_name, args_t&&... args) noexcept
+            -> std::unique_ptr<wrapper_type>
+        {
+            vmhook::hotspot::klass* const hotspot_klass{ vmhook::find_class(class_name) };
+            if (!hotspot_klass)
+            {
+                std::println("{} jni_make_unique<{}>(): HotSpot class '{}' not found.", vmhook::error_tag, typeid(wrapper_type).name(), class_name);
+                return nullptr;
+            }
+
+            void* const class_mirror{ hotspot_klass->get_java_mirror() };
+            if (!class_mirror || !vmhook::hotspot::is_valid_pointer(class_mirror))
+            {
+                std::println("{} jni_make_unique<{}>(): java.lang.Class mirror for '{}' is invalid.", vmhook::error_tag, typeid(wrapper_type).name(), class_name);
+                return nullptr;
+            }
+
+            void* class_handle_storage{};
+            void* const klass{ vmhook::detail::jni_oop_handle(class_mirror, class_handle_storage) };
+
+            std::vector<void*> object_handles{};
+            std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, std::forward<args_t>(args)...) };
+
+            std::string signature{ "(" };
+            ((signature += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
+            signature += ")V";
+
+            void* const method_id{ vmhook::detail::jni_get_method_id(klass, "<init>", signature) };
+            if (!method_id)
+            {
+                std::println("{} jni_make_unique<{}>(): GetMethodID('<init>', '{}') failed.", vmhook::error_tag, typeid(wrapper_type).name(), signature);
+                return nullptr;
+            }
+
+            using new_object_a_t = void* (*)(void*, void*, void*, const vmhook::detail::jni_value*);
+            new_object_a_t const new_object_a{ vmhook::detail::jni_function<30, new_object_a_t>(vmhook::hotspot::current_jni_env) };
+            if (!new_object_a)
+            {
+                return nullptr;
+            }
+
+            void* const object_handle{ new_object_a(vmhook::hotspot::current_jni_env, klass, method_id, values.data()) };
+            void* const oop{ vmhook::detail::jni_decode_object(object_handle) };
+            return oop ? std::make_unique<wrapper_type>(oop) : nullptr;
+        }
+    }
+
     /*
         @brief Constructs a new Java object and returns a C++ wrapper.
         @tparam T The C++ wrapper class (must derive from vmhook::object).
@@ -3757,14 +4547,28 @@ namespace vmhook
               parsing method descriptors and setting up interpreter frames.
     */
     template<typename wrapper_type, typename... args_t>
-    static auto make_unique(args_t&&... args) 
+    static auto make_unique(args_t&&... args)
         -> std::unique_ptr<wrapper_type>
     {
+        if (!vmhook::hotspot::ensure_current_java_thread())
+        {
+            std::println("{} vmhook::make_unique<{}>(): failed to attach current native thread to the JVM.", vmhook::error_tag, typeid(wrapper_type).name());
+            return nullptr;
+        }
+
         auto map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
         if (map_entry == vmhook::type_to_class_map.end())
         {
             std::println("{} vmhook::make_unique<{}>(): type not registered.", vmhook::error_tag, typeid(wrapper_type).name());
             return nullptr;
+        }
+
+        if (!vmhook::detail::find_call_stub_entry())
+        {
+            if (std::unique_ptr<wrapper_type> jni_result{ vmhook::detail::jni_make_unique<wrapper_type>(map_entry->second, std::forward<args_t>(args)...) })
+            {
+                return jni_result;
+            }
         }
 
         vmhook::hotspot::klass* const klass{ vmhook::find_class(map_entry->second) };
@@ -3792,8 +4596,8 @@ namespace vmhook
         {
             std::int32_t visited_threads{ 0 };
             for (vmhook::hotspot::java_thread* candidate{ vmhook::hotspot::find_any_java_thread() };
-                 candidate && vmhook::hotspot::is_valid_pointer(candidate) && visited_threads < 256;
-                 candidate = candidate->get_next(), ++visited_threads)
+                candidate && vmhook::hotspot::is_valid_pointer(candidate) && visited_threads < 256;
+                candidate = candidate->get_next(), ++visited_threads)
             {
                 object_pointer = candidate->allocate_tlab(object_size);
                 if (object_pointer)
@@ -3851,10 +4655,10 @@ namespace vmhook
 
         auto result{ std::make_unique<wrapper_type>(object_pointer) };
 
-        if constexpr (requires(wrapper_type& wrapper, args_t&&... construct_args)
-            {
-                wrapper.construct(std::forward<args_t>(construct_args)...);
-            })
+        if constexpr (requires(wrapper_type & wrapper, args_t&&... construct_args)
+        {
+            wrapper.construct(std::forward<args_t>(construct_args)...);
+        })
         {
             result->construct(std::forward<args_t>(args)...);
         }
@@ -3933,7 +4737,7 @@ namespace vmhook
               compressed OOP, then pass it to vmhook::hotspot::decode_oop_pointer() yourself.
     */
     template<typename value_type>
-    static auto get_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name) 
+    static auto get_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name)
         -> value_type
     {
         static_assert(std::is_trivially_copyable_v<value_type>, "get_field<value_type>: value_type must be trivially copyable.");
@@ -3986,11 +4790,11 @@ namespace vmhook
         @note Writing a reference-type field requires a properly encoded compressed OOP.
               Encoding is: (real_address - narrow_oop_base) >> narrow_oop_shift.
     */
-        template<typename value_type>
-        static auto set_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name, const value_type value) 
-            -> void
-        {
-            static_assert(std::is_trivially_copyable_v<value_type>, "set_field<value_type>: value_type must be trivially copyable.");
+    template<typename value_type>
+    static auto set_field(void* const object, vmhook::hotspot::klass* const target_klass, const std::string_view name, const value_type value)
+        -> void
+    {
+        static_assert(std::is_trivially_copyable_v<value_type>, "set_field<value_type>: value_type must be trivially copyable.");
 
         try
         {
@@ -4026,6 +4830,179 @@ namespace vmhook
         }
     }
 
+    inline auto make_java_object(vmhook::hotspot::klass* const klass, const std::size_t requested_size) noexcept
+        -> void*
+    {
+        if (!vmhook::hotspot::ensure_current_java_thread())
+        {
+            return nullptr;
+        }
+
+        if (!klass || requested_size == 0)
+        {
+            return nullptr;
+        }
+
+        const std::size_t object_size{ (requested_size + 7u) & ~static_cast<std::size_t>(7u) };
+        vmhook::hotspot::java_thread* const thread{ vmhook::hotspot::find_allocation_thread() };
+
+        void* object_pointer{};
+        if (thread && vmhook::hotspot::is_valid_pointer(thread))
+        {
+            object_pointer = thread->allocate_tlab(object_size);
+        }
+
+        if (!object_pointer)
+        {
+            std::int32_t visited_threads{ 0 };
+            for (vmhook::hotspot::java_thread* candidate{ vmhook::hotspot::find_any_java_thread() };
+                candidate && vmhook::hotspot::is_valid_pointer(candidate) && visited_threads < 256;
+                candidate = candidate->get_next(), ++visited_threads)
+            {
+                object_pointer = candidate->allocate_tlab(object_size);
+                if (object_pointer)
+                {
+                    vmhook::hotspot::last_java_thread.store(candidate, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+
+        if (!object_pointer)
+        {
+            object_pointer = vmhook::hotspot::allocate_from_threads_list(object_size);
+        }
+
+        if (!object_pointer)
+        {
+            return nullptr;
+        }
+
+        std::memset(object_pointer, 0, object_size);
+
+        static const vmhook::hotspot::vm_struct_entry_t* const mark_entry{ []()
+            -> const vmhook::hotspot::vm_struct_entry_t*
+            {
+                if (auto* const entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_mark") })
+                {
+                    return entry;
+                }
+
+                return vmhook::hotspot::iterate_struct_entries("oopDesc", "_markWord");
+            }()
+        };
+        static const vmhook::hotspot::vm_struct_entry_t* const compressed_klass_entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._compressed_klass") };
+        static const vmhook::hotspot::vm_struct_entry_t* const klass_entry{ vmhook::hotspot::iterate_struct_entries("oopDesc", "_metadata._klass") };
+
+        const std::size_t mark_offset{ mark_entry ? static_cast<std::size_t>(mark_entry->offset) : 0u };
+        *reinterpret_cast<std::uintptr_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + mark_offset) = klass->get_prototype_header();
+
+        if (compressed_klass_entry)
+        {
+            *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + compressed_klass_entry->offset) = vmhook::hotspot::encode_klass_pointer(klass);
+        }
+        else if (klass_entry)
+        {
+            *reinterpret_cast<vmhook::hotspot::klass**>(reinterpret_cast<std::uint8_t*>(object_pointer) + klass_entry->offset) = klass;
+        }
+        else
+        {
+            *reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::uint8_t*>(object_pointer) + 8u) = vmhook::hotspot::encode_klass_pointer(klass);
+        }
+
+        return object_pointer;
+    }
+
+    inline auto make_java_array(const std::string_view class_name, const std::int32_t length, const std::size_t element_size) noexcept
+        -> void*
+    {
+        if (length < 0)
+        {
+            return nullptr;
+        }
+
+        vmhook::hotspot::klass* const array_klass{ vmhook::find_class(class_name) };
+        if (!array_klass)
+        {
+            return nullptr;
+        }
+
+        constexpr std::size_t array_header_size{ 16u };
+        void* const array_oop{ vmhook::make_java_object(array_klass, array_header_size + static_cast<std::size_t>(length) * element_size) };
+        if (!array_oop)
+        {
+            return nullptr;
+        }
+
+        *reinterpret_cast<std::int32_t*>(reinterpret_cast<std::uint8_t*>(array_oop) + 12u) = length;
+        return array_oop;
+    }
+
+    inline auto make_java_string(const std::string_view value) noexcept
+        -> void*
+    {
+        vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
+        if (!string_klass)
+        {
+            return nullptr;
+        }
+
+        void* const string_oop{ vmhook::make_java_object(string_klass, string_klass->get_instance_size()) };
+        if (!string_oop)
+        {
+            return nullptr;
+        }
+
+        const bool compact_string{ string_klass->find_field("coder").has_value() };
+        const std::int32_t length{ static_cast<std::int32_t>(std::min<std::size_t>(value.size(), 4096u)) };
+
+        if (compact_string)
+        {
+            void* const value_array{ vmhook::make_java_array("[B", length, sizeof(std::uint8_t)) };
+            if (!value_array)
+            {
+                return nullptr;
+            }
+
+            std::memcpy(reinterpret_cast<std::uint8_t*>(value_array) + 16u, value.data(), static_cast<std::size_t>(length));
+            vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
+            vmhook::set_field<std::uint8_t>(string_oop, string_klass, "coder", 0u);
+        }
+        else
+        {
+            void* const value_array{ vmhook::make_java_array("[C", length, sizeof(std::uint16_t)) };
+            if (!value_array)
+            {
+                return nullptr;
+            }
+
+            auto* const chars{ reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(value_array) + 16u) };
+            for (std::int32_t index{ 0 }; index < length; ++index)
+            {
+                chars[index] = static_cast<std::uint8_t>(value[static_cast<std::size_t>(index)]);
+            }
+
+            vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
+
+            if (string_klass->find_field("offset").has_value())
+            {
+                vmhook::set_field<std::int32_t>(string_oop, string_klass, "offset", 0);
+            }
+
+            if (string_klass->find_field("count").has_value())
+            {
+                vmhook::set_field<std::int32_t>(string_oop, string_klass, "count", length);
+            }
+        }
+
+        if (string_klass->find_field("hash").has_value())
+        {
+            vmhook::set_field<std::int32_t>(string_oop, string_klass, "hash", 0);
+        }
+
+        return string_oop;
+    }
+
     // --- Array element access -------------------------------------------------
 
     /*
@@ -4039,7 +5016,7 @@ namespace vmhook
           +12 _length   (int)
           +16 _data[0]
     */
-    inline static auto array_length(void* const array_oop) noexcept 
+    inline static auto array_length(void* const array_oop) noexcept
         -> std::int32_t
     {
         if (!array_oop || !vmhook::hotspot::is_valid_pointer(array_oop))
@@ -4061,7 +5038,7 @@ namespace vmhook
         Bounds checking is performed against the array length.
     */
     template<typename element_type>
-    static auto get_array_element(void* const array_oop, const std::int32_t index) 
+    static auto get_array_element(void* const array_oop, const std::int32_t index)
         -> element_type
     {
         static_assert(std::is_trivially_copyable_v<element_type>, "get_array_element<element_type>: element_type must be trivially copyable.");
@@ -4088,7 +5065,7 @@ namespace vmhook
         @param value The value to write.
     */
     template<typename element_type>
-    static auto set_array_element(void* const array_oop, const std::int32_t index, const element_type value) 
+    static auto set_array_element(void* const array_oop, const std::int32_t index, const element_type value)
         -> void
     {
         static_assert(std::is_trivially_copyable_v<element_type>, "set_array_element<element_type>: element_type must be trivially copyable.");
@@ -4104,34 +5081,34 @@ namespace vmhook
         std::memcpy(reinterpret_cast<std::uint8_t*>(array_oop) + 16 + index * static_cast<std::int32_t>(sizeof(element_type)), &value, sizeof(element_type));
     }
 
-// --- Field proxy ----------------------------------------------------------
+    // --- Field proxy ----------------------------------------------------------
 
-    /*
-        @brief Lightweight proxy to a single Java field value in memory.
-        @details
-        Returned by vmhook::object::get_field().  Reads the field value on demand,
-        dispatches the correct C++ type from the JVM type descriptor (signature),
-        and returns a typed copy - not a raw-pointer alias.
+        /*
+            @brief Lightweight proxy to a single Java field value in memory.
+            @details
+            Returned by vmhook::object::get_field().  Reads the field value on demand,
+            dispatches the correct C++ type from the JVM type descriptor (signature),
+            and returns a typed copy - not a raw-pointer alias.
 
-        Usage inside a wrapper class:
+            Usage inside a wrapper class:
 
-            // No trailing return type needed - auto deduces field_proxy::value_t,
-            // which converts implicitly to the target type at the call site.
-             auto is_connected() -> bool { return get_field("isConnected")->get(); }
-             auto get_health()   -> int { return get_field("health")->get(); }
+                // No trailing return type needed - auto deduces field_proxy::value_t,
+                // which converts implicitly to the target type at the call site.
+                 auto is_connected() -> bool { return get_field("isConnected")->get(); }
+                 auto get_health()   -> int { return get_field("health")->get(); }
 
-             // If you want a concrete type inside the method, cast before returning:
-             auto get_max_hp()   -> int { return static_cast<int>(get_field("maxHp")->get()); }
+                 // If you want a concrete type inside the method, cast before returning:
+                 auto get_max_hp()   -> int { return static_cast<int>(get_field("maxHp")->get()); }
 
-        Usage at the call site:
-            bool ok  = client.is_connected();   // operator bool()  fires
-            int  hp  = client.get_health();     // operator int()   fires
-            if  (client.is_connected()) { ... } // contextual bool conversion
+            Usage at the call site:
+                bool ok  = client.is_connected();   // operator bool()  fires
+                int  hp  = client.get_health();     // operator int()   fires
+                if  (client.is_connected()) { ... } // contextual bool conversion
 
-        Writing:
-            obj.get_field("health")->set(100);  // T = int, deduced
-            obj.get_field("flag"  )->set(true); // T = bool, deduced
-    */
+            Writing:
+                obj.get_field("health")->set(100);  // T = int, deduced
+                obj.get_field("flag"  )->set(true); // T = bool, deduced
+        */
     class field_proxy final
     {
     public:
@@ -4203,11 +5180,11 @@ namespace vmhook
                 result.push_back(vmhook::get_array_element<element_type>(array_oop, index));
             }
 
-             /*
-                @brief Converts the stored value to target_type via static_cast.
-                Works for any combination of the nine stored types and any
-                numeric or bool target type.
-            */
+            /*
+               @brief Converts the stored value to target_type via static_cast.
+               Works for any combination of the nine stored types and any
+               numeric or bool target type.
+           */
             template<typename target_type>
             static auto read_array_value(const std::uint32_t compressed, const std::string_view signature) noexcept
                 -> target_type
@@ -4235,8 +5212,8 @@ namespace vmhook
             }
 
             template<typename target_type, typename source_type>
-            auto cast_for_variant(source_type value) const noexcept 
-                 -> target_type
+            auto cast_for_variant(source_type value) const noexcept
+                -> target_type
             {
                 using clean_target_type = std::remove_cvref_t<target_type>;
                 using clean_source_type = std::remove_cvref_t<source_type>;
@@ -4305,11 +5282,11 @@ namespace vmhook
             template<typename target_type>
             operator target_type() const noexcept
             {
-                return std::visit([this](auto value) noexcept 
-                    -> target_type 
-                        {
-                            return this->cast_for_variant<target_type>(value);
-                        }, data);
+                return std::visit([this](auto value) noexcept
+                    -> target_type
+                    {
+                        return this->cast_for_variant<target_type>(value);
+                    }, data);
             }
 
             template<typename element_type>
@@ -4341,7 +5318,7 @@ namespace vmhook
               "L…"/"[…" → uint32_t (compressed OOP)
             The returned value is a copy - safe to store and return from methods.
         */
-        auto get() const noexcept 
+        auto get() const noexcept
             -> value_t
         {
             if (!this->field_pointer)
@@ -4413,7 +5390,7 @@ namespace vmhook
             in place because this zero-JNI layer cannot resize Java heap objects.
         */
         template<typename value_type>
-        auto set(const value_type& value) const noexcept 
+        auto set(const value_type& value) const noexcept
             -> void
         {
             using clean_value_type = std::remove_cvref_t<value_type>;
@@ -4469,13 +5446,13 @@ namespace vmhook
         /*
             @brief Returns the JVM type descriptor of this field (e.g. "I", "Z", "J").
         */
-        auto signature() const noexcept 
+        auto signature() const noexcept
             -> std::string_view
         {
             return this->m_signature;
         }
 
-        auto is_static() const noexcept 
+        auto is_static() const noexcept
             -> bool
         {
             return this->m_is_static;
@@ -4485,7 +5462,7 @@ namespace vmhook
             @brief Returns the compressed OOP stored in this field (for reference/array types).
             @return The compressed OOP as uint32_t, or 0 if field_pointer is null.
         */
-        auto get_compressed_oop() const noexcept 
+        auto get_compressed_oop() const noexcept
             -> std::uint32_t
         {
             if (!this->field_pointer)
@@ -4541,18 +5518,18 @@ namespace vmhook
         {
             switch (c)
             {
-                case 'Z': return 4;   // T_BOOLEAN
-                case 'C': return 5;   // T_CHAR
-                case 'F': return 6;   // T_FLOAT
-                case 'D': return 7;   // T_DOUBLE
-                case 'B': return 8;   // T_BYTE
-                case 'S': return 9;   // T_SHORT
-                case 'I': return 10;  // T_INT
-                case 'J': return 11;  // T_LONG
-                case 'L': return 12;  // T_OBJECT
-                case '[': return 13;  // T_ARRAY
-                case 'V': return 14;  // T_VOID
-                default:  return 12;  // T_OBJECT (fallback)
+            case 'Z': return 4;   // T_BOOLEAN
+            case 'C': return 5;   // T_CHAR
+            case 'F': return 6;   // T_FLOAT
+            case 'D': return 7;   // T_DOUBLE
+            case 'B': return 8;   // T_BYTE
+            case 'S': return 9;   // T_SHORT
+            case 'I': return 10;  // T_INT
+            case 'J': return 11;  // T_LONG
+            case 'L': return 12;  // T_OBJECT
+            case '[': return 13;  // T_ARRAY
+            case 'V': return 14;  // T_VOID
+            default:  return 12;  // T_OBJECT (fallback)
             }
         }
     }
@@ -4636,6 +5613,63 @@ namespace vmhook
         {
         }
 
+        template<typename... args_t>
+        auto call_jni(args_t&&... args) const noexcept
+            -> value_t
+        {
+            if (!this->object)
+            {
+                return value_t{ std::monostate{} };
+            }
+
+            void* object_handle_storage{};
+            void* const object_handle{ vmhook::detail::jni_oop_handle(this->object, object_handle_storage) };
+            void* const klass{ vmhook::detail::jni_get_object_class(object_handle) };
+            if (!klass)
+            {
+                std::println("{} method_proxy::call_jni('{}{}'): GetObjectClass failed.", vmhook::error_tag, this->name(), this->m_signature);
+                return value_t{ std::monostate{} };
+            }
+
+            void* const method_id{ vmhook::detail::jni_get_method_id(klass, this->name(), this->m_signature) };
+            if (!method_id)
+            {
+                std::println("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->m_signature);
+                return value_t{ std::monostate{} };
+            }
+
+            std::vector<void*> object_handles{};
+            std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, std::forward<args_t>(args)...) };
+
+            const std::size_t rparen{ this->m_signature.rfind(')') };
+            const std::string_view return_signature{ rparen != std::string::npos ? std::string_view{ this->m_signature }.substr(rparen + 1) : std::string_view{ "V" } };
+
+            if (return_signature == "Ljava/lang/String;")
+            {
+                using call_object_method_a_t = void* (*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                call_object_method_a_t const call_object_method_a{ vmhook::detail::jni_function<36, call_object_method_a_t>(vmhook::hotspot::current_jni_env) };
+                if (!call_object_method_a)
+                {
+                    std::println("{} method_proxy::call_jni('{}{}'): CallObjectMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
+                    return value_t{ std::monostate{} };
+                }
+
+                void* const result_handle{ call_object_method_a(vmhook::hotspot::current_jni_env, object_handle, method_id, values.data()) };
+                return value_t{ vmhook::detail::jni_get_string_utf(result_handle) };
+            }
+
+            using call_void_method_a_t = void (*)(void*, void*, void*, const vmhook::detail::jni_value*);
+            call_void_method_a_t const call_void_method_a{ vmhook::detail::jni_function<63, call_void_method_a_t>(vmhook::hotspot::current_jni_env) };
+            if (!call_void_method_a)
+            {
+                std::println("{} method_proxy::call_jni('{}{}'): CallVoidMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
+                return value_t{ std::monostate{} };
+            }
+
+            call_void_method_a(vmhook::hotspot::current_jni_env, object_handle, method_id, values.data());
+            return value_t{ std::monostate{} };
+        }
+
         /*
             @brief Calls the method with the given arguments.
             @param args Arguments to pass (C++ types: int, std::string, etc.).
@@ -4671,12 +5705,23 @@ namespace vmhook
         {
             if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
             {
+                std::println("{} method_proxy::call(): method pointer is null or invalid.", vmhook::error_tag);
+                return value_t{ std::monostate{} };
+            }
+
+            vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
+            const std::string selected_signature{ selected_method ? selected_method->get_signature() : this->m_signature };
+
+            if (!vmhook::hotspot::ensure_current_java_thread())
+            {
+                std::println("{} method_proxy::call('{}{}'): no current JavaThread.", vmhook::error_tag, this->name(), selected_signature);
                 return value_t{ std::monostate{} };
             }
 
             auto* const thread{ vmhook::hotspot::current_java_thread };
             if (!thread)
             {
+                std::println("{} method_proxy::call('{}{}'): current JavaThread is null after attach.", vmhook::error_tag, this->name(), selected_signature);
                 return value_t{ std::monostate{} };
             }
 
@@ -4686,17 +5731,18 @@ namespace vmhook
             void* const call_stub{ vmhook::detail::find_call_stub_entry() };
             if (!call_stub)
             {
-                return value_t{ std::monostate{} };
+                return method_proxy{ this->object, selected_method, selected_signature }.call_jni(std::forward<args_t>(args)...);
             }
 
-            void* const entry{ this->method->get_from_interpreted_entry() };
+            void* const entry{ selected_method->get_from_interpreted_entry() };
             if (!entry || !vmhook::hotspot::is_valid_pointer(entry))
             {
+                std::println("{} method_proxy::call('{}{}'): interpreted entry is null or invalid.", vmhook::error_tag, this->name(), selected_signature);
                 return value_t{ std::monostate{} };
             }
 
             // ── Return type ───────────────────────────────────────────────────
-            const std::string_view sig{ this->m_signature };
+            const std::string_view sig{ selected_signature };
             const std::size_t rparen{ sig.rfind(')') };
             const char ret_char{
                 rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
@@ -4715,14 +5761,56 @@ namespace vmhook
             }
 
             auto pack = [&](auto&& a) noexcept
-            {
-                if (param_idx >= 8) return;
-                using clean_t = std::remove_cvref_t<decltype(a)>;
-                static_assert(sizeof(clean_t) <= 8);
-                std::intptr_t v{};
-                std::memcpy(&v, &a, sizeof(clean_t));
-                params[param_idx++] = v;
-            };
+                {
+                    if (param_idx >= 8) return;
+                    using clean_t = std::remove_cvref_t<decltype(a)>;
+                    if constexpr (std::is_same_v<clean_t, std::string>)
+                    {
+                        void* const string_oop{ vmhook::make_java_string(a) };
+                        if (!string_oop)
+                        {
+                            std::println("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                        }
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    }
+                    else if constexpr (std::is_same_v<clean_t, std::string_view>)
+                    {
+                        void* const string_oop{ vmhook::make_java_string(a) };
+                        if (!string_oop)
+                        {
+                            std::println("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                        }
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    }
+                    else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
+                    {
+                        void* const string_oop{ vmhook::make_java_string(a ? std::string_view{ a } : std::string_view{}) };
+                        if (!string_oop)
+                        {
+                            std::println("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                        }
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
+                    }
+                    else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+                    {
+                        using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
+                        if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
+                        {
+                            params[param_idx++] = reinterpret_cast<std::intptr_t>(a ? a->get_instance() : nullptr);
+                        }
+                    }
+                    else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
+                    {
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a.get_instance());
+                    }
+                    else
+                    {
+                        static_assert(sizeof(clean_t) <= 8);
+                        std::intptr_t v{};
+                        std::memcpy(&v, &a, sizeof(clean_t));
+                        params[param_idx++] = v;
+                    }
+                };
             (pack(std::forward<args_t>(args)), ...);
 
             // ── Call the stub ─────────────────────────────────────────────────
@@ -4741,51 +5829,56 @@ namespace vmhook
                 std::intptr_t*, // parameters
                 int,            // size_of_parameters
                 void*           // thread
-            );
+                );
 
             std::intptr_t result_holder{ 0 };
+            const vmhook::hotspot::java_thread_state previous_state{ thread->get_thread_state() };
+            thread->set_thread_state(vmhook::hotspot::java_thread_state::_thread_in_Java);
+
             reinterpret_cast<call_stub_fn_t>(call_stub)(
                 reinterpret_cast<void*>(static_cast<std::intptr_t>(-1)),
                 &result_holder,
                 result_type,
-                reinterpret_cast<void*>(this->method),
+                reinterpret_cast<void*>(selected_method),
                 entry,
                 params,
                 static_cast<int>(param_idx),
                 reinterpret_cast<void*>(thread)
-            );
+                );
 
             // ── Decode result ─────────────────────────────────────────────────
+            thread->set_thread_state(previous_state);
+
             switch (ret_char)
             {
-                case 'Z': return value_t{ (result_holder & 1) != 0 };
-                case 'B': return value_t{ static_cast<std::int8_t> (result_holder) };
-                case 'S': return value_t{ static_cast<std::int16_t>(result_holder) };
-                case 'I': return value_t{ static_cast<std::int32_t>(result_holder) };
-                case 'J': return value_t{ static_cast<std::int64_t>(result_holder) };
-                case 'C': return value_t{ static_cast<std::uint16_t>(result_holder) };
-                case 'F':
-                {
-                    float f{};
-                    const std::int32_t bits{ static_cast<std::int32_t>(result_holder) };
-                    std::memcpy(&f, &bits, sizeof(f));
-                    return value_t{ f };
-                }
-                case 'D':
-                {
-                    double d{};
-                    std::memcpy(&d, &result_holder, sizeof(d));
-                    return value_t{ d };
-                }
-                case 'V': return value_t{ std::monostate{} };
-                default:  return value_t{ static_cast<std::uint32_t>(result_holder) };
+            case 'Z': return value_t{ (result_holder & 1) != 0 };
+            case 'B': return value_t{ static_cast<std::int8_t> (result_holder) };
+            case 'S': return value_t{ static_cast<std::int16_t>(result_holder) };
+            case 'I': return value_t{ static_cast<std::int32_t>(result_holder) };
+            case 'J': return value_t{ static_cast<std::int64_t>(result_holder) };
+            case 'C': return value_t{ static_cast<std::uint16_t>(result_holder) };
+            case 'F':
+            {
+                float f{};
+                const std::int32_t bits{ static_cast<std::int32_t>(result_holder) };
+                std::memcpy(&f, &bits, sizeof(f));
+                return value_t{ f };
+            }
+            case 'D':
+            {
+                double d{};
+                std::memcpy(&d, &result_holder, sizeof(d));
+                return value_t{ d };
+            }
+            case 'V': return value_t{ std::monostate{} };
+            default:  return value_t{ static_cast<std::uint32_t>(result_holder) };
             }
         }
 
         /*
             @brief Returns the method name.
         */
-        auto name() const noexcept 
+        auto name() const noexcept
             -> std::string
         {
             if (!this->method)
@@ -4798,19 +5891,19 @@ namespace vmhook
         /*
             @brief Returns the JVM method signature.
         */
-        auto signature() const noexcept 
+        auto signature() const noexcept
             -> std::string_view
         {
             return this->m_signature;
         }
 
-        auto is_static() const noexcept 
+        auto is_static() const noexcept
             -> bool
         {
             return this->m_is_static;
         }
 
-        auto get_compressed_oop() const noexcept 
+        auto get_compressed_oop() const noexcept
             -> std::uint32_t
         {
             if (!this->object)
@@ -4823,6 +5916,192 @@ namespace vmhook
         }
 
     private:
+        static auto klass_from_object_header(void* const oop) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            if (!oop || !vmhook::hotspot::is_valid_pointer(oop))
+            {
+                return nullptr;
+            }
+
+            const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
+                reinterpret_cast<const std::uint8_t*>(oop) + 8) };
+            void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
+            if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+            {
+                return nullptr;
+            }
+
+            return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
+        }
+
+        template<typename argument_type>
+        static auto argument_matches_descriptor(const std::string_view descriptor) noexcept
+            -> bool
+        {
+            using clean_type = std::remove_cvref_t<argument_type>;
+
+            if constexpr (std::is_same_v<clean_type, std::string> || std::is_same_v<clean_type, std::string_view> || std::is_same_v<clean_type, const char*> || std::is_same_v<clean_type, char*>)
+            {
+                return descriptor == "Ljava/lang/String;";
+            }
+            else if constexpr (vmhook::detail::is_unique_ptr_v<clean_type>)
+            {
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_type>::value_type_t;
+                if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
+                {
+                    const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
+                    return descriptor.size() >= 3
+                        && descriptor.front() == 'L'
+                        && descriptor.back() == ';'
+                        && (type_map_entry == vmhook::type_to_class_map.end() || descriptor.substr(1, descriptor.size() - 2) == type_map_entry->second);
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_type>)
+            {
+                const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(clean_type) }) };
+                return descriptor.size() >= 3
+                    && descriptor.front() == 'L'
+                    && descriptor.back() == ';'
+                    && (type_map_entry == vmhook::type_to_class_map.end() || descriptor.substr(1, descriptor.size() - 2) == type_map_entry->second);
+            }
+            else if constexpr (std::is_same_v<clean_type, bool>)
+            {
+                return descriptor == "Z";
+            }
+            else if constexpr (std::is_integral_v<clean_type> && sizeof(clean_type) == 1)
+            {
+                return descriptor == "B" || descriptor == "Z";
+            }
+            else if constexpr (std::is_integral_v<clean_type> && sizeof(clean_type) == 2)
+            {
+                return descriptor == "S" || descriptor == "C";
+            }
+            else if constexpr (std::is_integral_v<clean_type> && sizeof(clean_type) == 4)
+            {
+                return descriptor == "I";
+            }
+            else if constexpr (std::is_integral_v<clean_type> && sizeof(clean_type) == 8)
+            {
+                return descriptor == "J";
+            }
+            else if constexpr (std::is_same_v<clean_type, float>)
+            {
+                return descriptor == "F";
+            }
+            else if constexpr (std::is_same_v<clean_type, double>)
+            {
+                return descriptor == "D";
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        static auto next_argument_descriptor(const std::string_view signature, std::size_t& position, const std::size_t close_paren) noexcept
+            -> std::string_view
+        {
+            const std::size_t start{ position };
+            while (position < close_paren && signature[position] == '[')
+            {
+                ++position;
+            }
+
+            if (position >= close_paren)
+            {
+                return {};
+            }
+
+            if (signature[position] == 'L')
+            {
+                const std::size_t semicolon{ signature.find(';', position) };
+                if (semicolon == std::string_view::npos || semicolon > close_paren)
+                {
+                    return {};
+                }
+                position = semicolon + 1;
+                return signature.substr(start, position - start);
+            }
+
+            ++position;
+            return signature.substr(start, position - start);
+        }
+
+        template<typename... args_t>
+        static auto signature_matches_arguments(const std::string_view signature) noexcept
+            -> bool
+        {
+            const std::size_t open_paren{ signature.find('(') };
+            const std::size_t close_paren{ signature.find(')') };
+            if (open_paren == std::string_view::npos || close_paren == std::string_view::npos || close_paren < open_paren)
+            {
+                return false;
+            }
+
+            std::size_t position{ open_paren + 1 };
+            bool matches{ true };
+            ([&]
+                {
+                    if (!matches)
+                    {
+                        return;
+                    }
+                    const std::string_view descriptor{ next_argument_descriptor(signature, position, close_paren) };
+                    matches = !descriptor.empty() && argument_matches_descriptor<args_t>(descriptor);
+                }(), ...);
+
+            return matches && position == close_paren;
+        }
+
+        template<typename... args_t>
+        auto resolve_compatible_method() const noexcept
+            -> vmhook::hotspot::method*
+        {
+            if (signature_matches_arguments<args_t...>(this->m_signature))
+            {
+                return this->method;
+            }
+
+            vmhook::hotspot::klass* const resolved_klass{ this->object ? klass_from_object_header(this->object) : nullptr };
+            if (!resolved_klass)
+            {
+                return this->method;
+            }
+
+            const std::string method_name{ this->name() };
+            for (vmhook::hotspot::klass* k{ resolved_klass }; k != nullptr; k = k->get_super())
+            {
+                const std::int32_t method_count{ k->get_methods_count() };
+                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
+                if (!methods_array || method_count <= 0)
+                {
+                    continue;
+                }
+
+                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+                {
+                    vmhook::hotspot::method* const current_method{ methods_array[method_index] };
+                    if (!current_method || !vmhook::hotspot::is_valid_pointer(current_method) || current_method->get_name() != method_name)
+                    {
+                        continue;
+                    }
+
+                    const std::string current_signature{ current_method->get_signature() };
+                    if (signature_matches_arguments<args_t...>(current_signature))
+                    {
+                        return current_method;
+                    }
+                }
+            }
+
+            return this->method;
+        }
+
         void* object;
         vmhook::hotspot::method* method;
         std::string m_signature;
@@ -4902,8 +6181,8 @@ namespace vmhook
         virtual ~object_base() = default;
 
         object_base(const object_base&) = default;
-        auto operator=(const object_base&) 
-            -> object_base& = default;
+        auto operator=(const object_base&)
+            -> object_base & = default;
 
         object_base(object_base&& other) noexcept
             : instance{ other.instance }
@@ -4911,7 +6190,7 @@ namespace vmhook
             other.instance = nullptr;
         }
 
-        auto operator=(object_base&& other) noexcept 
+        auto operator=(object_base&& other) noexcept
             -> object_base&
         {
             if (this != &other)
@@ -4925,7 +6204,7 @@ namespace vmhook
         /*
             @brief Returns the raw decoded OOP pointer held by this wrapper.
         */
-        auto get_instance() const noexcept 
+        auto get_instance() const noexcept
             -> oop_type_t
         {
             return this->instance;
@@ -4951,7 +6230,7 @@ namespace vmhook
                   In production code always check the optional, or assert field names
                   are correct at development time.
         */
-        auto get_field(const std::string_view name) const 
+        auto get_field(const std::string_view name) const
             -> std::optional<vmhook::field_proxy>
         {
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
@@ -5068,6 +6347,45 @@ namespace vmhook
             return std::nullopt;
         }
 
+        auto get_method(const std::string_view method_name, const std::string_view method_signature) const
+            -> std::optional<vmhook::method_proxy>
+        {
+            vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
+            if (!resolved_klass)
+            {
+                return std::nullopt;
+            }
+
+            // Walk the superclass chain so inherited methods are found.
+            for (vmhook::hotspot::klass* k{ resolved_klass }; k != nullptr; k = k->get_super())
+            {
+                const std::int32_t method_count{ k->get_methods_count() };
+                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
+
+                if (!methods_array || method_count <= 0)
+                {
+                    continue;
+                }
+
+                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+                {
+                    vmhook::hotspot::method* const current_method{ methods_array[method_index] };
+                    if (!current_method || !vmhook::hotspot::is_valid_pointer(current_method))
+                    {
+                        continue;
+                    }
+
+                    const std::string current_signature{ current_method->get_signature() };
+                    if (current_method->get_name() == method_name && current_signature == method_signature)
+                    {
+                        return vmhook::method_proxy{ this->instance, current_method, current_signature };
+                    }
+                }
+            }
+
+            return std::nullopt;
+        }
+
         static auto get_method(const std::type_index wrapper_type, const std::string_view method_name)
             -> std::optional<vmhook::method_proxy>
         {
@@ -5102,6 +6420,45 @@ namespace vmhook
             return std::nullopt;
         }
 
+        static auto get_method(const std::type_index wrapper_type, const std::string_view method_name, const std::string_view method_signature)
+            -> std::optional<vmhook::method_proxy>
+        {
+            vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
+            if (!resolved_klass)
+            {
+                return std::nullopt;
+            }
+
+            // Walk the superclass chain so inherited methods are found.
+            for (vmhook::hotspot::klass* k{ resolved_klass }; k != nullptr; k = k->get_super())
+            {
+                const std::int32_t method_count{ k->get_methods_count() };
+                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
+
+                if (!methods_array || method_count <= 0)
+                {
+                    continue;
+                }
+
+                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+                {
+                    vmhook::hotspot::method* const current_method{ methods_array[method_index] };
+                    if (!current_method || !vmhook::hotspot::is_valid_pointer(current_method))
+                    {
+                        continue;
+                    }
+
+                    const std::string current_signature{ current_method->get_signature() };
+                    if (current_method->get_name() == method_name && current_signature == method_signature)
+                    {
+                        return vmhook::method_proxy{ nullptr, current_method, current_signature };
+                    }
+                }
+            }
+
+            return std::nullopt;
+        }
+
     protected:
         /*
             @brief The raw decoded OOP pointer to the wrapped Java object.
@@ -5117,7 +6474,7 @@ namespace vmhook
             the first call).
             @return Pointer to the klass, or nullptr if the type is not registered.
         */
-        auto resolve_klass() const 
+        auto resolve_klass() const
             -> vmhook::hotspot::klass*
         {
             return resolve_klass(std::type_index{ typeid(*this) });
@@ -5181,6 +6538,12 @@ namespace vmhook
             return self.object_base::get_method(name);
         }
 
+        auto get_method(this const object_base& self, const char* const name, const char* const signature)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return self.object_base::get_method(name, signature);
+        }
+
         /*
             @brief Static get_field / get_method — for static Java fields called
             from static C++ methods.
@@ -5204,6 +6567,12 @@ namespace vmhook
             -> std::optional<vmhook::method_proxy>
         {
             return object_base::get_method(std::type_index{ typeid(derived) }, name);
+        }
+
+        static auto get_method(const std::string_view name, const std::string_view signature)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return object_base::get_method(std::type_index{ typeid(derived) }, name, signature);
         }
     };
 
@@ -5566,7 +6935,7 @@ namespace vmhook
         Handles both pre-Java-9 (char[] value) and Java-9+ (byte[] value + coder) layouts.
         Truncates strings longer than 4096 characters as a sanity check.
     */
-    inline auto read_java_string(void* const string_oop) 
+    inline auto read_java_string(void* const string_oop)
         -> std::string
     {
         if (!string_oop || !vmhook::hotspot::is_valid_pointer(string_oop))
@@ -5768,7 +7137,7 @@ namespace vmhook
         @param compressed  A 32-bit compressed OOP value.
         @return A valid pointer if decoding succeeded, nullptr otherwise.
     */
-    auto decode_array_oop(const std::uint32_t compressed) 
+    auto decode_array_oop(const std::uint32_t compressed)
         -> void*
     {
         if (!compressed)
