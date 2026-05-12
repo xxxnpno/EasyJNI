@@ -1064,6 +1064,27 @@ namespace
         write_result(line.str());
     }
 
+    template<typename request_function, typename done_function>
+    auto run_java_probe(request_function&& set_requested, done_function&& is_done)
+        -> bool
+    {
+        set_requested(true);
+
+        constexpr std::int32_t max_wait_iterations{ 5000 };
+        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
+        {
+            if (is_done())
+            {
+                break;
+            }
+
+            Sleep(1);
+        }
+
+        set_requested(false);
+        return is_done();
+    }
+
     auto set_expected_values(example_class& instance)
         -> void
     {
@@ -1210,23 +1231,9 @@ namespace
             return;
         }
 
-        example_class::set_hook_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_hook_probe_requested, example_class::get_hook_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-
-        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
-        {
-            if (example_class::get_hook_probe_done())
-            {
-                break;
-            }
-
-            Sleep(1);
-        }
-
-        example_class::set_hook_probe_requested(false);
-
-        check("hookProbeDone", example_class::get_hook_probe_done());
+        check("hookProbeDone", probe_done);
         check_equal("hookCallCount", hook_call_count.load(), 1);
         check("hookSawInstance", hook_saw_instance.load());
         check("hookSawExpectedArgument", hook_saw_expected_argument.load());
@@ -1266,23 +1273,9 @@ namespace
             return;
         }
 
-        example_class::set_force_return_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_force_return_probe_requested, example_class::get_force_return_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-
-        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
-        {
-            if (example_class::get_force_return_probe_done())
-            {
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
-        }
-
-        example_class::set_force_return_probe_requested(false);
-
-        check("forceReturnProbeDone", example_class::get_force_return_probe_done());
+        check("forceReturnProbeDone", probe_done);
         check_equal("forceReturnHookCallCount", force_return_hook_call_count.load(), 1);
         check("forceReturnSawInstance", force_return_saw_instance.load());
         check("forceReturnSawExpectedArgument", force_return_saw_expected_argument.load());
@@ -1322,23 +1315,9 @@ namespace
             return;
         }
 
-        example_class::set_cancel_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_cancel_probe_requested, example_class::get_cancel_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-
-        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
-        {
-            if (example_class::get_cancel_probe_done())
-            {
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
-        }
-
-        example_class::set_cancel_probe_requested(false);
-
-        check("cancelProbeDone", example_class::get_cancel_probe_done());
+        check("cancelProbeDone", probe_done);
         check_equal("cancelHookCallCount", cancel_hook_call_count.load(), 1);
         check("cancelSawInstance", cancel_saw_instance.load());
         check("cancelSawExpectedArgument", cancel_saw_expected_argument.load());
@@ -1376,23 +1355,9 @@ namespace
             return;
         }
 
-        example_class::set_static_force_return_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_static_force_return_probe_requested, example_class::get_static_force_return_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-
-        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
-        {
-            if (example_class::get_static_force_return_probe_done())
-            {
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
-        }
-
-        example_class::set_static_force_return_probe_requested(false);
-
-        check("staticForceReturnProbeDone", example_class::get_static_force_return_probe_done());
+        check("staticForceReturnProbeDone", probe_done);
         check_equal("staticForceReturnHookCallCount", static_force_return_hook_call_count.load(), 1);
         check("staticForceReturnSawExpectedArgument", static_force_return_saw_expected_argument.load());
         check_equal("staticForceReturnValue", example_class::get_static_force_return_probe_value(), static_cast<std::int32_t>(24680));
@@ -1441,23 +1406,9 @@ namespace
             return;
         }
 
-        example_class::set_make_unique_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_make_unique_probe_requested, example_class::get_make_unique_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-
-        for (std::int32_t wait_iteration{ 0 }; wait_iteration < max_wait_iterations; ++wait_iteration)
-        {
-            if (example_class::get_make_unique_probe_done())
-            {
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
-        }
-
-        example_class::set_make_unique_probe_requested(false);
-
-        check("makeUniqueProbeDone", example_class::get_make_unique_probe_done());
+        check("makeUniqueProbeDone", probe_done);
         check_equal("makeUniqueHookCallCount", make_unique_hook_call_count.load(), 1);
         check("makeUniqueSawExpectedArgument", make_unique_saw_argument.load());
         check("makeUniqueAllocated", make_unique_allocated.load());
@@ -1509,18 +1460,9 @@ namespace
         example_class::set_list_probe_done(false);
         example_class::set_list_probe_requested(false);
 
-        example_class::set_list_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_list_probe_requested, example_class::get_list_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-        for (std::int32_t i{ 0 }; i < max_wait_iterations; ++i)
-        {
-            if (example_class::get_list_probe_done()) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
-        }
-
-        example_class::set_list_probe_requested(false);
-
-        check("listProbeDone", example_class::get_list_probe_done());
+        check("listProbeDone", probe_done);
 
         // Java confirmed the list has 3 elements
         check_equal("listProbeSize", example_class::get_list_probe_size(), static_cast<std::int32_t>(3));
@@ -1563,18 +1505,9 @@ namespace
         example_class::set_poly_probe_done(false);
         example_class::set_poly_probe_requested(false);
 
-        example_class::set_poly_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_poly_probe_requested, example_class::get_poly_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-        for (std::int32_t i{ 0 }; i < max_wait_iterations; ++i)
-        {
-            if (example_class::get_poly_probe_done()) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
-        }
-
-        example_class::set_poly_probe_requested(false);
-
-        check("polyProbeDone", example_class::get_poly_probe_done());
+        check("polyProbeDone", probe_done);
 
         // Get B instance
         auto b_ptr = instance.get_b_instance();
@@ -1661,18 +1594,9 @@ namespace
             return;
         }
 
-        example_class::set_method_call_return_probe_requested(true);
+        const bool probe_done{ run_java_probe(example_class::set_method_call_return_probe_requested, example_class::get_method_call_return_probe_done) };
 
-        constexpr std::int32_t max_wait_iterations{ 5000 };
-        for (std::int32_t i{ 0 }; i < max_wait_iterations; ++i)
-        {
-            if (example_class::get_method_call_return_probe_done()) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
-        }
-
-        example_class::set_method_call_return_probe_requested(false);
-
-        check("methodCallReturnProbeDone", example_class::get_method_call_return_probe_done());
+        check("methodCallReturnProbeDone", probe_done);
 
         // StubRoutines::_call_stub_entry is not exported in the VMStructs of
         // any JDK version tested in CI (8–24).  When the gate IS present,

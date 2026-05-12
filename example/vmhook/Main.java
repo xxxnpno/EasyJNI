@@ -1,6 +1,7 @@
 package vmhook;
 
 import java.lang.management.ManagementFactory;
+import java.util.function.BooleanSupplier;
 
 public class Main
 {
@@ -27,62 +28,50 @@ public class Main
         // vmhook has to get_field("stopJVM")->set(true) to stop the JVM
         while(!stopJVM)
         {
-            if (Example.hookProbeRequested && !Example.hookProbeDone)
-            {
-                Example.instance.nonStaticCallMe(77);
-                Example.hookProbeDone = true;
-            }
+            runProbe(() -> Example.hookProbeRequested && !Example.hookProbeDone,
+                () -> Example.instance.nonStaticCallMe(77),
+                () -> Example.hookProbeDone = true);
 
-            if (Example.forceReturnProbeRequested && !Example.forceReturnProbeDone)
-            {
-                Example.forceReturnProbeValue = Example.instance.nonStaticReturnMe(77);
-                Example.forceReturnProbeDone = true;
-            }
+            runProbe(() -> Example.forceReturnProbeRequested && !Example.forceReturnProbeDone,
+                () -> Example.forceReturnProbeValue = Example.instance.nonStaticReturnMe(77),
+                () -> Example.forceReturnProbeDone = true);
 
-            if (Example.cancelProbeRequested && !Example.cancelProbeDone)
-            {
-                Example.instance.nonStaticCancelMe(9);
-                Example.cancelProbeDone = true;
-            }
+            runProbe(() -> Example.cancelProbeRequested && !Example.cancelProbeDone,
+                () -> Example.instance.nonStaticCancelMe(9),
+                () -> Example.cancelProbeDone = true);
 
-            if (Example.staticForceReturnProbeRequested && !Example.staticForceReturnProbeDone)
-            {
-                Example.staticForceReturnProbeValue = Example.staticReturnMe(77);
-                Example.staticForceReturnProbeDone = true;
-            }
+            runProbe(() -> Example.staticForceReturnProbeRequested && !Example.staticForceReturnProbeDone,
+                () -> Example.staticForceReturnProbeValue = Example.staticReturnMe(77),
+                () -> Example.staticForceReturnProbeDone = true);
 
-            if (Example.makeUniqueProbeRequested && !Example.makeUniqueProbeDone)
-            {
-                final Object tlabRefill = new Object();
-                Example.instance.nonStaticCallMe(88);
-                if (tlabRefill == null)
+            runProbe(() -> Example.makeUniqueProbeRequested && !Example.makeUniqueProbeDone,
+                () ->
                 {
-                    throw new IllegalStateException("unreachable");
-                }
-                Example.makeUniqueProbeDone = true;
-            }
+                    final Object tlabRefill = new Object();
+                    Example.instance.nonStaticCallMe(88);
+                    if (tlabRefill == null)
+                    {
+                        throw new IllegalStateException("unreachable");
+                    }
+                },
+                () -> Example.makeUniqueProbeDone = true);
 
-            if (Example.listProbeRequested && !Example.listProbeDone)
-            {
-                Example.listProbeSize = Example.instance.listOfAs.size();
-                Example.listProbeDone = true;
-            }
+            runProbe(() -> Example.listProbeRequested && !Example.listProbeDone,
+                () -> Example.listProbeSize = Example.instance.listOfAs.size(),
+                () -> Example.listProbeDone = true);
 
-            if (Example.polyProbeRequested && !Example.polyProbeDone)
-            {
-                Example.polyProbeInheritedField = (Example.instance.bInstance.protectedInt == 1337);
-                Example.polyProbeInheritedMethod = (Example.instance.bInstance.protectedAdd(3) == 1340);
-                Example.polyProbeOwnField = (Example.instance.bInstance.bInt == 42);
-                Example.polyProbeDone = true;
-            }
+            runProbe(() -> Example.polyProbeRequested && !Example.polyProbeDone,
+                () ->
+                {
+                    Example.polyProbeInheritedField = (Example.instance.bInstance.protectedInt == 1337);
+                    Example.polyProbeInheritedMethod = (Example.instance.bInstance.protectedAdd(3) == 1340);
+                    Example.polyProbeOwnField = (Example.instance.bInstance.bInt == 42);
+                },
+                () -> Example.polyProbeDone = true);
 
-            if (Example.methodCallReturnProbeRequested && !Example.methodCallReturnProbeDone)
-            {
-                // The C++ hook on nonStaticCallMe will call nonStaticReturnMe(5) inside
-                // the detour and store 6 back through an atomic; we just trigger the call.
-                Example.instance.nonStaticCallMe(99);
-                Example.methodCallReturnProbeDone = true;
-            }
+            runProbe(() -> Example.methodCallReturnProbeRequested && !Example.methodCallReturnProbeDone,
+                () -> Example.instance.nonStaticCallMe(99),
+                () -> Example.methodCallReturnProbeDone = true);
 
             Thread.sleep(1);
         }
@@ -97,5 +86,16 @@ public class Main
         }
 
         System.out.println("[JAVA PASS] All setter verifications passed.");
+    }
+
+    private static void runProbe(final BooleanSupplier shouldRun, final Runnable action, final Runnable markDone)
+    {
+        if (!shouldRun.getAsBoolean())
+        {
+            return;
+        }
+
+        action.run();
+        markDone.run();
     }
 }
