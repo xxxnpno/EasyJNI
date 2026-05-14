@@ -362,6 +362,10 @@ jobs:
       fail-fast: false
       matrix:
         java: ${{ fromJson(needs.java-versions.outputs.versions) }}
+        # Temurin does not publish a Java 8 build for macOS arm64 (Apple
+        # Silicon), which is what the GitHub-hosted macOS runners are.
+        exclude:
+          - java: '8'
 
     steps:
       - uses: actions/checkout@v4
