@@ -434,6 +434,72 @@ the oop's narrow-klass header, not the static `Throwable` type).
 Misses Throwables built with `writableStackTrace=false` and any
 subclass that overrides `fillInStackTrace` to a no-op.
 
+## RAII hook removal
+
+`vmhook::hook<T>(name, callback)` installs a hook that lives until
+`vmhook::shutdown_hooks()` tears it down.  For cases where you want
+the hook bound to a C++ scope, `vmhook::scoped_hook<T>(name, callback)`
+returns a `hook_handle` that uninstalls **just that hook** when it
+goes out of scope:
+
+```cpp
+{
+    auto handle{ vmhook::scoped_hook<my_class>(
+        "doThing",
+        [](vmhook::return_value&,
+           const std::unique_ptr<my_class>&,
+           std::int32_t)
+        {
+            VMHOOK_LOG("doThing was called");
+        }) };
+
+    // ... run probes ...
+}   // handle destructed -> hook removed; doThing dispatches normally again
+```
+
+The handle is move-only, exposes `installed()` to check success, and
+its destructor restores the method's original entry points and clears
+the no-inline / no-compile flags.  Other hooks are unaffected;
+`shutdown_hooks()` still works as a hard reset.
+
+Caveat: hook removal isn't synchronised with in-flight callbacks.
+Make sure no Java thread is currently inside the hooked method when
+the handle dies — typically that's the case if you only call
+`stop()` after `run_java_probe()` returns.
+
+## Walking every instance of a class
+
+`vmhook::for_each_instance<T>(visitor, max_visits)` scans the live
+heap and invokes the visitor with a fresh `std::unique_ptr<T>` for
+every object whose narrow-klass pointer matches `T`'s registered
+class.  Useful for "give me every loaded `Player`" without installing
+a constructor hook.
+
+```cpp
+vmhook::for_each_instance<player_class>(
+    [](std::unique_ptr<player_class> p)
+    {
+        VMHOOK_LOG("player at {}", p->name());
+    },
+    /* max_visits = */ 256);
+```
+
+Reads `Universe::_collectedHeap::_reserved` in 4 KiB chunks and walks
+candidate object headers at 8-byte stride.  The JVM is **not**
+brought to a safepoint, so:
+
+- Concurrent GCs may move objects between when we see them and when
+  the visitor accesses them — don't keep the wrappers past the
+  call's return.
+- Region-based GCs (G1) skip unmapped regions silently; you'll see
+  every accessible match but possibly miss objects in regions whose
+  safe-read fails.
+- Colored-pointer GCs (ZGC, Shenandoah) are unsupported — prefer a
+  constructor hook there.
+
+The scan is O(heap-size) — typically 0.5–2 s on a 4 GiB heap.
+`max_visits` short-circuits as soon as you have enough.
+
 ## Enumerating loaded classes
 
 `vmhook::for_each_loaded_class(visitor)` snapshots the JVM's

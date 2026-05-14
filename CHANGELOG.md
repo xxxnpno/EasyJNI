@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- `vmhook::scoped_hook<T>(name, callback)` + `class hook_handle` — RAII variant
+  of `vmhook::hook<T>`.  The returned `hook_handle` uninstalls just that hook
+  when it goes out of scope, restoring the method's original entry points and
+  clearing the no-inline / no-compile flags.  Other hooks are unaffected;
+  `shutdown_hooks()` still works as a hard reset.
+- `vmhook::for_each_instance<T>(visitor, max_visits)` — walks the live heap
+  (`Universe::_collectedHeap::_reserved`) and invokes the visitor with a fresh
+  `std::unique_ptr<T>` for every object whose narrow-klass header matches
+  `T`'s registered class.  Best-effort on region-based GCs (G1); unsupported
+  on colored-pointer GCs (ZGC / Shenandoah).
 - `return_value::stack_trace(max_depth = 64)` — walks the saved-rbp chain from
   inside a hook callback and returns every interpreter frame as a
   `caller_info`.  Stops at the first compiled / native frame so the result

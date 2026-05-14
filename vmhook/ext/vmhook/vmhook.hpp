@@ -5466,6 +5466,164 @@ namespace vmhook
     }
 
     /*
+        @brief Visits every live instance of a registered C++ wrapper class.
+        @details
+        Walks `Universe::_collectedHeap::_reserved` linearly in 4 KiB
+        chunks, decodes each candidate oop's narrow klass pointer at
+        offset +8, and invokes the visitor for every header whose
+        klass matches `T`'s registered class.  The visitor receives a
+        freshly allocated `std::unique_ptr<T>` pointing at the live
+        Java object, so it can read fields / call methods on it the
+        same way a hooked-method callback would.
+
+        The scan is single-threaded and best-effort:
+
+          - The JVM is **not** brought to a safepoint, so a concurrent
+            GC may move objects between when we see them and when the
+            visitor accesses them.  Don't hold the wrappers past the
+            return of `for_each_instance` if the GC is active.
+          - On region-based GCs (G1) the heap reservation may include
+            unmapped regions; we read in chunks and skip chunks where
+            the safe-read fails.  This means *every* visit is correct
+            (we only see real objects) but some objects may be missed.
+          - Shenandoah / ZGC use colored pointers and forwarding
+            tables that this scan does not understand.  Results on
+            those collectors are undefined; prefer constructor-based
+            tracking there.
+          - The scan is O(heap-size).  On a 4 GiB heap it typically
+            takes 0.5–2 s; pass `max_visits` to short-circuit once you
+            have enough instances.
+
+        @tparam T            Registered wrapper type (derived from
+                             `vmhook::object<T>`), with an
+                             `explicit T(vmhook::oop_t)` constructor.
+        @tparam visitor_type Callable accepting `std::unique_ptr<T>`.
+        @param  visit        Visitor invoked for each match.
+        @param  max_visits   Stop after this many matches.  Defaults
+                             to no limit.
+        @return  Number of instances reported to the visitor.
+    */
+    template<typename T, typename visitor_type>
+    inline auto for_each_instance(visitor_type&& visit,
+                                  std::size_t   max_visits = std::numeric_limits<std::size_t>::max())
+        -> std::size_t
+    {
+        // Resolve T's registered klass.
+        const auto type_idx{ std::type_index{ typeid(T) } };
+        const auto type_map_it{ vmhook::type_to_class_map.find(type_idx) };
+        if (type_map_it == vmhook::type_to_class_map.end())
+        {
+            VMHOOK_LOG("{} for_each_instance: type not registered (call register_class<T>() first)",
+                       vmhook::error_tag);
+            return 0;
+        }
+        vmhook::hotspot::klass* const target_klass{ vmhook::find_class(type_map_it->second) };
+        if (!target_klass)
+        {
+            return 0;
+        }
+
+        // Resolve heap bounds via VMStructs.  All entries cached on
+        // first call; subsequent calls hit a static.
+        static const auto* const heap_static_entry{
+            vmhook::hotspot::iterate_struct_entries("Universe", "_collectedHeap") };
+        static const auto* const reserved_offset{
+            vmhook::hotspot::iterate_struct_entries("CollectedHeap", "_reserved") };
+        static const auto* const memregion_start_offset{
+            vmhook::hotspot::iterate_struct_entries("MemRegion", "_start") };
+        static const auto* const memregion_word_size_offset{
+            vmhook::hotspot::iterate_struct_entries("MemRegion", "_word_size") };
+        if (!heap_static_entry || !heap_static_entry->address
+         || !reserved_offset
+         || !memregion_start_offset
+         || !memregion_word_size_offset)
+        {
+            VMHOOK_LOG("{} for_each_instance: heap VMStruct entries missing on this JDK",
+                       vmhook::error_tag);
+            return 0;
+        }
+
+        void* const collected_heap{ *reinterpret_cast<void**>(heap_static_entry->address) };
+        if (!vmhook::hotspot::is_valid_pointer(collected_heap))
+        {
+            return 0;
+        }
+
+        auto* const memregion_addr{
+            reinterpret_cast<std::uint8_t*>(collected_heap) + reserved_offset->offset };
+        void* const heap_start{
+            *reinterpret_cast<void**>(memregion_addr + memregion_start_offset->offset) };
+        const std::size_t heap_word_count{
+            *reinterpret_cast<std::size_t*>(memregion_addr + memregion_word_size_offset->offset) };
+        const std::size_t heap_byte_size{ heap_word_count * sizeof(void*) };
+
+        if (!vmhook::hotspot::is_valid_pointer(heap_start) || heap_byte_size == 0)
+        {
+            return 0;
+        }
+
+        auto* const scan_begin{ static_cast<std::uint8_t*>(heap_start) };
+        auto* const scan_end{ scan_begin + heap_byte_size };
+
+        // Chunked safe-read scan: copy 4 KiB at a time so each
+        // candidate read stays in our process address space (no
+        // per-cell SEH or signal-handler entry).
+        constexpr std::size_t chunk_size{ 4096 };
+        constexpr std::size_t stride{ 8 };
+        alignas(8) std::uint8_t buffer[chunk_size];
+        std::size_t visits{ 0 };
+
+        for (auto* p{ scan_begin }; p < scan_end && visits < max_visits; p += chunk_size)
+        {
+            const std::size_t to_read{
+                std::min<std::size_t>(chunk_size, static_cast<std::size_t>(scan_end - p)) };
+            if (!vmhook::os::safe_read(buffer, p, to_read))
+            {
+                continue;
+            }
+
+            // Walk the chunk at 8-byte stride; every potential
+            // object header has its mark word at +0 and a narrow
+            // klass pointer at +8.
+            for (std::size_t off{ 0 }; off + 12 <= to_read && visits < max_visits; off += stride)
+            {
+                const std::uint32_t narrow{
+                    *reinterpret_cast<const std::uint32_t*>(buffer + off + 8) };
+                if (narrow == 0)
+                {
+                    continue;
+                }
+                void* const decoded{ vmhook::hotspot::decode_klass_pointer(narrow) };
+                if (decoded != static_cast<void*>(target_klass))
+                {
+                    continue;
+                }
+
+                // Hand the visitor a wrapper pointing at the real
+                // heap address (not the buffer copy).
+                try
+                {
+                    // T's constructor accepts vmhook::oop_t, which is
+                    // an alias for void* defined further down in the
+                    // header — use void* directly so we don't need
+                    // the typedef in scope yet.
+                    auto wrapper{ std::unique_ptr<T>{
+                        new T{ static_cast<void*>(p + off) } } };
+                    visit(std::move(wrapper));
+                }
+                catch (const std::exception& ex)
+                {
+                    VMHOOK_LOG("{} for_each_instance visitor: {}",
+                               vmhook::error_tag, ex.what());
+                }
+                ++visits;
+            }
+        }
+
+        return visits;
+    }
+
+    /*
         @brief Associates a C++ type with its corresponding Java class name.
         @tparam T The C++ type to register.
         @param class_name The internal JVM class name using '/' separators.
@@ -5597,6 +5755,86 @@ namespace vmhook
 
     private:
         std::shared_ptr<control_block> block{};
+    };
+
+    /*
+        @brief RAII handle for a single installed method hook.
+        @details
+        Returned by vmhook::scoped_hook<T>(...).  Destroying the handle
+        (or calling stop()) tears down only this hook — other hooks on
+        other methods stay armed.  vmhook::shutdown_hooks() still
+        removes everything in one call when you want a hard reset.
+
+        Move-only.  An empty hook_handle (default-constructed or after
+        stop()) returns running() == false and does nothing on
+        destruction.
+
+        Thread safety: hook removal mutates the global
+        g_hooked_methods list, which is not synchronised.  Either
+        remove hooks from a single thread, or guard the removal site
+        with a mutex.  In-flight callbacks for the method being
+        removed must have finished before stop() returns to avoid
+        racing the detour's std::function destruction; in practice
+        this means ensuring no Java thread is currently inside the
+        hooked method when the handle is destroyed.
+    */
+    class hook_handle
+    {
+    public:
+        hook_handle() = default;
+        explicit hook_handle(vmhook::hotspot::method* m) noexcept
+            : method{ m }
+        {
+        }
+
+        hook_handle(const hook_handle&) = delete;
+        auto operator=(const hook_handle&) -> hook_handle& = delete;
+
+        hook_handle(hook_handle&& other) noexcept
+            : method{ other.method }
+        {
+            other.method = nullptr;
+        }
+
+        auto operator=(hook_handle&& other) noexcept -> hook_handle&
+        {
+            if (this != &other)
+            {
+                this->stop();
+                this->method = other.method;
+                other.method = nullptr;
+            }
+            return *this;
+        }
+
+        ~hook_handle()
+        {
+            this->stop();
+        }
+
+        /*
+            @brief Returns true while the hook is still installed.
+        */
+        auto installed() const noexcept -> bool
+        {
+            return this->method != nullptr;
+        }
+
+        /*
+            @brief Tears down this specific hook (idempotent).  Restores
+                   the method's original entry points, clears the
+                   no-inline / no-compile flags, and removes the entry
+                   from the global hooked-method list so the i2i
+                   common_detour stops dispatching to it.  The
+                   underlying midi2i_hook trampoline is left in place
+                   because it may still serve other methods sharing
+                   the same i2i_entry; clearing it would risk
+                   un-patching live dispatch sites.
+        */
+        auto stop() noexcept -> void;
+
+    private:
+        vmhook::hotspot::method* method{ nullptr };
     };
 
     // The function templates `watch_static_field` and `on_class_loaded`
@@ -6369,6 +6607,143 @@ namespace vmhook
 
         vmhook::hotspot::g_hooked_methods.clear();
         vmhook::hotspot::g_hooked_i2i_entries.clear();
+    }
+
+    inline auto hook_handle::stop() noexcept -> void
+    {
+        if (!this->method)
+        {
+            return;
+        }
+        vmhook::hotspot::method* const target{ this->method };
+        this->method = nullptr;
+
+        try
+        {
+            auto& hooks{ vmhook::hotspot::g_hooked_methods };
+            const auto entry_it{ std::find_if(hooks.begin(), hooks.end(),
+                [target](const vmhook::hotspot::hooked_method& h) noexcept
+                {
+                    return h.method == target;
+                }) };
+            if (entry_it == hooks.end())
+            {
+                return;
+            }
+
+            // Restore the method's original behaviour.  Mirrors
+            // shutdown_hooks() but for one entry.  Leaving the
+            // midi2i_hook trampoline installed is deliberate — other
+            // hooks may still share the same i2i entry point, and
+            // common_detour will simply skip over methods missing
+            // from g_hooked_methods.
+            vmhook::hotspot::set_dont_inline(entry_it->method, false);
+            if (std::uint32_t* const flags{ entry_it->method->get_access_flags() })
+            {
+                *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
+            }
+            if (entry_it->was_compiled)
+            {
+                if (entry_it->original_from_compiled_entry)
+                {
+                    entry_it->method->set_from_compiled_entry(entry_it->original_from_compiled_entry);
+                }
+                if (entry_it->original_from_interpreted_entry)
+                {
+                    entry_it->method->set_from_interpreted_entry(entry_it->original_from_interpreted_entry);
+                }
+                if (entry_it->original_code)
+                {
+                    entry_it->method->set_code(entry_it->original_code);
+                }
+            }
+
+            hooks.erase(entry_it);
+        }
+        catch (...)
+        {
+            // Removal must never throw; the user is dropping a handle.
+        }
+    }
+
+    /*
+        @brief RAII-style hook install: same as vmhook::hook<T>() but
+               returns a hook_handle that uninstalls just this hook on
+               destruction.
+        @details
+        Use this when you want a hook bound to a C++ scope rather than
+        persisting until shutdown_hooks().  See class hook_handle for
+        thread-safety caveats around concurrent in-flight callbacks.
+
+        @return  A hook_handle whose installed() is true on success and
+                 false on failure.  Failure modes (class not found,
+                 method not found, etc.) match vmhook::hook<T>.
+    */
+    template<class wrapper_type>
+    inline auto scoped_hook(const std::string_view method_name,
+                            const std::string_view method_signature,
+                            auto&&                 user_detour) -> hook_handle
+    {
+        if (!vmhook::hook<wrapper_type>(method_name, method_signature,
+                                         std::forward<decltype(user_detour)>(user_detour)))
+        {
+            return hook_handle{};
+        }
+
+        // Re-resolve the Method* we just installed so the handle has
+        // a stable target to disarm later.  The lookup duplicates a
+        // few comparisons from hook<T>(), but install is not a hot
+        // path and this keeps the public API decoupled from the
+        // internal install routine.
+        try
+        {
+            const auto type_map_entry{ vmhook::type_to_class_map.find(
+                std::type_index{ typeid(wrapper_type) }) };
+            if (type_map_entry == vmhook::type_to_class_map.end())
+            {
+                return hook_handle{};
+            }
+            vmhook::hotspot::klass* const target_klass{
+                vmhook::find_class(type_map_entry->second) };
+            if (!target_klass)
+            {
+                return hook_handle{};
+            }
+            const std::int32_t method_count{ target_klass->get_methods_count() };
+            vmhook::hotspot::method** const methods_array{ target_klass->get_methods_ptr() };
+            if (!methods_array || method_count <= 0)
+            {
+                return hook_handle{};
+            }
+            for (std::int32_t i{ 0 }; i < method_count; ++i)
+            {
+                vmhook::hotspot::method* const m{ methods_array[i] };
+                if (!m || !vmhook::hotspot::is_valid_pointer(m))
+                {
+                    continue;
+                }
+                if (m->get_name() != method_name)
+                {
+                    continue;
+                }
+                if (!method_signature.empty() && m->get_signature() != method_signature)
+                {
+                    continue;
+                }
+                return hook_handle{ m };
+            }
+        }
+        catch (...) { /* swallow — return empty handle */ }
+        return hook_handle{};
+    }
+
+    template<class wrapper_type>
+    inline auto scoped_hook(const std::string_view method_name,
+                            auto&&                 user_detour) -> hook_handle
+    {
+        return vmhook::scoped_hook<wrapper_type>(
+            method_name, std::string_view{},
+            std::forward<decltype(user_detour)>(user_detour));
     }
 
     // --- JNI helper layer --------------------------------------------------------

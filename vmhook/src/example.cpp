@@ -2403,6 +2403,89 @@ namespace
         check("forEachLoadedClassExample",   classes_seen.contains("vmhook/Example"));
     }
 
+    // ── scoped_hook + hook_handle — RAII hook removal probe ────────────────
+    std::atomic_int  scoped_hook_call_count{ 0 };
+
+    auto test_scoped_hook() -> void
+    {
+        scoped_hook_call_count.store(0);
+
+        // Phase 1: install a scoped hook on innerStep, fire the
+        // probe once, verify the hook fired.  The handle keeps the
+        // hook alive for this scope.
+        {
+            auto handle{ vmhook::scoped_hook<caller_probe_class>(
+                "innerStep",
+                "(I)I",
+                [](vmhook::return_value& /*ret*/,
+                   const std::unique_ptr<caller_probe_class>& /*self*/,
+                   std::int32_t /*v*/)
+                {
+                    ++scoped_hook_call_count;
+                }) };
+            check("scopedHookInstalled", handle.installed());
+
+            caller_probe_class::set_probe_done(false);
+            caller_probe_class::set_probe_requested(false);
+            const bool first_done{ run_java_probe(caller_probe_class::set_probe_requested,
+                                                   caller_probe_class::get_probe_done) };
+            check("scopedHookFirstProbeDone", first_done);
+            check("scopedHookFiredFirstProbe", scoped_hook_call_count.load() > 0);
+        }   // handle destroyed -> hook removed
+
+        // Phase 2: fire the probe again with the handle gone.  No
+        // increment should occur because the hook has been
+        // uninstalled.
+        const int after_remove_baseline{ scoped_hook_call_count.load() };
+        caller_probe_class::set_probe_done(false);
+        caller_probe_class::set_probe_requested(false);
+        const bool second_done{ run_java_probe(caller_probe_class::set_probe_requested,
+                                                caller_probe_class::get_probe_done) };
+        check("scopedHookSecondProbeDone", second_done);
+        check_equal("scopedHookNotFiredAfterRemove",
+                    scoped_hook_call_count.load(),
+                    after_remove_baseline);
+
+        vmhook::shutdown_hooks();
+    }
+
+    // ── for_each_instance — heap iteration probe ───────────────────────────
+    auto test_for_each_instance() -> void
+    {
+        // Walk the heap for instances of Example.  At least one
+        // (Example.instance, the static singleton) should be there.
+        std::atomic_int  example_count{ 0 };
+        std::atomic_bool saw_singleton_field{ false };
+
+        const auto expected{ example_class::get_instance() };
+        // `example_class::get_instance` is a static factory that
+        // hides the inherited object_base::get_instance() accessor;
+        // qualify the call so we read the raw void* OOP instead.
+        void* const expected_oop{ expected ? expected->vmhook::object_base::get_instance() : nullptr };
+
+        const std::size_t visits{ vmhook::for_each_instance<example_class>(
+            [&](std::unique_ptr<example_class> instance)
+            {
+                ++example_count;
+                if (instance && expected_oop
+                    && instance->vmhook::object_base::get_instance() == expected_oop)
+                {
+                    saw_singleton_field.store(true);
+                }
+            },
+            /* max_visits = */ 1024) };
+
+        check("forEachInstanceVisitedAtLeastOne", visits > 0);
+        check("forEachInstanceCountMatches",     visits == static_cast<std::size_t>(example_count.load()));
+        // The static singleton may not be the first match (the heap
+        // can hold other transient Example instances built by the
+        // probe), but it must appear in the walk.
+        if (expected_oop)
+        {
+            check("forEachInstanceSawSingleton", saw_singleton_field.load());
+        }
+    }
+
     // ── on_exception — exception-construction hook probe ───────────────────
     auto test_on_exception() -> void
     {
@@ -2561,11 +2644,16 @@ static auto run_test_suite() -> void
         // the dynamic class-load tests fire.
         test_for_each_loaded_class();
 
+        // Heap iteration probe — also runs early before any other
+        // hooks mess with the test_log thread's state.
+        test_for_each_instance();
+
         // Newer feature surface: caller info, field watcher, class-load watcher.
         // on_exception is exercised BEFORE test_caller_info because the
         // latter calls shutdown_hooks() and would tear down our
         // Throwable.fillInStackTrace hook if it ran first.
         test_on_exception();
+        test_scoped_hook();
         test_caller_info();
         test_field_watcher();
         test_class_load_watcher();
