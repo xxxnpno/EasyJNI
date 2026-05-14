@@ -3831,6 +3831,12 @@ namespace vmhook
         template<typename value_type, typename deleter_type>
         struct is_unique_object_ptr<std::unique_ptr<value_type, deleter_type>>
             : std::bool_constant<std::is_base_of_v<vmhook::object_base, value_type>> {};
+
+        inline auto jni_decode_object(void* object_handle) noexcept
+            -> void*;
+
+        inline auto jni_new_string_utf(std::string_view value) noexcept
+            -> void*;
     } // namespace detail
 
     template<typename T>
