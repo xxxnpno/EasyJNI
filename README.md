@@ -137,16 +137,6 @@ auto compute(std::int32_t value) const
 }
 ```
 
-When obfuscated classes contain several methods with the same short name,
-`method_proxy::call(...)` checks same-name overloads against the C++ argument
-types and JVM descriptors before invoking the selected method.
-
-Use explicit descriptors when the wrapper boundary should be exact:
-
-```cpp
-this->get_method("a", "(Ljava/lang/String;)V")->call(message);
-```
-
 ## Hooks
 
 Hooks receive `vmhook::return_value&` first, followed by decoded Java arguments.
