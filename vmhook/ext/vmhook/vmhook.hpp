@@ -202,6 +202,21 @@
     #define VMHOOK_HAS_STD_PRINT 0
 #endif
 
+// C++23 deducing-this support test.  The feature itself is implemented in
+// MSVC 19.32+ / GCC 14+ / Clang 18+, but GCC's overload resolution still
+// considers explicit-object member functions in *static-call* contexts
+// (where no implicit object is available) and then errors with "cannot
+// call without object".  MSVC and Clang correctly exclude them from
+// static-call overload resolution.  We therefore enable the deducing-this
+// path only on MSVC and Clang — that's where vmhook::object<T>::get_field
+// can be invoked from both instance and static methods uniformly.
+#if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L \
+    && (defined(__clang__) || defined(_MSC_VER))
+    #define VMHOOK_HAS_DEDUCING_THIS 1
+#else
+    #define VMHOOK_HAS_DEDUCING_THIS 0
+#endif
+
 #if VMHOOK_OS_WINDOWS
     // <windows.h> defines macros (min, max, ERROR, etc.) that clash with C++.
     // We guard them and undefine the worst offenders right after include.
@@ -214,10 +229,11 @@
     #include <windows.h>
 #elif VMHOOK_OS_POSIX
     #include <cerrno>
-    #include <csignal>
     #include <cstdio>
     #include <dlfcn.h>
     #include <fcntl.h>
+    #include <setjmp.h>     // sigjmp_buf, sigsetjmp, siglongjmp — POSIX (not in <csetjmp>)
+    #include <signal.h>     // POSIX sigaction, SIGSEGV, etc. (not in <csignal> for SA_*)
     #include <sys/mman.h>
     #include <unistd.h>
     #if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
@@ -227,7 +243,7 @@
     #endif
     #if VMHOOK_OS_APPLE
         #include <mach/mach.h>
-        #include <mach/vm_map.h>
+        #include <mach/mach_vm.h>   // mach_vm_region, mach_vm_read_overwrite
         #include <pthread.h>
     #endif
 #endif
@@ -8666,29 +8682,26 @@ namespace vmhook
         using object_base::object_base;
 
         // -------------------------------------------------------------------
-        // Deducing-this overloads.  These exist so that on MSVC and Clang a
-        // call like `get_field("staticName")` made from a static C++ method
-        // *of the wrapper class* dispatches to the static fallback at the
-        // bottom of this class:  the deducing-this overloads are non-viable
-        // in a static-call context (no implicit object), so overload
-        // resolution falls through to the 1-arg static `get_field`.
+        // Deducing-this overloads (compiled only on toolchains that support
+        // C++23 explicit-object parameters: MSVC 19.32+, GCC 14+, Clang 18+).
         //
-        // From an instance method these are an exact match for string
-        // literals (`const char*`) and outrank the static fallback which
-        // accepts `std::string_view`.
-        //
-        // We do NOT bring in `object_base::get_field` via a using-declaration
-        // here, because the using-declaration would add the same-named
-        // base overload to the overload set and trigger ambiguity errors
-        // on MSVC.  The deducing-this overloads below forward to the base
-        // explicitly via `self.object_base::get_field(...)`.
+        // These exist so that a call like `get_field("staticName")` made
+        // from a static C++ method *of the wrapper class* dispatches to the
+        // static fallback below:  the deducing-this overloads are non-viable
+        // in a static-call context (no implicit object), so on MSVC and
+        // Clang overload resolution falls through to the string_view static
+        // `get_field`.  From an instance method they are an exact match for
+        // string literals and outrank the string_view static.
         //
         // On GCC the deducing-this overloads are still considered for
-        // static-call overload resolution and produce a compile error
-        // ("cannot call member function without object").  Users targeting
+        // static-call overload resolution and produce a compile error.  We
+        // still emit them because instance-context calls need a non-static
+        // overload (otherwise the same-named static in this class would
+        // hide the inherited `object_base::get_field`).  Users targeting
         // GCC should call `static_field("name")` explicitly from static
         // methods; that name is always available below.
         // -------------------------------------------------------------------
+#if VMHOOK_HAS_DEDUCING_THIS
         auto get_field(this object_base const& self, char const* name)
             -> std::optional<vmhook::field_proxy>
         {
@@ -8706,12 +8719,28 @@ namespace vmhook
         {
             return self.object_base::get_method(name, signature);
         }
+#else
+        // Pre-C++23 fallback: forward via the inherited non-static overloads.
+        // Brought in with using-declarations.  These cover instance-context
+        // get_field("name") / get_method("name") on compilers that don't
+        // support deducing-this.  The same-name static overloads further
+        // below add the type_index-based static-field lookup; both are in
+        // scope, and overload resolution distinguishes them via the
+        // implicit object parameter.
+        using object_base::get_field;
+        using object_base::get_method;
+#endif
 
         // -------------------------------------------------------------------
-        // Static fallbacks.  Reachable on every compiler via the names
-        // `get_field` / `get_method` (MSVC, Clang) and via the explicit names
-        // `static_field` / `static_method` (universally portable).
+        // Static-context fallbacks for `get_field` / `get_method`.
+        //
+        // Only emitted when deducing-this is available; on older toolchains
+        // a same-name same-signature static overload would hide the inherited
+        // non-static brought in via the `using` directives above, which would
+        // break instance-context access.  On those compilers users still
+        // call `static_field` / `static_method` (always available below).
         // -------------------------------------------------------------------
+#if VMHOOK_HAS_DEDUCING_THIS
         static auto get_field(std::string_view name)
             -> std::optional<vmhook::field_proxy>
         {
@@ -8729,6 +8758,7 @@ namespace vmhook
         {
             return object_base::get_method(std::type_index{ typeid(derived) }, name, signature);
         }
+#endif
 
         /*
             @brief Explicit static field accessor.  Portable across compilers.

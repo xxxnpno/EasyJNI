@@ -42,21 +42,29 @@ jobs:
       - uses: seanmiddleditch/gha-setup-ninja@v5
 
       # ── Linux toolchains ────────────────────────────────────────────────
-      - name: Install GCC 13 (Linux)
+      # GCC 14+ and Clang 18+ ship the C++23 deducing-this feature that the
+      # header uses to make `get_field("name")` work in both static and
+      # instance contexts.  We pin those versions so CI matches the
+      # documented minimum.
+      - name: Install GCC 14 (Linux)
         if: matrix.os == 'ubuntu-latest' && matrix.cc == 'gcc'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-13 g++-13
-          echo "CC=gcc-13"  >> "$GITHUB_ENV"
-          echo "CXX=g++-13" >> "$GITHUB_ENV"
+          sudo apt-get install -y gcc-14 g++-14
+          echo "CC=gcc-14"  >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
 
-      - name: Install Clang 16 (Linux)
+      - name: Install Clang 18 (Linux)
         if: matrix.os == 'ubuntu-latest' && matrix.cc == 'clang'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-16 libstdc++-13-dev
-          echo "CC=clang-16"   >> "$GITHUB_ENV"
-          echo "CXX=clang++-16" >> "$GITHUB_ENV"
+          sudo apt-get install -y wget gnupg lsb-release software-properties-common
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          sudo add-apt-repository -y "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main"
+          sudo apt-get update
+          sudo apt-get install -y clang-18 libstdc++-14-dev
+          echo "CC=clang-18"   >> "$GITHUB_ENV"
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
 
       # ── macOS toolchain (system clang) ──────────────────────────────────
       - name: Pick Xcode (macOS)
@@ -461,15 +469,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: "linux / gcc",   os: ubuntu-latest, cxx: g++-13 }
-          - { label: "linux / clang", os: ubuntu-latest, cxx: clang++-16 }
+          - { label: "linux / gcc",   os: ubuntu-latest, cxx: g++-14 }
+          - { label: "linux / clang", os: ubuntu-latest, cxx: clang++-18 }
     steps:
       - uses: actions/checkout@v4
       - uses: seanmiddleditch/gha-setup-ninja@v5
-      - name: Install toolchain
+      - name: Install GCC 14 + libstdc++-14
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-13 g++-13 clang-16 libstdc++-13-dev
+          sudo apt-get install -y gcc-14 g++-14 libstdc++-14-dev
+      - name: Install Clang 18
+        if: contains(matrix.cxx, 'clang')
+        run: |
+          sudo apt-get install -y wget gnupg lsb-release software-properties-common
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          sudo add-apt-repository -y "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main"
+          sudo apt-get update
+          sudo apt-get install -y clang-18
       - name: Configure + build + test with -Werror
         env:
           CXX: ${{ matrix.cxx }}
@@ -490,4 +506,8 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
       - name: Build solution
         shell: cmd
-        run: msbuild vmhook.slnx /m /p:Configuration=Release /p:Platform=x64
+        # The vcxproj files default to PlatformToolset=v145 (the VS Insider
+        # build the project was developed against).  GitHub-hosted runners
+        # ship the stable v143 toolset; we override at MSBuild invocation
+        # time so the same vcxproj works in both environments.
+        run: msbuild vmhook.slnx /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0

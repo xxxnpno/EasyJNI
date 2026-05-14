@@ -4,43 +4,47 @@ cmake_minimum_required(VERSION 3.20)
 # regressions for each compiler/platform combo) or exercises pieces of the API
 # that work without a live HotSpot JVM (the os::* shims, type traits, etc.).
 
+# Helper to register a test executable with the common configuration.
+function(vmhook_add_test name)
+    set(options)
+    set(oneValueArgs)
+    set(multiValueArgs SOURCES)
+    cmake_parse_arguments(_t "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    add_executable("vmhook_test_${name}" ${_t_SOURCES})
+    target_link_libraries("vmhook_test_${name}" PRIVATE vmhook::vmhook)
+    vmhook_apply_warnings("vmhook_test_${name}")
+
+    # iOS / tvOS / watchOS / Android targets require an Xcode product
+    # bundle identifier on every binary they produce; CMake doesn't fill
+    # one in by default.  We synthesize a unique one per test target.
+    if(VMHOOK_PLATFORM_IOS OR APPLE)
+        set_target_properties("vmhook_test_${name}" PROPERTIES
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.vmhook.test.${name}")
+    endif()
+
+    add_test(NAME "${name}" COMMAND "vmhook_test_${name}")
+endfunction()
+
 # 1) Smoke-compile the header on its own (no JVM, no other includes).
-add_executable(vmhook_test_header_compile test_header_compile.cpp)
-target_link_libraries(vmhook_test_header_compile PRIVATE vmhook::vmhook)
-vmhook_apply_warnings(vmhook_test_header_compile)
-add_test(NAME header_compile COMMAND vmhook_test_header_compile)
+vmhook_add_test(header_compile SOURCES test_header_compile.cpp)
 
 # 2) Header included from two TUs to catch ODR / inline issues.
-add_executable(vmhook_test_odr test_odr_unit_a.cpp test_odr_unit_b.cpp)
-target_link_libraries(vmhook_test_odr PRIVATE vmhook::vmhook)
-vmhook_apply_warnings(vmhook_test_odr)
-add_test(NAME odr_two_translation_units COMMAND vmhook_test_odr)
+vmhook_add_test(odr_two_translation_units
+    SOURCES test_odr_unit_a.cpp test_odr_unit_b.cpp)
 
 # 3) Type-trait + concept compile-time checks (no JVM required).
-add_executable(vmhook_test_traits test_traits.cpp)
-target_link_libraries(vmhook_test_traits PRIVATE vmhook::vmhook)
-vmhook_apply_warnings(vmhook_test_traits)
-add_test(NAME traits_static_assertions COMMAND vmhook_test_traits)
+vmhook_add_test(traits_static_assertions SOURCES test_traits.cpp)
 
 # 4) OS abstraction layer — page/protect/allocate round-trip (no JVM required).
-add_executable(vmhook_test_os_layer test_os_layer.cpp)
-target_link_libraries(vmhook_test_os_layer PRIVATE vmhook::vmhook)
-vmhook_apply_warnings(vmhook_test_os_layer)
-add_test(NAME os_layer_roundtrip COMMAND vmhook_test_os_layer)
+vmhook_add_test(os_layer_roundtrip SOURCES test_os_layer.cpp)
 
 # 5) Static API surface — make sure register_class, hook<>, etc. are callable
 #    with the right signatures even when no JVM is present (they no-op).
-add_executable(vmhook_test_api_surface test_api_surface.cpp)
-target_link_libraries(vmhook_test_api_surface PRIVATE vmhook::vmhook)
-vmhook_apply_warnings(vmhook_test_api_surface)
-add_test(NAME api_surface_no_jvm COMMAND vmhook_test_api_surface)
+vmhook_add_test(api_surface_no_jvm SOURCES test_api_surface.cpp)
 
 # 6) Unified `get_field` / `get_method` call syntax across static + instance.
-#    MSVC + Clang resolve the deducing-this overloads correctly; GCC errors
-#    out in static contexts.  The test file uses #if to skip the static
-#    call sites on GCC so CI stays green everywhere while still catching
-#    a regression on MSVC / Clang.
-add_executable(vmhook_test_unified_call_syntax test_unified_call_syntax.cpp)
-target_link_libraries(vmhook_test_unified_call_syntax PRIVATE vmhook::vmhook)
-vmhook_apply_warnings(vmhook_test_unified_call_syntax)
-add_test(NAME unified_call_syntax COMMAND vmhook_test_unified_call_syntax)
+#    Toolchains with C++23 deducing-this resolve the overloads correctly in
+#    static context; the file is guarded by VMHOOK_HAS_DEDUCING_THIS so older
+#    Clang / GCC compile a reduced subset.
+vmhook_add_test(unified_call_syntax SOURCES test_unified_call_syntax.cpp)
