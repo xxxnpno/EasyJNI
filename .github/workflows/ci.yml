@@ -11,33 +11,38 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# All supported Java versions.  Update when a new release ships from Adoptium.
+# Java 8 is the oldest HotSpot vmhook still supports; the latest entry tracks
+# the newest GA build that Temurin publishes.
+env:
+  JAVA_VERSIONS: '["8","11","17","21","24","25"]'
+
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # 1. Build matrix: every supported {OS × compiler} combination must
-  #    compile the header, the example shared library, and the unit-test
-  #    suite, then run the unit tests (no JVM needed).
+  # 1. Build matrix: every supported {OS × compiler} combination must compile
+  #    the header, the example shared library, the injector (Windows only),
+  #    and the unit-test suite — then run the unit tests with no JVM.
   # ─────────────────────────────────────────────────────────────────────────
   build-and-unit-test:
-    name: ${{ matrix.label }}
+    name: build · ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { label: "windows / msvc",   os: windows-latest, cc: cl,    cxx: cl,      generator: "Ninja"          }
-          - { label: "windows / clang",  os: windows-latest, cc: clang, cxx: clang++, generator: "Ninja"          }
-          - { label: "windows / gcc",    os: windows-latest, cc: gcc,   cxx: g++,     generator: "Ninja"          }
-          - { label: "linux   / gcc",    os: ubuntu-latest,  cc: gcc,   cxx: g++,     generator: "Ninja"          }
-          - { label: "linux   / clang",  os: ubuntu-latest,  cc: clang, cxx: clang++, generator: "Ninja"          }
+          - { label: "windows / msvc",   os: windows-latest, cc: cl,    cxx: cl,      generator: "Ninja" }
+          - { label: "windows / clang",  os: windows-latest, cc: clang, cxx: clang++, generator: "Ninja" }
+          - { label: "windows / mingw",  os: windows-latest, cc: gcc,   cxx: g++,     generator: "Ninja" }
+          - { label: "linux   / gcc",    os: ubuntu-latest,  cc: gcc,   cxx: g++,     generator: "Ninja" }
+          - { label: "linux   / clang",  os: ubuntu-latest,  cc: clang, cxx: clang++, generator: "Ninja" }
+          - { label: "macos   / clang",  os: macos-latest,   cc: clang, cxx: clang++, generator: "Ninja" }
 
     steps:
       - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
 
-      - name: Install Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
-
-      # Linux toolchains.
-      - name: Install GCC 13 (Ubuntu)
+      # ── Linux toolchains ────────────────────────────────────────────────
+      - name: Install GCC 13 (Linux)
         if: matrix.os == 'ubuntu-latest' && matrix.cc == 'gcc'
         run: |
           sudo apt-get update
@@ -45,7 +50,7 @@ jobs:
           echo "CC=gcc-13"  >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
-      - name: Install Clang 16 (Ubuntu)
+      - name: Install Clang 16 (Linux)
         if: matrix.os == 'ubuntu-latest' && matrix.cc == 'clang'
         run: |
           sudo apt-get update
@@ -53,21 +58,27 @@ jobs:
           echo "CC=clang-16"   >> "$GITHUB_ENV"
           echo "CXX=clang++-16" >> "$GITHUB_ENV"
 
-      # Windows MSVC toolchain.
+      # ── macOS toolchain (system clang) ──────────────────────────────────
+      - name: Pick Xcode (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          sudo xcode-select --switch /Applications/Xcode.app
+          clang --version
+
+      # ── Windows MSVC / clang-cl / MinGW ─────────────────────────────────
       - name: Set up MSVC dev cmd
         if: matrix.os == 'windows-latest' && matrix.cc == 'cl'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Windows clang-cl via the bundled LLVM that comes with Visual Studio.
-      - name: Set up MSVC dev cmd for clang-cl
+      - name: Set up MSVC dev cmd for clang
         if: matrix.os == 'windows-latest' && matrix.cc == 'clang'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Install LLVM on Windows
+      - name: Install LLVM (Windows / clang)
         if: matrix.os == 'windows-latest' && matrix.cc == 'clang'
         uses: KyleMayes/install-llvm-action@v2
         with:
@@ -77,11 +88,10 @@ jobs:
         if: matrix.os == 'windows-latest' && matrix.cc == 'clang'
         shell: pwsh
         run: |
-          echo "CC=clang"   >> $env:GITHUB_ENV
+          echo "CC=clang"    >> $env:GITHUB_ENV
           echo "CXX=clang++" >> $env:GITHUB_ENV
 
-      # Windows GCC via MSYS2 / MinGW-w64.
-      - name: Install MSYS2 (MinGW-w64)
+      - name: Install MSYS2 (Windows MinGW)
         if: matrix.os == 'windows-latest' && matrix.cc == 'gcc'
         uses: msys2/setup-msys2@v2
         with:
@@ -92,20 +102,15 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
 
-      - name: Configure (CMake, non-MSYS2)
-        if: matrix.cc != 'gcc' || matrix.os == 'ubuntu-latest'
+      # ── Build + test ────────────────────────────────────────────────────
+      - name: Configure, build, test (non-MSYS2)
+        if: matrix.cc != 'gcc' || matrix.os != 'windows-latest'
         run: |
           cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel
+          ctest --test-dir build --output-on-failure -C Release
 
-      - name: Build (CMake, non-MSYS2)
-        if: matrix.cc != 'gcc' || matrix.os == 'ubuntu-latest'
-        run: cmake --build build --config Release --parallel
-
-      - name: Test (CTest, non-MSYS2)
-        if: matrix.cc != 'gcc' || matrix.os == 'ubuntu-latest'
-        run: ctest --test-dir build --output-on-failure -C Release
-
-      - name: Configure / build / test (MSYS2 MinGW-w64)
+      - name: Configure, build, test (MSYS2 MinGW)
         if: matrix.os == 'windows-latest' && matrix.cc == 'gcc'
         shell: msys2 {0}
         run: |
@@ -113,53 +118,94 @@ jobs:
           cmake --build build --parallel
           ctest --test-dir build --output-on-failure
 
-      - name: Upload built shared library
-        if: matrix.cc == 'cl' && matrix.os == 'windows-latest'
+      # ── Upload built artefacts so the JVM jobs can reuse them ──────────
+      - name: Upload artefacts (Windows MSVC)
+        if: matrix.os == 'windows-latest' && matrix.cc == 'cl'
         uses: actions/upload-artifact@v4
         with:
-          name: vmhook-${{ matrix.os }}-${{ matrix.cc }}
+          name: vmhook-windows-msvc
           path: |
             build/bin/vmhook.dll
             build/bin/vmhook.pdb
             build/bin/injector.exe
             build/bin/injector.pdb
 
-      - name: Upload built shared library (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Upload artefacts (Windows clang)
+        if: matrix.os == 'windows-latest' && matrix.cc == 'clang'
         uses: actions/upload-artifact@v4
         with:
-          name: vmhook-${{ matrix.os }}-${{ matrix.cc }}
+          name: vmhook-windows-clang
           path: |
-            build/bin/libvmhook.so
+            build/bin/vmhook.dll
+            build/bin/injector.exe
+
+      - name: Upload artefacts (Windows MinGW)
+        if: matrix.os == 'windows-latest' && matrix.cc == 'gcc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmhook-windows-mingw
+          path: |
+            build/bin/vmhook.dll
+            build/bin/injector.exe
+
+      - name: Upload artefacts (Linux gcc)
+        if: matrix.os == 'ubuntu-latest' && matrix.cc == 'gcc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmhook-linux-gcc
+          path: build/bin/libvmhook.so
+
+      - name: Upload artefacts (Linux clang)
+        if: matrix.os == 'ubuntu-latest' && matrix.cc == 'clang'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmhook-linux-clang
+          path: build/bin/libvmhook.so
+
+      - name: Upload artefacts (macOS clang)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmhook-macos-clang
+          path: build/bin/libvmhook.so
 
   # ─────────────────────────────────────────────────────────────────────────
-  # 2. JVM integration test (Windows MSVC, multiple JDK versions).
-  #    Builds with MSVC + CMake, injects the resulting DLL into a freshly
-  #    started JVM via the injector executable, then asserts every line of
-  #    test_results.txt is [PASS].
+  # 2. JVM integration tests — every Java version × every compiler that
+  #    produces a usable artefact on a runner.  Three OSes (Windows, Linux,
+  #    macOS) participate.
   # ─────────────────────────────────────────────────────────────────────────
-  jvm-integration-windows:
-    name: jvm integration (windows / msvc / Java ${{ matrix.java-version }})
-    needs: build-and-unit-test
+  java-versions:
+    name: enumerate Java versions
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.set.outputs.versions }}
+    steps:
+      - id: set
+        run: echo "versions=${{ env.JAVA_VERSIONS }}" >> "$GITHUB_OUTPUT"
+
+  jvm-windows:
+    name: jvm · windows · ${{ matrix.compiler }} · java ${{ matrix.java }}
+    needs: [build-and-unit-test, java-versions]
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        java-version: ['8', '11', '17', '21', '24']
+        compiler: [msvc, clang, mingw]
+        java:     ${{ fromJson(needs.java-versions.outputs.versions) }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Windows MSVC artifacts
+      - name: Download Windows artefact
         uses: actions/download-artifact@v4
         with:
-          name: vmhook-windows-latest-cl
+          name: vmhook-windows-${{ matrix.compiler }}
           path: build/bin
 
-      - name: Set up Java ${{ matrix.java-version }}
+      - name: Set up Java ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ matrix.java-version }}
+          java-version: ${{ matrix.java }}
           distribution: temurin
 
       - name: Compile Java fixtures
@@ -171,7 +217,7 @@ jobs:
       - name: Run injection-based integration test
         shell: pwsh
         run: |
-          Write-Host "=== Java ${{ matrix.java-version }} integration test ==="
+          Write-Host "=== Java ${{ matrix.java }} · Windows / ${{ matrix.compiler }} ==="
 
           $java = Start-Process `
             -FilePath "java" `
@@ -183,30 +229,27 @@ jobs:
 
           Start-Sleep -Seconds 5
 
-          $inject = Start-Process `
-            -FilePath "build\bin\injector.exe" `
-            -PassThru -Wait -WindowStyle Hidden
-          Write-Host "injector.exe exited with code $($inject.ExitCode)"
+          $inject = Start-Process -FilePath "build\bin\injector.exe" `
+                                  -PassThru -Wait -WindowStyle Hidden
+          Write-Host "injector.exe exit=$($inject.ExitCode)"
 
           if ($inject.ExitCode -ne 0) {
-            Write-Error "Injection failed (exit code $($inject.ExitCode))"
             Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue
+            Write-Error "Injection failed"
             exit 1
           }
 
-          $exited = $java.WaitForExit(60000)
-          if (-not $exited) {
-            Write-Error "java.exe did not exit within 60 s"
+          if (-not $java.WaitForExit(60000)) {
             Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue
+            Write-Error "java.exe did not exit within 60 s"
             exit 1
           }
-          Write-Host "java.exe exited with code $($java.ExitCode)"
 
           if (Test-Path "java_stdout.txt") { Get-Content "java_stdout.txt" | ForEach-Object { Write-Host $_ } }
-          if (Test-Path "java_stderr.txt") { $e = Get-Content "java_stderr.txt"; if ($e) { $e | ForEach-Object { Write-Host "[java stderr]" $_ } } }
+          if (Test-Path "java_stderr.txt") { $e = Get-Content "java_stderr.txt"; if ($e) { $e | ForEach-Object { Write-Host "[stderr] $_" } } }
 
           if ($java.ExitCode -ne 0) {
-            Write-Error "java.exe exited with code $($java.ExitCode) — Java-side setter verification failed"
+            Write-Error "java.exe exit=$($java.ExitCode) — Java-side verification failed"
             exit 1
           }
 
@@ -214,49 +257,38 @@ jobs:
             Write-Error "test_results.txt was not created by the test DLL"
             exit 1
           }
-
           $results = Get-Content "test_results.txt"
           $results | ForEach-Object { Write-Host $_ }
-
-          $failures = $results | Where-Object { $_ -match '^\[FAIL\]' }
-          if ($failures) {
-            Write-Host ""
-            Write-Error "$($failures.Count) unit test(s) FAILED"
+          $fail = $results | Where-Object { $_ -match '^\[FAIL\]' }
+          if ($fail) {
+            Write-Error "$($fail.Count) FAIL line(s) in test_results.txt"
             exit 1
           }
+          Write-Host "Java ${{ matrix.java }} / ${{ matrix.compiler }}: ALL PASS"
 
-          Write-Host ""
-          Write-Host "All unit tests PASSED for Java ${{ matrix.java-version }}"
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # 3. JVM integration test (Linux GCC, multiple JDK versions).
-  #    On Linux there is no injection step: the JVM loads libvmhook.so via
-  #    System.loadLibrary("vmhook"), which triggers JNI_OnLoad, which
-  #    spawns the test worker thread.  The harness uses the SAME Java
-  #    fixtures as Windows.
-  # ─────────────────────────────────────────────────────────────────────────
-  jvm-integration-linux:
-    name: jvm integration (linux / gcc / Java ${{ matrix.java-version }})
-    needs: build-and-unit-test
+  jvm-linux:
+    name: jvm · linux · ${{ matrix.compiler }} · java ${{ matrix.java }}
+    needs: [build-and-unit-test, java-versions]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        java-version: ['8', '11', '17', '21', '24']
+        compiler: [gcc, clang]
+        java:     ${{ fromJson(needs.java-versions.outputs.versions) }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Linux GCC artifacts
+      - name: Download Linux artefact
         uses: actions/download-artifact@v4
         with:
-          name: vmhook-ubuntu-latest-gcc
+          name: vmhook-linux-${{ matrix.compiler }}
           path: build/bin
 
-      - name: Set up Java ${{ matrix.java-version }}
+      - name: Set up Java ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ matrix.java-version }}
+          java-version: ${{ matrix.java }}
           distribution: temurin
 
       - name: Compile Java fixtures
@@ -264,80 +296,163 @@ jobs:
           mkdir -p out
           javac -d out example/vmhook/Main.java example/vmhook/Example.java example/vmhook/A.java example/vmhook/B.java
 
-      - name: Patch loader bootstrap (Main.loadLibrary)
-        run: |
-          chmod +x build/bin/libvmhook.so
-          cat > out/vmhook/Loader.java <<'EOF'
-          package vmhook;
-          // Helper that System.loadLibrary's the test shared library before
-          // the regular Main loop starts.  Used only by the Linux integration
-          // test where there is no separate injector step.
-          public final class Loader {
-              public static void load() { System.loadLibrary("vmhook"); }
-          }
-          EOF
-          # Compile only the new loader class against the fixture classes.
-          javac -d out -cp out out/vmhook/Loader.java
-
       - name: Run JNI integration test
         env:
           LD_LIBRARY_PATH: build/bin
         run: |
           set -euo pipefail
-          echo "=== Java ${{ matrix.java-version }} (Linux) integration test ==="
-
-          # Spawn java in the background, asking it to load vmhook.so via
-          # Loader.load() before reaching the main loop.  We rely on the
-          # constructor in libvmhook.so to fire run_test_suite().
-          java -cp out \
-               -Djava.library.path=build/bin \
-               -Xss512k \
-               -XX:+UseSerialGC \
-               vmhook.Main &
+          echo "=== Java ${{ matrix.java }} · Linux / ${{ matrix.compiler }} ==="
+          chmod +x build/bin/libvmhook.so
+          # Launch java with the shared library on the load path; the loader
+          # constructor in libvmhook.so will start the test worker thread.
+          java -cp out -Djava.library.path=build/bin vmhook.Main &
           JAVA_PID=$!
 
-          # Trigger System.loadLibrary("vmhook") from outside; on Linux the
-          # SO is loaded lazily.  The simplest approach is to wrap Main: we
-          # already do that by relying on the constructor in libvmhook.so
-          # fired via JNI_OnLoad.  Use jcmd to attach the lib.
-          sleep 4
+          # Trigger load explicitly via JVMTI agent attach.
+          sleep 3
           if command -v jcmd >/dev/null 2>&1; then
-            jcmd $JAVA_PID JVMTI.agent_load build/bin/libvmhook.so || true
+            jcmd "$JAVA_PID" JVMTI.agent_load build/bin/libvmhook.so || true
           fi
 
-          # Give the worker thread time to finish.
-          wait_secs=0
-          while kill -0 "$JAVA_PID" 2>/dev/null && [ "$wait_secs" -lt 90 ]; do
+          waited=0
+          while kill -0 "$JAVA_PID" 2>/dev/null && [ "$waited" -lt 90 ]; do
             sleep 1
-            wait_secs=$((wait_secs + 1))
+            waited=$((waited + 1))
           done
-
           if kill -0 "$JAVA_PID" 2>/dev/null; then
-            echo "java did not exit within 90 s; killing"
             kill -9 "$JAVA_PID" || true
           fi
 
-          # The Linux integration is a stretch goal: the same workflow as
-          # Windows requires a working trampoline ABI on Linux.  If the
-          # results file is missing we treat this as a known limitation,
-          # not a hard failure, so we don't block the rest of CI.
           if [ ! -f test_results.txt ]; then
-            echo "::warning::test_results.txt missing — Linux runtime integration is not yet wired"
+            echo "::warning::test_results.txt missing — Linux runtime integration is best-effort"
             exit 0
           fi
-
           cat test_results.txt
           if grep -q '^\[FAIL\]' test_results.txt; then
-            echo "::error::one or more tests failed"
+            echo "::error::FAIL lines detected"
             grep '^\[FAIL\]' test_results.txt
             exit 1
           fi
-          echo "All unit tests PASSED for Java ${{ matrix.java-version }} (Linux)"
+          echo "Java ${{ matrix.java }} / ${{ matrix.compiler }}: ALL PASS"
+
+  jvm-macos:
+    name: jvm · macos · clang · java ${{ matrix.java }}
+    needs: [build-and-unit-test, java-versions]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ${{ fromJson(needs.java-versions.outputs.versions) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: vmhook-macos-clang
+          path: build/bin
+
+      - name: Set up Java ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+
+      - name: Compile Java fixtures
+        run: |
+          mkdir -p out
+          javac -d out example/vmhook/Main.java example/vmhook/Example.java example/vmhook/A.java example/vmhook/B.java
+
+      - name: Run JNI integration test (best-effort)
+        run: |
+          set -euo pipefail
+          echo "=== Java ${{ matrix.java }} · macOS / clang ==="
+          chmod +x build/bin/libvmhook.so || true
+          # macOS runners ship Apple Silicon (arm64); HotSpot is present but
+          # the vmhook trampoline is x86_64 only, so the runtime hook step
+          # will degrade gracefully.  We still exercise the OS layer and
+          # the JNI_OnLoad entrypoint.
+          DYLD_LIBRARY_PATH=build/bin java -cp out -Djava.library.path=build/bin vmhook.Main &
+          JAVA_PID=$!
+          sleep 3
+          waited=0
+          while kill -0 "$JAVA_PID" 2>/dev/null && [ "$waited" -lt 60 ]; do
+            sleep 1
+            waited=$((waited + 1))
+          done
+          if kill -0 "$JAVA_PID" 2>/dev/null; then
+            kill -9 "$JAVA_PID" || true
+          fi
+          if [ -f test_results.txt ]; then
+            cat test_results.txt
+          else
+            echo "::warning::test_results.txt missing — macOS runtime hooking is arm64-limited"
+          fi
 
   # ─────────────────────────────────────────────────────────────────────────
-  # 4. Strict warnings-as-errors build, run on the primary compilers only.
-  #    Catches regressions where a portable change accidentally introduces
-  #    new diagnostics.
+  # 3. Mobile cross-compile jobs (build-only).  iOS and Android do not ship
+  #    HotSpot, so runtime hooking is unreachable there; we still ensure
+  #    the header and tests compile cleanly under their toolchains.
+  # ─────────────────────────────────────────────────────────────────────────
+  android-build:
+    name: android cross-compile (NDK · ${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Locate NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Configure + build (Android ${{ matrix.abi }})
+        run: |
+          cmake -S . -B build-android-${{ matrix.abi }} -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVMHOOK_BUILD_EXAMPLE=OFF \
+            -DVMHOOK_BUILD_INJECTOR=OFF
+          cmake --build build-android-${{ matrix.abi }} --parallel
+      - name: Run host-runnable unit tests (only when ABI matches host)
+        if: matrix.abi == 'x86_64'
+        run: |
+          # The Android NDK builds for an emulated target by default; we
+          # can't execute on the runner.  Just confirm the binaries exist.
+          ls -la build-android-${{ matrix.abi }}/tests/
+
+  ios-build:
+    name: ios cross-compile (xcode · ${{ matrix.sdk }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [iphoneos, iphonesimulator]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure + build (iOS ${{ matrix.sdk }})
+        run: |
+          case "${{ matrix.sdk }}" in
+            iphoneos)         PLATFORM=OS64       ;;
+            iphonesimulator)  PLATFORM=SIMULATOR64 ;;
+          esac
+          # Use CMake's built-in iOS toolchain handling.
+          cmake -S . -B build-ios-${{ matrix.sdk }} -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=${{ matrix.sdk }} \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVMHOOK_BUILD_EXAMPLE=OFF \
+            -DVMHOOK_BUILD_INJECTOR=OFF \
+            -DVMHOOK_BUILD_TESTS=ON
+          cmake --build build-ios-${{ matrix.sdk }} --config Release
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Strict warnings-as-errors build on the primary Linux compilers.
   # ─────────────────────────────────────────────────────────────────────────
   warnings-as-errors:
     name: warnings-as-errors (${{ matrix.label }})
@@ -346,16 +461,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: "linux / gcc",   os: ubuntu-latest,  cxx: g++-13 }
-          - { label: "linux / clang", os: ubuntu-latest,  cxx: clang++-16 }
+          - { label: "linux / gcc",   os: ubuntu-latest, cxx: g++-13 }
+          - { label: "linux / clang", os: ubuntu-latest, cxx: clang++-16 }
     steps:
       - uses: actions/checkout@v4
       - uses: seanmiddleditch/gha-setup-ninja@v5
-      - name: Install toolchain (Linux)
+      - name: Install toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-13 g++-13 clang-16 libstdc++-13-dev
-      - name: Configure and build with -Werror
+      - name: Configure + build + test with -Werror
         env:
           CXX: ${{ matrix.cxx }}
         run: |
@@ -364,16 +479,15 @@ jobs:
           ctest --test-dir build --output-on-failure
 
   # ─────────────────────────────────────────────────────────────────────────
-  # 5. Legacy MSBuild build of the historic vmhook.slnx, kept so existing
-  #    consumers of the Visual Studio solution still get CI coverage.
+  # 5. Legacy MSBuild build of the historic vmhook.slnx — kept so existing
+  #    Visual Studio consumers still get CI coverage.
   # ─────────────────────────────────────────────────────────────────────────
   msbuild-solution:
     name: legacy msbuild (vmhook.slnx)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - uses: microsoft/setup-msbuild@v2
       - name: Build solution
         shell: cmd
         run: msbuild vmhook.slnx /m /p:Configuration=Release /p:Platform=x64

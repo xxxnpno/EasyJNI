@@ -82,22 +82,90 @@
 
 // ---------------------------------------------------------------------------
 // Platform / compiler detection
+//
+// Five OS macros are exposed.  Exactly one is set to 1; the others are 0.
+// Two convenience aggregates are also defined:
+//
+//   VMHOOK_OS_POSIX   = Linux | macOS | iOS | Android  (true POSIX backends)
+//   VMHOOK_OS_APPLE   = macOS | iOS
+//
+// The header is callable (and the standalone unit tests run) on every
+// platform listed here.  Runtime functionality (HotSpot interpreter
+// hooking, gHotSpotVMStructs lookup) requires a HotSpot JVM in-process;
+// that exists on Windows / Linux / macOS desktop JDKs but not on iOS or
+// Android, where the platform VMs (Apple's restricted no-JIT environment
+// and Android's ART) replace HotSpot.  See README / CONTRIBUTING for the
+// platform-capability matrix.
 // ---------------------------------------------------------------------------
 
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(__ANDROID__)
+    #define VMHOOK_OS_WINDOWS 0
+    #define VMHOOK_OS_LINUX   0
+    #define VMHOOK_OS_MACOS   0
+    #define VMHOOK_OS_IOS     0
+    #define VMHOOK_OS_ANDROID 1
+#elif defined(_WIN32) || defined(_WIN64)
     #define VMHOOK_OS_WINDOWS 1
     #define VMHOOK_OS_LINUX   0
+    #define VMHOOK_OS_MACOS   0
+    #define VMHOOK_OS_IOS     0
+    #define VMHOOK_OS_ANDROID 0
+#elif defined(__APPLE__)
+    #include <TargetConditionals.h>
+    #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        #define VMHOOK_OS_WINDOWS 0
+        #define VMHOOK_OS_LINUX   0
+        #define VMHOOK_OS_MACOS   0
+        #define VMHOOK_OS_IOS     1
+        #define VMHOOK_OS_ANDROID 0
+    #else
+        #define VMHOOK_OS_WINDOWS 0
+        #define VMHOOK_OS_LINUX   0
+        #define VMHOOK_OS_MACOS   1
+        #define VMHOOK_OS_IOS     0
+        #define VMHOOK_OS_ANDROID 0
+    #endif
 #elif defined(__linux__)
     #define VMHOOK_OS_WINDOWS 0
     #define VMHOOK_OS_LINUX   1
+    #define VMHOOK_OS_MACOS   0
+    #define VMHOOK_OS_IOS     0
+    #define VMHOOK_OS_ANDROID 0
 #else
     #define VMHOOK_OS_WINDOWS 0
     #define VMHOOK_OS_LINUX   0
-    #error "vmhook currently supports Windows or Linux on x86_64."
+    #define VMHOOK_OS_MACOS   0
+    #define VMHOOK_OS_IOS     0
+    #define VMHOOK_OS_ANDROID 0
+    #error "vmhook supports Windows, Linux, macOS, iOS, or Android (x86_64 / arm64)."
 #endif
 
-#if !defined(__x86_64__) && !defined(_M_X64)
-    #error "vmhook currently supports x86_64 only (HotSpot interpreter assumes x64)."
+#define VMHOOK_OS_POSIX (VMHOOK_OS_LINUX | VMHOOK_OS_MACOS | VMHOOK_OS_IOS | VMHOOK_OS_ANDROID)
+#define VMHOOK_OS_APPLE (VMHOOK_OS_MACOS | VMHOOK_OS_IOS)
+
+#if defined(__x86_64__) || defined(_M_X64)
+    #define VMHOOK_ARCH_X86_64 1
+    #define VMHOOK_ARCH_ARM64  0
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #define VMHOOK_ARCH_X86_64 0
+    #define VMHOOK_ARCH_ARM64  1
+#else
+    #define VMHOOK_ARCH_X86_64 0
+    #define VMHOOK_ARCH_ARM64  0
+    #error "vmhook supports x86_64 or arm64 only."
+#endif
+
+// HotSpot runtime hooking is x86_64-only: the trampoline emits Microsoft
+// x64 / System V AMD64 bytes and walks the HotSpot interpreter frame
+// layout, which differs on arm64.  On arm64 hosts the header still
+// compiles and the OS layer is fully functional, but `vmhook::hook<T>`
+// returns false at runtime.  Set VMHOOK_RUNTIME_HOOKING_AVAILABLE to 0
+// in that build configuration so consumers can gate their use of the
+// runtime API.
+#if VMHOOK_ARCH_X86_64 && !VMHOOK_OS_IOS
+    #define VMHOOK_RUNTIME_HOOKING_AVAILABLE 1
+#else
+    #define VMHOOK_RUNTIME_HOOKING_AVAILABLE 0
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -144,15 +212,24 @@
         #define NOMINMAX
     #endif
     #include <windows.h>
-#else
-    #include <dlfcn.h>
-    #include <sys/mman.h>
-    #include <sys/syscall.h>
-    #include <sys/uio.h>
-    #include <unistd.h>
+#elif VMHOOK_OS_POSIX
     #include <cerrno>
     #include <csignal>
-    #include <fstream>
+    #include <cstdio>
+    #include <dlfcn.h>
+    #include <fcntl.h>
+    #include <sys/mman.h>
+    #include <unistd.h>
+    #if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
+        // Linux-and-Android-only helpers we use for fast safe memory reads.
+        #include <sys/syscall.h>
+        #include <sys/uio.h>
+    #endif
+    #if VMHOOK_OS_APPLE
+        #include <mach/mach.h>
+        #include <mach/vm_map.h>
+        #include <pthread.h>
+    #endif
 #endif
 
 #ifndef VMHOOK_DEBUG_LOGS
@@ -358,15 +435,26 @@ namespace vmhook
         /*
             @brief Locates the JVM runtime shared library currently loaded.
             @details
-            Tries the platform-specific candidate names (jvm.dll on Windows,
-            libjvm.so on Linux) until one resolves to a non-null module.
+            Tries the platform-specific candidate names until one resolves to
+            a non-null module.  On Android and iOS this normally returns
+            nullptr because those platforms ship their own VM (ART /
+            JavaScriptCore-derived) rather than a HotSpot libjvm; the
+            higher-level vmhook APIs degrade gracefully in that case.
         */
         inline auto find_jvm_module() noexcept -> module_handle
         {
 #if VMHOOK_OS_WINDOWS
             static const char* const candidates[]{ "jvm.dll" };
-#else
+#elif VMHOOK_OS_MACOS
+            static const char* const candidates[]{
+                "libjvm.dylib",
+                "@rpath/libjvm.dylib",
+                "libjvm.so",
+            };
+#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
             static const char* const candidates[]{ "libjvm.so", "libjvm.so.0" };
+#else
+            static const char* const candidates[]{ "libjvm.dylib", "libjvm.so" };
 #endif
             for (const char* name : candidates)
             {
@@ -396,13 +484,23 @@ namespace vmhook
 
         /*
             @brief Returns the OS-level identifier of the calling thread.
+            @details
+            Win32 thread ID on Windows, kernel TID (gettid) on Linux/Android,
+            mach thread port number on Apple platforms.  The value space
+            differs per platform; the type is uint64_t so all of them fit.
         */
         inline auto current_thread_id() noexcept -> thread_id_t
         {
 #if VMHOOK_OS_WINDOWS
             return ::GetCurrentThreadId();
-#else
+#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
             return static_cast<thread_id_t>(::syscall(SYS_gettid));
+#elif VMHOOK_OS_APPLE
+            std::uint64_t tid{ 0 };
+            ::pthread_threadid_np(nullptr, &tid);
+            return static_cast<thread_id_t>(tid);
+#else
+            return 0;
 #endif
         }
 
@@ -545,8 +643,34 @@ namespace vmhook
                                        | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
             info.guarded = (prot & PAGE_GUARD) != 0;
             return info;
+#elif VMHOOK_OS_APPLE
+            // Use mach_vm_region to walk the task's memory map.  Apple has no
+            // /proc filesystem; mach_vm_region is the supported API.
+            vm_address_t region_addr{ reinterpret_cast<vm_address_t>(address) };
+            vm_size_t    region_size{ 0 };
+            vm_region_basic_info_data_64_t mach_info{};
+            mach_msg_type_number_t info_count{ VM_REGION_BASIC_INFO_COUNT_64 };
+            mach_port_t object_name{};
+            const kern_return_t rc{
+                ::mach_vm_region(::mach_task_self(),
+                                 reinterpret_cast<mach_vm_address_t*>(&region_addr),
+                                 reinterpret_cast<mach_vm_size_t*>(&region_size),
+                                 VM_REGION_BASIC_INFO_64,
+                                 reinterpret_cast<vm_region_info_t>(&mach_info),
+                                 &info_count,
+                                 &object_name) };
+            if (rc != KERN_SUCCESS)
+            {
+                return info;
+            }
+            info.base = reinterpret_cast<void*>(region_addr);
+            info.size = static_cast<std::size_t>(region_size);
+            info.committed = true;
+            info.readable  = (mach_info.protection & VM_PROT_READ)    != 0;
+            info.executable= (mach_info.protection & VM_PROT_EXECUTE) != 0;
+            return info;
 #else
-            // Parse /proc/self/maps to find the region containing the address.
+            // Linux and Android both expose /proc/self/maps.
             const std::uintptr_t target{ reinterpret_cast<std::uintptr_t>(address) };
             std::ifstream maps{ "/proc/self/maps" };
             std::string line;
@@ -568,7 +692,6 @@ namespace vmhook
                 }
                 if (target < begin)
                 {
-                    // Address is in a free hole between prev_end and begin.
                     info.base = reinterpret_cast<void*>(prev_end);
                     info.size = static_cast<std::size_t>(begin - prev_end);
                     info.free = true;
@@ -592,11 +715,13 @@ namespace vmhook
 #endif
         }
 
-#if !VMHOOK_OS_WINDOWS
+#if VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
         namespace detail_signal
         {
             // Thread-local jmp-buf machinery to recover from SIGSEGV during
-            // safe pointer probing on POSIX systems.
+            // the safe_read sigsetjmp fallback on Linux / Android.  macOS
+            // and iOS use mach_vm_read_overwrite so the signal machinery
+            // is not needed there; Windows uses ReadProcessMemory.
             struct probe_state
             {
                 bool          active{ false };
@@ -638,10 +763,12 @@ namespace vmhook
         /*
             @brief Reads `size` bytes from `src` into `dst` without faulting on bad pointers.
             @details
-            On Windows uses ReadProcessMemory on the current process so the kernel
-            performs the read with a fault-safe path.  On Linux uses process_vm_readv
-            with /proc/self/mem (zero-copy) and falls back to a SIGSEGV-catching
-            sigsetjmp protected read.  Returns true on success.
+            On Windows uses ReadProcessMemory on the current process so the
+            kernel performs the read with a fault-safe path.  On Linux /
+            Android uses process_vm_readv (zero-copy) and falls back to a
+            SIGSEGV-catching sigsetjmp probed read.  On macOS / iOS uses
+            mach_vm_read_overwrite which kernel-validates the source.
+            Returns true on success.
         */
         inline auto safe_read(void* dst, const void* src, std::size_t size) noexcept -> bool
         {
@@ -654,7 +781,16 @@ namespace vmhook
             const BOOL ok{ ::ReadProcessMemory(::GetCurrentProcess(), src, dst,
                                                size, &transferred) };
             return ok && transferred == size;
-#else
+#elif VMHOOK_OS_APPLE
+            mach_vm_size_t transferred{ 0 };
+            const kern_return_t rc{ ::mach_vm_read_overwrite(
+                ::mach_task_self(),
+                reinterpret_cast<mach_vm_address_t>(src),
+                static_cast<mach_vm_size_t>(size),
+                reinterpret_cast<mach_vm_address_t>(dst),
+                &transferred) };
+            return rc == KERN_SUCCESS && transferred == size;
+#elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
             iovec local{ dst, size };
             iovec remote{ const_cast<void*>(src), size };
             const ssize_t n{ ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) };
@@ -678,6 +814,9 @@ namespace vmhook
             }
             detail_signal::active_state = nullptr;
             return success && !state.fault;
+#else
+            (void)dst; (void)src; (void)size;
+            return false;
 #endif
         }
 
@@ -692,9 +831,12 @@ namespace vmhook
             }
 #if VMHOOK_OS_WINDOWS
             ::FlushInstructionCache(::GetCurrentProcess(), address, size);
-#else
+#elif defined(__GNUC__) || defined(__clang__)
             __builtin___clear_cache(static_cast<char*>(address),
                                     static_cast<char*>(address) + size);
+#else
+            (void)address;
+            (void)size;
 #endif
         }
     } // namespace os
@@ -4249,6 +4391,15 @@ namespace vmhook
                 , allocated_size{ 0 }
                 , error{ true }
             {
+#if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
+                // The trampoline emits Windows/SysV x64 bytes and depends on
+                // the HotSpot interpreter frame layout for that ABI.  arm64
+                // and iOS (no JIT, no HotSpot) cannot use this path; leave
+                // the hook in its error state so callers see a clean false.
+                (void)target;
+                (void)detour;
+                return;
+#else
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
                 static constexpr std::int32_t JMP_SIZE{ 5 };
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
@@ -4461,6 +4612,7 @@ namespace vmhook
                 vmhook::os::flush_instruction_cache(this->allocated, total_size);
 
                 this->error = false;
+#endif  // VMHOOK_RUNTIME_HOOKING_AVAILABLE
             }
 
             /*

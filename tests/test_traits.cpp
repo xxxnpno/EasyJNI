@@ -20,17 +20,23 @@ static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>,
 static_assert(!vmhook::detail::is_unique_ptr_v<int*>,
               "is_unique_ptr_v must reject raw pointers");
 
-// Platform-detection sanity.
-#if VMHOOK_OS_WINDOWS
-static_assert(VMHOOK_OS_LINUX == 0, "exactly one OS macro should be 1");
-#elif VMHOOK_OS_LINUX
-static_assert(VMHOOK_OS_WINDOWS == 0, "exactly one OS macro should be 1");
-#else
-static_assert(false, "vmhook should detect Windows or Linux");
+// Platform-detection sanity.  Exactly one OS macro must be 1.
+#if (VMHOOK_OS_WINDOWS + VMHOOK_OS_LINUX + VMHOOK_OS_MACOS \
+   + VMHOOK_OS_IOS    + VMHOOK_OS_ANDROID) != 1
+#  error "exactly one VMHOOK_OS_* macro should be 1"
+#endif
+
+// VMHOOK_OS_POSIX is the OR of all POSIX-flavored backends.
+#if VMHOOK_OS_WINDOWS && VMHOOK_OS_POSIX
+#  error "POSIX detection is inconsistent with Windows detection"
 #endif
 
 #if VMHOOK_COMPILER_MSVC + VMHOOK_COMPILER_GCC + VMHOOK_COMPILER_CLANG != 1
 #  error "exactly one compiler macro should be 1"
+#endif
+
+#if (VMHOOK_ARCH_X86_64 + VMHOOK_ARCH_ARM64) != 1
+#  error "exactly one arch macro should be 1"
 #endif
 
 int main()

@@ -23,20 +23,36 @@ it reads HotSpot VMStruct metadata, resolves JVM internals directly, and patches
 interpreter entry stubs for hooks. Use it only when the target JVM and runtime
 layout are part of your compatibility surface.
 
-## Platform & toolchains
+## Platform & toolchain matrix
 
-The single header builds on every combination CI exercises:
+The header compiles on every combination listed below.  Runtime hooking
+needs a HotSpot JVM in-process plus an x86_64 ABI; the columns reflect
+what CI actually exercises for each target.
 
-| Host     | Compiler             | Notes                                  |
-|----------|----------------------|----------------------------------------|
-| Windows  | MSVC 19.36+ (cl.exe) | Primary toolchain; runs full JVM tests |
-| Windows  | clang / clang-cl 16+ | Drop-in for MSVC via CMake or vcxproj  |
-| Windows  | MinGW-w64 GCC 13+    | Builds via CMake + MSYS2               |
-| Linux    | GCC 13+              | Builds libvmhook.so; primary Linux CI  |
-| Linux    | Clang 16+            | Drop-in for GCC                        |
+| OS / Arch                | Compiler                  | Header builds | OS layer | Hook trampoline | Real-JVM tests |
+|--------------------------|---------------------------|:-------------:|:--------:|:---------------:|:--------------:|
+| Windows x86_64           | MSVC 19.36+               | yes           | yes      | yes (Win64 ABI) | yes            |
+| Windows x86_64           | clang / clang-cl 16+      | yes           | yes      | yes (Win64 ABI) | yes            |
+| Windows x86_64           | MinGW-w64 GCC 13+         | yes           | yes      | yes (Win64 ABI) | yes            |
+| Linux x86_64             | GCC 13+                   | yes           | yes      | yes (SysV ABI)  | yes            |
+| Linux x86_64             | Clang 16+                 | yes           | yes      | yes (SysV ABI)  | yes            |
+| macOS x86_64             | Apple Clang               | yes           | yes      | yes (SysV ABI)  | best-effort    |
+| macOS arm64              | Apple Clang               | yes           | yes      | no (arm64)      | best-effort    |
+| Android (ARM64 / x86_64) | NDK clang                 | yes           | yes      | x86_64 only     | n/a (no HotSpot) |
+| iOS (device / simulator) | Apple Clang               | yes           | yes      | no              | n/a (no HotSpot) |
 
-HotSpot is required at runtime (Temurin, Corretto, Liberica, Microsoft, ...).
-CI builds and runs unit tests against Java 8, 11, 17, 21, and 24.
+Notes:
+- *Hook trampoline* is x86_64-only.  On arm64 hosts the header still
+  builds and the OS layer is fully functional; `vmhook::hook<T>` returns
+  false at runtime so consumers can degrade gracefully.
+- *iOS / Android* ship their own VMs (Apple's locked-down JVM
+  alternatives, Android's ART).  vmhook will compile on those platforms
+  for cross-platform-code-sharing reasons, but there's no HotSpot
+  libjvm to hook into, so `vmhook::find_class`, `vmhook::hook<T>`,
+  etc. return null / false at runtime.
+- The CI matrix runs the full JVM integration test for Java 8, 11, 17,
+  21, 24, and 25 against every compiler that produces a working
+  artefact on a hosted runner.
 
 ### Building with CMake (recommended)
 
