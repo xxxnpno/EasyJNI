@@ -139,10 +139,15 @@ auto register_sdk()
 
 ## Fields
 
-Instance fields use `get_field(name)`.  Static fields use `static_field(name)`.
-The two names exist so the call is unambiguous on every compiler  using a
-single overloaded name worked on MSVC but produced different overload-resolution
-results on GCC / Clang.
+Instance field access is `get_field("name")`.  Static field access has two
+forms depending on the compiler you target:
+
+- On **MSVC** and **Clang**, `get_field("name")` resolves correctly in both
+  instance and static contexts: the C++23 deducing-this overload is excluded
+  from static-call overload resolution, so the static fallback wins.
+- On **GCC** the deducing-this overload is still considered viable in a
+  static-call context and produces a compile error.  Call `static_field("name")`
+  from static methods to stay portable across all three compilers.
 
 ```cpp
 class example : public vmhook::object<example>
@@ -153,7 +158,7 @@ public:
     {
     }
 
-    // Instance field accessor: uses the live OOP held by this wrapper.
+    // Instance field accessor — works on every compiler.
     auto get_name() const
         -> std::string
     {
@@ -166,7 +171,10 @@ public:
         this->get_field("score")->set(value);
     }
 
-    // Static field accessor: resolves the Java class via typeid(example).
+    // Static field accessor — pick one:
+    //
+    //   static_field("...")           portable: MSVC, Clang, GCC
+    //   get_field("...")              MSVC and Clang only
     static auto get_total_count()
         -> std::int32_t
     {
@@ -181,8 +189,9 @@ references as `std::unique_ptr<wrapper_type>`.
 
 ## Methods
 
-Instance method calls use `get_method(name)->call(args...)`.  Static method
-calls use `static_method(name)->call(args...)`.
+Same pattern as fields.  `get_method("name")->call(args...)` works for
+instance access on every compiler.  Static access is `static_method(...)` for
+portable code (or `get_method(...)` on MSVC / Clang).
 
 ```cpp
 // Instance:
@@ -198,7 +207,7 @@ auto compute(std::int32_t value) const
     return this->get_method("compute")->call(value);
 }
 
-// Static:
+// Static (portable):
 static auto reset_global_state()
     -> void
 {

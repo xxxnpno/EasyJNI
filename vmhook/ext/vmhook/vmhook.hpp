@@ -8468,19 +8468,29 @@ namespace vmhook
     /*
         @brief CRTP base class for typed Java-object wrappers.
         @details
-        Derive from vmhook::object<YourClass> (not object_base directly) so that:
+        Derive from vmhook::object<YourClass> (not object_base directly).
 
-          - Instance access uses the inherited get_field("name") /
-            get_method("name") overloads from object_base.  These work from
-            non-static C++ methods because the implicit 'this' provides the
-            OOP needed for instance Java fields.
+        Field / method access syntax:
 
-          - Static access uses static_field("name") / static_method("name").
-            These do not require an object instance; they resolve the Java
-            class via typeid(derived).  The distinct method names sidestep
-            the cross-compiler issue where some compilers (e.g. older g++)
-            do not exclude deducing-this overloads from static-context
-            overload resolution.
+          - Inside an instance C++ method, `get_field("name")` /
+            `get_method("name")` route through the implicit `this` and
+            resolve via the live OOP.  These are inherited from
+            object_base.
+
+          - Inside a static C++ method, the same `get_field("name")` /
+            `get_method("name")` call resolves through the C++23
+            deducing-this overloads below on MSVC and Clang.  These
+            compilers correctly exclude deducing-this overloads from
+            overload resolution when no implicit object is available,
+            so the static fallbacks defined here win automatically.
+
+          - On GCC the deducing-this overloads are still selected from
+            a static-call context (the compiler picks the better
+            argument-type match before checking object availability,
+            then errors), so static methods on GCC must call
+            `static_field("name")` / `static_method("name")` instead.
+            The same names are available on every compiler for
+            authors who want a uniformly portable call site.
 
         Usage:
             class my_entity : public vmhook::object<my_entity>
@@ -8488,8 +8498,13 @@ namespace vmhook
             public:
                 explicit my_entity(vmhook::oop_t oop) : vmhook::object<my_entity>{ oop } {}
 
-                auto get_health()        -> int  { return get_field("health")->get(); }
-                static auto get_count() -> int  { return static_field("entityCount")->get(); }
+                auto get_health()       -> int { return get_field("health")->get(); }
+
+                // Portable static accessor (works on MSVC, Clang, GCC):
+                static auto get_count() -> int { return static_field("entityCount")->get(); }
+
+                // MSVC/Clang only — deducing-this resolves to the static fallback:
+                // static auto get_count() -> int { return get_field("entityCount")->get(); }
             };
     */
     template<typename derived>
@@ -8498,39 +8513,93 @@ namespace vmhook
     public:
         using object_base::object_base;
 
-        // Instance get_field / get_method are inherited from object_base.
-        // They are non-static const members; they pick up the live OOP via
-        // the implicit `this`.
-        using object_base::get_field;
-        using object_base::get_method;
+        // -------------------------------------------------------------------
+        // Deducing-this overloads.  These exist so that on MSVC and Clang a
+        // call like `get_field("staticName")` made from a static C++ method
+        // *of the wrapper class* dispatches to the static fallback at the
+        // bottom of this class:  the deducing-this overloads are non-viable
+        // in a static-call context (no implicit object), so overload
+        // resolution falls through to the 1-arg static `get_field`.
+        //
+        // From an instance method these are an exact match for string
+        // literals (`const char*`) and outrank the static fallback which
+        // accepts `std::string_view`.
+        //
+        // We do NOT bring in `object_base::get_field` via a using-declaration
+        // here, because the using-declaration would add the same-named
+        // base overload to the overload set and trigger ambiguity errors
+        // on MSVC.  The deducing-this overloads below forward to the base
+        // explicitly via `self.object_base::get_field(...)`.
+        //
+        // On GCC the deducing-this overloads are still considered for
+        // static-call overload resolution and produce a compile error
+        // ("cannot call member function without object").  Users targeting
+        // GCC should call `static_field("name")` explicitly from static
+        // methods; that name is always available below.
+        // -------------------------------------------------------------------
+        auto get_field(this object_base const& self, char const* name)
+            -> std::optional<vmhook::field_proxy>
+        {
+            return self.object_base::get_field(name);
+        }
+
+        auto get_method(this object_base const& self, char const* name)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return self.object_base::get_method(name);
+        }
+
+        auto get_method(this object_base const& self, char const* name, char const* signature)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return self.object_base::get_method(name, signature);
+        }
+
+        // -------------------------------------------------------------------
+        // Static fallbacks.  Reachable on every compiler via the names
+        // `get_field` / `get_method` (MSVC, Clang) and via the explicit names
+        // `static_field` / `static_method` (universally portable).
+        // -------------------------------------------------------------------
+        static auto get_field(std::string_view name)
+            -> std::optional<vmhook::field_proxy>
+        {
+            return object_base::get_field(std::type_index{ typeid(derived) }, name);
+        }
+
+        static auto get_method(std::string_view name)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return object_base::get_method(std::type_index{ typeid(derived) }, name);
+        }
+
+        static auto get_method(std::string_view name, std::string_view signature)
+            -> std::optional<vmhook::method_proxy>
+        {
+            return object_base::get_method(std::type_index{ typeid(derived) }, name, signature);
+        }
 
         /*
-            @brief Static field accessor for static Java fields.
-            @details
-            Resolves the Java klass through the type-to-class map using
-            typeid(derived), then returns a field_proxy bound to the
-            class's mirror.  Use this from static C++ methods on the
-            wrapper class.
+            @brief Explicit static field accessor.  Portable across compilers.
         */
-        static auto static_field(const std::string_view name)
+        static auto static_field(std::string_view name)
             -> std::optional<vmhook::field_proxy>
         {
             return object_base::get_field(std::type_index{ typeid(derived) }, name);
         }
 
         /*
-            @brief Static method accessor for static Java methods.
+            @brief Explicit static method accessor.  Portable across compilers.
         */
-        static auto static_method(const std::string_view name)
+        static auto static_method(std::string_view name)
             -> std::optional<vmhook::method_proxy>
         {
             return object_base::get_method(std::type_index{ typeid(derived) }, name);
         }
 
         /*
-            @brief Static method accessor with explicit JVM descriptor.
+            @brief Explicit static method accessor with JVM descriptor.
         */
-        static auto static_method(const std::string_view name, const std::string_view signature)
+        static auto static_method(std::string_view name, std::string_view signature)
             -> std::optional<vmhook::method_proxy>
         {
             return object_base::get_method(std::type_index{ typeid(derived) }, name, signature);

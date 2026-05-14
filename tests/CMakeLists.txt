@@ -34,3 +34,13 @@ add_executable(vmhook_test_api_surface test_api_surface.cpp)
 target_link_libraries(vmhook_test_api_surface PRIVATE vmhook::vmhook)
 vmhook_apply_warnings(vmhook_test_api_surface)
 add_test(NAME api_surface_no_jvm COMMAND vmhook_test_api_surface)
+
+# 6) Unified `get_field` / `get_method` call syntax across static + instance.
+#    MSVC + Clang resolve the deducing-this overloads correctly; GCC errors
+#    out in static contexts.  The test file uses #if to skip the static
+#    call sites on GCC so CI stays green everywhere while still catching
+#    a regression on MSVC / Clang.
+add_executable(vmhook_test_unified_call_syntax test_unified_call_syntax.cpp)
+target_link_libraries(vmhook_test_unified_call_syntax PRIVATE vmhook::vmhook)
+vmhook_apply_warnings(vmhook_test_unified_call_syntax)
+add_test(NAME unified_call_syntax COMMAND vmhook_test_unified_call_syntax)

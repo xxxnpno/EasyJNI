@@ -39,7 +39,8 @@ function(vmhook_apply_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE
             /W4 /permissive- /Zc:__cplusplus /utf-8
-            /wd4505)  # unreferenced static function (header carries multiple by design)
+            /wd4505     # unreferenced static function (header carries multiple by design)
+            /wd4101)    # unreferenced local (release builds compile out VMHOOK_LOG)
         if(VMHOOK_WARNINGS_AS_ERRORS)
             target_compile_options(${target} PRIVATE /WX)
         endif()

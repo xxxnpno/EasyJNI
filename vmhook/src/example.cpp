@@ -17,20 +17,28 @@
     raw method names, or lower-level vmhook helpers.
 
     Field pattern:
-        - instance field: get_field("javaField")->get()
-        - static field:   get_field("javaField")->get()   (same syntax, no prefix needed)
-        - setter:         get_field(...)->set(value)
+        - instance field (any compiler):    get_field("javaField")->get()
+        - static field (MSVC / Clang):      get_field("javaField")->get()
+        - static field (portable, any cc):  static_field("javaField")->get()
+        - setter (instance / static same):  ...->set(value)
 
     Method pattern:
-        - instance method: get_method("javaMethod")->call(args...)
-        - static method:   get_method("javaMethod")->call(args...)  (same syntax)
+        - instance method (any compiler):       get_method("javaMethod")->call(args...)
+        - static method (MSVC / Clang):         get_method("javaMethod")->call(args...)
+        - static method (portable, any cc):     static_method("javaMethod")->call(args...)
 
-    vmhook::object<T> exposes both a non-static get_field(const char*) and a
-    static get_field(std::string_view).  String literals are an exact match for
-    const char*, so the instance overload wins in non-static context; from a
-    static C++ method only the static overload is viable.  The result is that
-    the call site is always simply get_field("name") regardless of Java-side
-    staticness.
+    vmhook::object<T> exposes:
+      - C++23 deducing-this overloads of get_field / get_method which accept
+        `const char*` and forward to the instance API.  String literals are
+        an exact match for `const char*`, so these win in non-static context.
+        On MSVC and Clang they are correctly excluded from static-call
+        overload resolution, so a static call to `get_field("name")` falls
+        through to the static fallback below.  GCC includes the deducing-this
+        overload as a candidate in static contexts and errors out, so this
+        file uses `static_field` / `static_method` in every static method
+        to stay portable across all three compilers.
+      - Static fallback overloads of get_field / get_method (string_view)
+        plus the always-available aliases `static_field` / `static_method`.
 
     Object construction pattern:
         - call vmhook::make_unique<wrapper_class>(args...) from a method hook
