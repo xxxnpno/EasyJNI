@@ -251,6 +251,7 @@
     #if VMHOOK_OS_APPLE
         #include <mach/mach.h>
         #include <pthread.h>
+        #include <libkern/OSCacheControl.h>   // sys_icache_invalidate
         // mach_vm.h is "unsupported" in the iOS SDK (it builds but the
         // mach_vm_* APIs are not callable from a user-space iOS process).
         // On macOS the same header lives at <mach/mach_vm.h>.  Only include
@@ -888,6 +889,11 @@ namespace vmhook
             }
 #if VMHOOK_OS_WINDOWS
             ::FlushInstructionCache(::GetCurrentProcess(), address, size);
+#elif VMHOOK_OS_APPLE
+            // Apple ships sys_icache_invalidate as the user-callable API.
+            // __builtin___clear_cache emits a reference to compiler-rt's
+            // ___clear_cache, which iOS does not link by default.
+            ::sys_icache_invalidate(address, size);
 #elif defined(__GNUC__) || defined(__clang__)
             __builtin___clear_cache(static_cast<char*>(address),
                                     static_cast<char*>(address) + size);

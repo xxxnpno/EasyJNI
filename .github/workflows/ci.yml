@@ -177,7 +177,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vmhook-macos-clang
-          path: build/bin/libvmhook.so
+          # CMake's MODULE library uses the platform-default suffix; on
+          # Apple platforms that is .dylib (.bundle is also possible if
+          # we tweak SUFFIX in CMakeLists.txt, but the default suits us).
+          path: |
+            build/bin/libvmhook.dylib
+            build/bin/libvmhook.so
 
   # ─────────────────────────────────────────────────────────────────────────
   # 2. JVM integration tests — every Java version × every compiler that
@@ -222,7 +227,7 @@ jobs:
         shell: cmd
         run: |
           mkdir out 2>nul || ver >nul
-          javac -d out example\vmhook\Main.java example\vmhook\Example.java example\vmhook\A.java example\vmhook\B.java
+          javac -d out example\vmhook\*.java
 
       - name: Run injection-based integration test
         shell: pwsh
@@ -304,7 +309,7 @@ jobs:
       - name: Compile Java fixtures
         run: |
           mkdir -p out
-          javac -d out example/vmhook/Main.java example/vmhook/Example.java example/vmhook/A.java example/vmhook/B.java
+          javac -d out example/vmhook/*.java
 
       - name: Run JNI integration test
         env:
@@ -372,13 +377,23 @@ jobs:
       - name: Compile Java fixtures
         run: |
           mkdir -p out
-          javac -d out example/vmhook/Main.java example/vmhook/Example.java example/vmhook/A.java example/vmhook/B.java
+          javac -d out example/vmhook/*.java
 
       - name: Run JNI integration test (best-effort)
         run: |
           set -euo pipefail
           echo "=== Java ${{ matrix.java }} · macOS / clang ==="
-          chmod +x build/bin/libvmhook.so || true
+          chmod +x build/bin/libvmhook.dylib build/bin/libvmhook.so 2>/dev/null || true
+          # System.loadLibrary needs `lib<name>.dylib` on macOS but our
+          # CMake configuration may emit either suffix depending on the
+          # generator.  Symlink one to the other so the search path
+          # works regardless.
+          if [ -f build/bin/libvmhook.dylib ] && [ ! -f build/bin/libvmhook.so ]; then
+            ln -s libvmhook.dylib build/bin/libvmhook.so
+          fi
+          if [ -f build/bin/libvmhook.so ] && [ ! -f build/bin/libvmhook.dylib ]; then
+            ln -s libvmhook.so build/bin/libvmhook.dylib
+          fi
           # macOS runners ship Apple Silicon (arm64); HotSpot is present but
           # the vmhook trampoline is x86_64 only, so the runtime hook step
           # will degrade gracefully.  We still exercise the OS layer and
