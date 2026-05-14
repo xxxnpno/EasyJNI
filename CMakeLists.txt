@@ -67,8 +67,19 @@ message(STATUS "vmhook platform = ${_vmhook_platform_label}"
 # the header + tests but skip the JVM-injection-only example DLL and the
 # Windows-only injector.
 
+# Determine the default for VMHOOK_BUILD_EXAMPLE.  The example DLL is
+# useful as a self-test even on platforms where runtime hooking is not
+# functional (the field-access, klass-walking, and JNI-OnLoad paths still
+# work; only the interpreter-stub trampoline degrades).  We only disable
+# the example by default on cross-compile targets that have no JVM at
+# all: iOS and Android.
+set(_vmhook_example_default TRUE)
+if(VMHOOK_PLATFORM_IOS OR VMHOOK_PLATFORM_ANDROID)
+    set(_vmhook_example_default FALSE)
+endif()
+
 option(VMHOOK_BUILD_EXAMPLE  "Build the example test DLL/SO that runs the hook suite"
-       ${VMHOOK_HAS_RUNTIME_HOOKING})
+       ${_vmhook_example_default})
 option(VMHOOK_BUILD_INJECTOR "Build the Windows-only injector executable"
        ${VMHOOK_PLATFORM_WINDOWS})
 option(VMHOOK_BUILD_TESTS    "Build the standalone unit-test suite (no JVM needed)"

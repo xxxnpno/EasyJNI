@@ -52,7 +52,17 @@ public class Example
     // Empty, unicode, long, and interned strings.
     public static String emptyString    = "";
     public static String unicodeString  = "héllo éè ?";   // includes non-ASCII codepoints
-    public static String longString     = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(8);
+    // Note: explicit concatenation instead of String.repeat(int) so this
+    // compiles on Java 8 (repeat() was added in Java 11).
+    public static String longString     =
+        "abcdefghijklmnopqrstuvwxyz0123456789"
+      + "abcdefghijklmnopqrstuvwxyz0123456789"
+      + "abcdefghijklmnopqrstuvwxyz0123456789"
+      + "abcdefghijklmnopqrstuvwxyz0123456789"
+      + "abcdefghijklmnopqrstuvwxyz0123456789"
+      + "abcdefghijklmnopqrstuvwxyz0123456789"
+      + "abcdefghijklmnopqrstuvwxyz0123456789"
+      + "abcdefghijklmnopqrstuvwxyz0123456789";
     public static String internedLiteral = "INTERNED";
     public static String nullString     = null;     // null-reference field
 
