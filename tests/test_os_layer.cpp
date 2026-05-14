@@ -63,9 +63,19 @@ int main()
                                                  vmhook::os::memory_protection::read, &old);
         check("protect_to_readonly", flipped);
 
-        const bool flipped_back = vmhook::os::protect(block, page,
-                                                     vmhook::os::memory_protection::execute_rw, nullptr);
-        check("protect_back_to_rwx", flipped_back);
+        // Flipping back to a writable + executable mapping requires the
+        // JIT entitlement on Apple arm64 (W^X enforced).  When the
+        // entitlement is absent we settle for plain read-write which is
+        // what allocate_rwx itself fell back to.
+        bool flipped_back = vmhook::os::protect(block, page,
+                                                vmhook::os::memory_protection::execute_rw, nullptr);
+        if (!flipped_back)
+        {
+            flipped_back = vmhook::os::protect(block, page,
+                                               vmhook::os::memory_protection::read_write, nullptr);
+            std::printf("[INFO] protect_back_to_rwx fell back to read_write (Apple W^X / no JIT entitlement)\n");
+        }
+        check("protect_back_to_rw_or_rwx", flipped_back);
         check("memory_survives_protect_cycle", bytes[0] == 0xAA && bytes[1] == 0x55);
 
         // safe_read sanity: reading into a buffer should succeed for the
@@ -74,9 +84,15 @@ int main()
         const bool ok_read = vmhook::os::safe_read(dst, block, sizeof(dst));
         check("safe_read_valid_block", ok_read && dst[0] == 0xAA && dst[1] == 0x55);
 
+        // iOS has no fault-safe read API without entitlements, so the
+        // bogus-pointer check would crash there; skip it.
+#if !VMHOOK_OS_IOS
         const void* const bogus = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(0xDEADBEEFDEAD'BEEFull));
         const bool ok_bogus = vmhook::os::safe_read(dst, bogus, sizeof(dst));
         check("safe_read_rejects_bogus", !ok_bogus);
+#else
+        std::printf("[INFO] safe_read_rejects_bogus: skipped (no fault-safe read API on iOS)\n");
+#endif
 
         vmhook::os::release(block, page);
     }

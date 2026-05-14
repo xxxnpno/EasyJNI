@@ -206,12 +206,19 @@
 // MSVC 19.32+ / GCC 14+ / Clang 18+, but GCC's overload resolution still
 // considers explicit-object member functions in *static-call* contexts
 // (where no implicit object is available) and then errors with "cannot
-// call without object".  MSVC and Clang correctly exclude them from
-// static-call overload resolution.  We therefore enable the deducing-this
-// path only on MSVC and Clang — that's where vmhook::object<T>::get_field
-// can be invoked from both instance and static methods uniformly.
+// call without object".  Upstream LLVM Clang and MSVC correctly exclude
+// them from static-call overload resolution.
+//
+// The Android NDK Clang shows the same overload-resolution behavior as
+// GCC here even though it self-identifies as Clang, so we also exclude
+// __ANDROID__.
+//
+// The deducing-this path is therefore enabled only on MSVC and non-NDK
+// Clang — that is where vmhook::object<T>::get_field can be invoked from
+// both instance and static methods uniformly.
 #if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L \
-    && (defined(__clang__) || defined(_MSC_VER))
+    && (defined(__clang__) || defined(_MSC_VER)) \
+    && !defined(__ANDROID__)
     #define VMHOOK_HAS_DEDUCING_THIS 1
 #else
     #define VMHOOK_HAS_DEDUCING_THIS 0
@@ -243,8 +250,14 @@
     #endif
     #if VMHOOK_OS_APPLE
         #include <mach/mach.h>
-        #include <mach/mach_vm.h>   // mach_vm_region, mach_vm_read_overwrite
         #include <pthread.h>
+        // mach_vm.h is "unsupported" in the iOS SDK (it builds but the
+        // mach_vm_* APIs are not callable from a user-space iOS process).
+        // On macOS the same header lives at <mach/mach_vm.h>.  Only include
+        // it when we are actually going to call it.
+        #if VMHOOK_OS_MACOS
+            #include <mach/mach_vm.h>
+        #endif
     #endif
 #endif
 
@@ -601,12 +614,24 @@ namespace vmhook
                                   MEM_COMMIT | MEM_RESERVE,
                                   PAGE_EXECUTE_READWRITE);
 #else
-            void* const requested{ address_hint };
-            void* result{ ::mmap(requested, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+            // Try RWX first (succeeds on Linux, Android, x86_64 macOS, and
+            // older iOS).  On Apple arm64 / current iOS the kernel enforces
+            // W^X and refuses PROT_WRITE | PROT_EXEC simultaneously without
+            // the JIT entitlement; fall back to RW so the caller at least
+            // gets a usable buffer (the caller can mprotect to RX later via
+            // os::protect, which is also entitlement-gated on Apple).
+            void* result{ ::mmap(address_hint, size,
+                                 PROT_READ | PROT_WRITE | PROT_EXEC,
                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
             if (result == MAP_FAILED)
             {
-                return nullptr;
+                result = ::mmap(address_hint, size,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (result == MAP_FAILED)
+                {
+                    return nullptr;
+                }
             }
             return result;
 #endif
@@ -659,18 +684,18 @@ namespace vmhook
                                        | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
             info.guarded = (prot & PAGE_GUARD) != 0;
             return info;
-#elif VMHOOK_OS_APPLE
+#elif VMHOOK_OS_MACOS
             // Use mach_vm_region to walk the task's memory map.  Apple has no
-            // /proc filesystem; mach_vm_region is the supported API.
-            vm_address_t region_addr{ reinterpret_cast<vm_address_t>(address) };
-            vm_size_t    region_size{ 0 };
+            // /proc filesystem; mach_vm_region is the supported API on macOS.
+            mach_vm_address_t region_addr{ reinterpret_cast<mach_vm_address_t>(address) };
+            mach_vm_size_t    region_size{ 0 };
             vm_region_basic_info_data_64_t mach_info{};
             mach_msg_type_number_t info_count{ VM_REGION_BASIC_INFO_COUNT_64 };
             mach_port_t object_name{};
             const kern_return_t rc{
                 ::mach_vm_region(::mach_task_self(),
-                                 reinterpret_cast<mach_vm_address_t*>(&region_addr),
-                                 reinterpret_cast<mach_vm_size_t*>(&region_size),
+                                 &region_addr,
+                                 &region_size,
                                  VM_REGION_BASIC_INFO_64,
                                  reinterpret_cast<vm_region_info_t>(&mach_info),
                                  &info_count,
@@ -684,6 +709,16 @@ namespace vmhook
             info.committed = true;
             info.readable  = (mach_info.protection & VM_PROT_READ)    != 0;
             info.executable= (mach_info.protection & VM_PROT_EXECUTE) != 0;
+            return info;
+#elif VMHOOK_OS_IOS
+            // iOS does not expose mach_vm_region / /proc/self/maps.  Return
+            // a permissive "looks committed" result so the higher-level
+            // validity checks defer to the user-supplied pointer rather
+            // than rejecting everything.
+            info.base = const_cast<void*>(address);
+            info.size = vmhook::os::page_size();
+            info.committed = true;
+            info.readable  = true;
             return info;
 #else
             // Linux and Android both expose /proc/self/maps.
@@ -797,7 +832,7 @@ namespace vmhook
             const BOOL ok{ ::ReadProcessMemory(::GetCurrentProcess(), src, dst,
                                                size, &transferred) };
             return ok && transferred == size;
-#elif VMHOOK_OS_APPLE
+#elif VMHOOK_OS_MACOS
             mach_vm_size_t transferred{ 0 };
             const kern_return_t rc{ ::mach_vm_read_overwrite(
                 ::mach_task_self(),
@@ -806,6 +841,12 @@ namespace vmhook
                 reinterpret_cast<mach_vm_address_t>(dst),
                 &transferred) };
             return rc == KERN_SUCCESS && transferred == size;
+#elif VMHOOK_OS_IOS
+            // No mach_vm on iOS; do a best-effort memcpy.  Bad pointers
+            // will fault — there is no user-callable fault-safe read API
+            // on iOS without entitlements.
+            std::memcpy(dst, src, size);
+            return true;
 #elif VMHOOK_OS_LINUX || VMHOOK_OS_ANDROID
             iovec local{ dst, size };
             iovec remote{ const_cast<void*>(src), size };
@@ -4512,13 +4553,34 @@ namespace vmhook
                 // System V AMD64 calling convention trampoline.
                 // Args: rdi, rsi, rdx, rcx, r8, r9.  No shadow space.
                 // Caller-saved: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+                //
+                // Byte layout (the offsets below are runtime constants; the
+                // values match the cumulative widths of the instructions
+                // above each landmark):
+                //
+                //   off 0   push rax/rdi/rsi/rdx/rcx/r8/r9/r10/r11/rbp  (14)
+                //   off 14  push 0, push 0                              (4)
+                //   off 18  mov rdi,rbp ; mov rsi,r15 ; mov rdx,rsp     (9)
+                //   off 27  mov rbp,rsp ; and rsp,-16                   (7)
+                //   off 34  call [rip+disp32]                           (6)
+                //   off 40  mov rsp,rbp                                 (3)
+                //   off 43  cmp byte [rsp],0                            (4)
+                //   off 47  je rel32                                    (6)  <- JE_OFFSET
+                //   off 53  cancel path                                 (45)
+                //   off 98  resume path                                 (23) <- RESUME_OFFSET
+                //   off 116 jmp rel32 (inside resume path)              (5)  <- RESUME_JMP_OFFSET
+                //   off 121 detour-function-pointer slot                (8)  <- DETOUR_ADDRESS_OFFSET
+                //   off 129 end
+                //
+                // The 6-byte call uses disp32 = 121 − 40 = 81 = 0x51 so
+                // [rip+0x51] dereferences the detour function pointer.
                 // ------------------------------------------------------------
-                static constexpr std::int32_t JE_OFFSET{ 0x36 };
+                static constexpr std::int32_t JE_OFFSET{ 0x2F };
                 static constexpr std::int32_t JE_SIZE{ 6 };
-                static constexpr std::int32_t RESUME_OFFSET{ 0x6B };
-                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x7D };
+                static constexpr std::int32_t RESUME_OFFSET{ 0x62 };
+                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x74 };
                 static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
-                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x82 };
+                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x79 };
 
                 std::uint8_t assembly[]
                 {
@@ -4542,14 +4604,14 @@ namespace vmhook
                     0x48, 0x89, 0xE5,                               // mov rbp, rsp
                     0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
 
-                    0xFF, 0x15, 0x4D, 0x00, 0x00, 0x00,             // call [rip+0x4D]
+                    0xFF, 0x15, 0x51, 0x00, 0x00, 0x00,             // call [rip+0x51]
 
                     0x48, 0x89, 0xEC,                               // mov rsp, rbp
 
                     0x80, 0x3C, 0x24, 0x00,                         // cmp byte ptr [rsp], 0
                     0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je resume  (offset filled below)
 
-                    // cancel path:
+                    // cancel path (offset 0x35..0x61, 45 bytes):
                     0x48, 0x8B, 0x44, 0x24, 0x08,                   // mov rax, [rsp+8]
                     0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax
                     0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10
@@ -4570,7 +4632,7 @@ namespace vmhook
                     0x48, 0x89, 0xDC,                               // mov rsp, rbx
                     0xFF, 0xE6,                                     // jmp rsi
 
-                    // resume path:
+                    // resume path (offset 0x62..0x78, 23 bytes):
                     0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10
                     0x5D,                                           // pop rbp
                     0x41, 0x5B,                                     // pop r11
@@ -4584,7 +4646,7 @@ namespace vmhook
                     0x58,                                           // pop rax
                     0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp target+HOOK_SIZE
 
-                    // data slot:
+                    // data slot (offset 0x79..0x80):
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
 #endif

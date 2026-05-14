@@ -454,7 +454,7 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=${{ matrix.sdk }} \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.3 \
             -DCMAKE_BUILD_TYPE=Release \
             -DVMHOOK_BUILD_EXAMPLE=OFF \
             -DVMHOOK_BUILD_INJECTOR=OFF \
