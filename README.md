@@ -52,12 +52,22 @@ what CI actually exercises for each target.
 Notes:
 - *Hook trampoline* is x86_64-only.  On arm64 hosts the header still
   builds and the OS layer is fully functional; `vmhook::hook<T>` returns
-  false at runtime so consumers can degrade gracefully.
-- *iOS / Android* ship their own VMs (Apple's locked-down JVM
-  alternatives, Android's ART).  vmhook will compile on those platforms
-  for cross-platform-code-sharing reasons, but there's no HotSpot
-  libjvm to hook into, so `vmhook::find_class`, `vmhook::hook<T>`,
-  etc. return null / false at runtime.
+  false at runtime so consumers can degrade gracefully.  An arm64
+  trampoline is a tractable future addition, but on its own it does not
+  unlock iOS or Android (see next bullet).
+- *iOS and Android do not run HotSpot.*  iOS has no JVM at all; Android
+  runs Java bytecode on ART (a completely different runtime with
+  different internal structures).  vmhook reads HotSpot-specific data
+  (`gHotSpotVMStructs`, `Klass`, `Method`, interpreter frame layout),
+  so there is no path to "real-JVM tests" on either platform — the
+  thing being tested doesn't exist there.  The CI cross-compile jobs
+  verify the header is syntactically valid for those toolchains; at
+  runtime `vmhook::find_class`, `vmhook::hook<T>`,
+  `vmhook::watch_static_field`, and `vmhook::on_class_loaded` all
+  return null / false / empty-handle.
+- *Field watcher* (`vmhook::watch_static_field`) needs hardware data
+  breakpoints, which we currently wire up only on Windows × x86_64.
+  See `VMHOOK_HAS_HW_DATA_BREAKPOINTS`.
 - The CI matrix runs the full JVM integration test for Java 8, 11, 17,
   21, 24, and 25 against every compiler that produces a working
   artefact on a hosted runner.
@@ -341,18 +351,18 @@ saved-rbp chains manually starting from `ret.frame()`.
 
 ## Watching a static field for changes
 
-`vmhook::watch_static_field<T, value_t>(name, interval, callback)` spawns
-a background thread that polls a static field and invokes the callback
-whenever the value changes.  Destroying the returned `watch_handle`
-stops the watcher.
+`vmhook::watch_static_field<T, value_t>(name, callback)` installs a
+**hardware data breakpoint** (one of `DR0`-`DR3`) on the field's
+address.  The trap fires *instantly* on every write — no polling, no
+idle CPU.  The callback runs inside a vectored exception handler on
+whichever thread issued the write.
 
 ```cpp
 auto watcher{ vmhook::watch_static_field<my_class, std::int32_t>(
     "tickCount",
-    std::chrono::milliseconds{ 50 },
-    [](std::int32_t prev, std::int32_t next)
+    [](std::int32_t /*prev*/, std::int32_t next)
     {
-        std::println("tickCount changed: {} -> {}", prev, next);
+        std::println("tickCount written: {}", next);
     }) };
 
 // ... do work ...
@@ -360,29 +370,49 @@ auto watcher{ vmhook::watch_static_field<my_class, std::int32_t>(
 watcher.stop();   // optional; happens automatically on scope exit
 ```
 
-Polling-based, so the callback latency is bounded by `interval`.  The
-first read seeds the baseline and does NOT fire the callback; only
-subsequent value changes do.
+**Platform support**: Windows × x86_64 only.  On any other platform the
+function logs an error and returns an empty `watch_handle`
+(`watcher.running() == false`) — there is no polling fallback.  Check
+the `VMHOOK_HAS_HW_DATA_BREAKPOINTS` macro at compile time to gate
+features that depend on the trap.
+
+**Limits**:
+- At most 4 concurrent watches per process (one per debug register).
+- Threads created *after* the watch is installed do not have the trap
+  armed.  Threads alive at install time get it.
+- The callback receives `(old, new)` where `old` is zero-initialised —
+  the CPU does not save the pre-write value, so the previous value
+  cannot be reconstructed from inside the trap handler.  If you need it,
+  capture it before installing the watch.
+- The callback must not allocate Java objects or call back into the JVM
+  (those require a JavaThread and a safe-point window).
 
 ## Watching for newly-loaded classes
 
-`vmhook::on_class_loaded(interval, callback)` snapshots the JVM's
-ClassLoaderData graph at the given interval and invokes the callback
-once per newly-discovered class.  Classes already loaded when the
-watcher starts are not reported.
+`vmhook::on_class_loaded(callback)` installs a **method hook on
+`java.lang.ClassLoader::defineClass`** and fires the callback every
+time a class is defined through the Java-side entry point.  This is
+event-driven: zero latency, zero idle CPU.
 
 ```cpp
 auto watcher{ vmhook::on_class_loaded(
-    std::chrono::milliseconds{ 100 },
-    [](const std::string& internal_name, vmhook::hotspot::klass* k)
+    [](const std::string& internal_name)
     {
-        std::println("loaded: {} (klass {:p})", internal_name, (void*)k);
+        std::println("loaded: {}", internal_name);
     }) };
 ```
 
 `internal_name` uses JVM `/`-separated form (e.g.
-`"net/minecraft/client/Minecraft"`).  Like the field watcher, this is
-polling-based; lower intervals give better latency at the cost of CPU.
+`"net/minecraft/client/Minecraft"`).
+
+**Limits**:
+- Catches only classes defined through `ClassLoader.defineClass`.
+  Bootstrap-loaded classes (`java.*`, `javax.*`, `sun.*`) bypass that
+  entry point and are not reported.
+- The `(String, ByteBuffer, ProtectionDomain)` overload of
+  `defineClass` is not yet hooked.
+- The callback runs on the Java thread that triggered the definition,
+  with the JVM mid-class-loading — keep it short.
 
 ## Object Construction
 

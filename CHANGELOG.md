@@ -21,11 +21,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the load, with the internal class name (`/`-separated).  Zero polling, zero
   idle cost.  Returns an RAII `watch_handle` that removes the callback when
   destroyed.
-- `vmhook::watch_static_field<T, V>(name, interval, callback)` — installs a
-  hardware data breakpoint (DR0–DR3 + DR7 write trap) on the field's address
-  on Windows x86_64; falls back to a polling thread on other platforms.  The
-  trap path fires instantly on every write with zero idle cost.  Up to four
-  simultaneous trap-based watches per process.
+- `vmhook::watch_static_field<T, V>(name, callback)` — installs a hardware
+  data breakpoint (DR0–DR3 + DR7 write trap) on the field's address.  The
+  trap fires instantly on every write with zero idle cost; the callback
+  runs synchronously on the writing thread inside a vectored exception
+  handler.  Up to four simultaneous watches per process.  Windows × x86_64
+  only — on other platforms the function logs an error and returns an
+  empty `watch_handle` (no polling fallback; `VMHOOK_HAS_HW_DATA_BREAKPOINTS`
+  is the compile-time capability flag).
 - New hook overload: `vmhook::hook<T>(name, signature, callback)` selects the
   target method by matching both name AND JVM descriptor.  Needed for classes
   with overloaded methods sharing a name (e.g. ClassLoader's five

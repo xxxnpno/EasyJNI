@@ -938,9 +938,10 @@ namespace vmhook
         // remains zero-overhead until the trap actually fires.
         //
         // Currently a Windows-only path; on other platforms the
-        // companion vmhook::watch_static_field<> falls back to its
-        // polling implementation.  The capability flag below lets
-        // callers query support at compile time.
+        // companion vmhook::watch_static_field<> returns an empty
+        // handle and logs an error (there is no polling fallback).
+        // The capability flag below lets callers query support at
+        // compile time.
 
 #if VMHOOK_OS_WINDOWS && VMHOOK_ARCH_X86_64
         #define VMHOOK_HAS_HW_DATA_BREAKPOINTS 1
@@ -5273,27 +5274,30 @@ namespace vmhook
     }
 
     // -------------------------------------------------------------------------
-    // Watchers: long-lived background pollers for field-value changes and
-    // for newly-loaded Java classes.  Both are polling-based — the JVM
-    // doesn't expose interpreter-level field-write or class-load events
-    // through gHotSpotVMStructs alone, so we observe at a configurable
-    // cadence.  watch_handle stops the watcher when it goes out of scope.
+    // Watchers: event-driven hooks for field-value changes and for
+    // newly-loaded Java classes.  No background polling, no idle CPU —
+    // the field watcher installs a hardware data breakpoint that fires
+    // synchronously on the writing thread, and the class-load watcher
+    // installs a method hook on java.lang.ClassLoader.defineClass.
+    // watch_handle disarms the trap / unregisters the callback when it
+    // goes out of scope.
     // -------------------------------------------------------------------------
 
     /*
-        @brief RAII handle for a background watcher (field-change / class-load).
+        @brief RAII handle for an event-driven watcher (field-change / class-load).
         @details
-        The watcher thread keeps running as long as at least one handle is
-        live.  Destroying the last handle signals the thread to exit and
-        joins it.  Move-only.
+        The handle owns a disarm callback that runs exactly once, either
+        when stop() is called explicitly or when the handle is destroyed.
+        There is no worker thread; the watch is passive between events.
+        Move-only.
     */
     class watch_handle
     {
     public:
         struct control_block
         {
-            std::atomic_bool running{ true };
-            std::thread     worker;
+            std::function<void()> on_stop{};
+            bool                  stopped{ false };
         };
 
         watch_handle() = default;
@@ -5326,28 +5330,38 @@ namespace vmhook
         }
 
         /*
-            @brief Stops the watcher synchronously (idempotent).
+            @brief Disarms the watcher (idempotent).  After stop() returns
+                   no further callbacks will fire.
         */
         auto stop() noexcept -> void
         {
-            if (!this->block)
+            if (!this->block || this->block->stopped)
             {
+                this->block.reset();
                 return;
             }
-            this->block->running.store(false, std::memory_order_relaxed);
-            if (this->block->worker.joinable())
+            this->block->stopped = true;
+            if (this->block->on_stop)
             {
-                this->block->worker.join();
+                try
+                {
+                    this->block->on_stop();
+                }
+                catch (...)
+                {
+                    // never let disarm exceptions propagate.
+                }
+                this->block->on_stop = nullptr;
             }
             this->block.reset();
         }
 
         /*
-            @brief Returns true while the background thread is running.
+            @brief Returns true while the watcher is armed.
         */
         auto running() const noexcept -> bool
         {
-            return this->block && this->block->running.load(std::memory_order_relaxed);
+            return this->block && !this->block->stopped;
         }
 
     private:
@@ -10177,42 +10191,41 @@ namespace vmhook
     /*
         @brief Watches a Java static field and invokes a callback when it changes.
         @details
-        On Windows x86_64 this installs a hardware data breakpoint (one of
-        DR0-DR3) on the field's address.  The trap fires *instantly* on
-        every write — no polling, no idle CPU.  The callback runs inside
-        a vectored exception handler on whichever thread issued the write,
-        so it must not allocate Java objects or call back into the JVM
-        (those operations require a JavaThread and a safe-point window).
+        Installs a hardware data breakpoint (one of DR0-DR3) on the
+        field's address.  The trap fires *instantly* on every write —
+        no polling, no idle CPU.  The callback runs inside a vectored
+        exception handler on whichever thread issued the write, so it
+        must not allocate Java objects or call back into the JVM (those
+        operations require a JavaThread and a safe-point window).
 
-        On platforms without hardware data-breakpoint support, the
-        implementation falls back to a polling background thread that
-        reads the field every `poll_interval` and fires the callback on
-        observed changes.  Pass a reasonable poll_interval (e.g.
-        50 ms) — it's only used on the fallback path.
+        Currently supported only on Windows x86_64.  On other platforms
+        the function returns an empty `watch_handle` (its `running()`
+        returns false) and logs an error — there is no polling fallback.
 
-        Limits (trap path):
-          - At most 4 simultaneous trap-based watches per process.
+        Limits:
+          - At most 4 simultaneous watches per process (hardware limit
+            of DR0-DR3).
           - Threads that exist when the watch is installed get the trap
-            armed; threads created later do NOT.  Hooking thread creation
-            so they are caught too is a known improvement.
-          - The callback receives the field's address; if the value-type
-            is known statically, the caller can read it directly with
-            `*reinterpret_cast<const field_type*>(addr)`.
+            armed; threads created later do NOT.  Hooking thread
+            creation so they are caught too is a known improvement.
+          - The callback receives (old_value, new_value) where
+            old_value is a zero-initialised placeholder — the CPU does
+            not save the pre-write value, so the "previous" argument
+            cannot be reconstructed from the trap path alone.
 
         @tparam wrapper_type  Registered C++ wrapper for the Java class.
-        @tparam field_type    Expected value type for the polling path.
-        @tparam callback_type Callable invoked with (field_type, field_type)
-                              on the polling path, or (field_type)
-                              on the trap path (no "old" value cached).
+        @tparam field_type    Field value type (used to read the new
+                              value at the moment the trap fires and to
+                              pick the DR LEN field).
+        @tparam callback_type Callable invoked as
+                              `void(field_type old, field_type new)`.
     */
     template<class wrapper_type, typename field_type, typename callback_type>
     inline auto watch_static_field(
-        std::string_view                 field_name,
-        std::chrono::milliseconds        poll_interval,
-        callback_type                    on_change) -> watch_handle
+        std::string_view field_name,
+        callback_type    on_change) -> watch_handle
     {
 #if VMHOOK_HAS_HW_DATA_BREAKPOINTS
-        // Resolve the field's address through the field-proxy machinery.
         const auto proxy{ vmhook::object_base::get_field(
             std::type_index{ typeid(wrapper_type) }, field_name) };
         if (!proxy.has_value())
@@ -10229,7 +10242,6 @@ namespace vmhook
             return watch_handle{};
         }
 
-        // Choose a DR slot.
         std::lock_guard<std::mutex> guard{ detail::dr_mutex };
         const int slot{ detail::find_free_slot() };
         if (slot < 0)
@@ -10240,8 +10252,6 @@ namespace vmhook
         }
         detail::ensure_dr_handler_installed();
 
-        // The trap fires on every write of any size that touches the
-        // field's bytes; we use the field type's size to decide LEN.
         constexpr auto length{
             sizeof(field_type) == 1 ? vmhook::os::data_breakpoint_length::one_byte    :
             sizeof(field_type) == 2 ? vmhook::os::data_breakpoint_length::two_bytes   :
@@ -10270,70 +10280,24 @@ namespace vmhook
 
         detail::refresh_thread_drs(slot, reinterpret_cast<std::uint64_t>(address), dr7_bits);
 
-        // Return a handle whose worker thread just blocks until stop()
-        // is invoked, then disarms the DR slot.
         auto block{ std::make_shared<watch_handle::control_block>() };
-        block->worker = std::thread{ [block, slot]()
+        block->on_stop = [slot]() noexcept
         {
-            while (block->running.load(std::memory_order_relaxed))
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
-            }
             std::lock_guard<std::mutex> guard{ detail::dr_mutex };
             detail::clear_thread_drs(slot);
             detail::dr_slots[slot].in_use.store(false, std::memory_order_release);
-            detail::dr_slots[slot].address = nullptr;
+            detail::dr_slots[slot].address  = nullptr;
             detail::dr_slots[slot].callback = nullptr;
             detail::dr_slots[slot].dr7_bits = 0;
-        } };
-        (void)poll_interval;
+        };
         return watch_handle{ std::move(block) };
 #else
-        // Polling fallback on platforms without hardware data breakpoints.
-        auto block{ std::make_shared<watch_handle::control_block>() };
-        std::string                 captured_field{ field_name };
-        std::chrono::milliseconds   captured_interval{ poll_interval };
-
-        block->worker = std::thread{ [block,
-                                       captured_field    = std::move(captured_field),
-                                       captured_interval,
-                                       on_change         = std::move(on_change)]()
-            {
-                std::optional<field_type> last_value{};
-                while (block->running.load(std::memory_order_relaxed))
-                {
-                    try
-                    {
-                        const auto proxy{ vmhook::object_base::get_field(
-                            std::type_index{ typeid(wrapper_type) }, captured_field) };
-                        if (proxy.has_value())
-                        {
-                            field_type current{ proxy->get() };
-                            if (last_value.has_value())
-                            {
-                                if (!(*last_value == current))
-                                {
-                                    field_type prev{ std::move(*last_value) };
-                                    last_value = current;
-                                    try { on_change(std::move(prev), current); }
-                                    catch (const std::exception& ex) {
-                                        VMHOOK_LOG("{} watch_static_field callback: {}",
-                                                   vmhook::error_tag, ex.what());
-                                    }
-                                }
-                            }
-                            else { last_value = std::move(current); }
-                        }
-                    }
-                    catch (const std::exception& ex)
-                    {
-                        VMHOOK_LOG("{} watch_static_field poll: {}",
-                                   vmhook::error_tag, ex.what());
-                    }
-                    std::this_thread::sleep_for(captured_interval);
-                }
-            } };
-        return watch_handle{ std::move(block) };
+        (void)field_name;
+        (void)on_change;
+        VMHOOK_LOG("{} watch_static_field<{}>('{}'): hardware data breakpoints "
+                   "are unsupported on this platform; the watch was not armed",
+                   vmhook::error_tag, typeid(wrapper_type).name(), field_name);
+        return watch_handle{};
 #endif
     }
 
@@ -10460,18 +10424,18 @@ namespace vmhook
         }
 
         auto block{ std::make_shared<watch_handle::control_block>() };
-        block->worker = std::thread{ [block, cb]()
+        block->on_stop = [cb]() noexcept
+        {
+            try
             {
-                while (block->running.load(std::memory_order_relaxed))
-                {
-                    std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
-                }
                 std::lock_guard<std::mutex> guard{ detail::class_load_mutex };
                 detail::class_load_callbacks.erase(
                     std::remove(detail::class_load_callbacks.begin(),
                                 detail::class_load_callbacks.end(), cb),
                     detail::class_load_callbacks.end());
-            } };
+            }
+            catch (...) { /* swallowed */ }
+        };
 
         return watch_handle{ std::move(block) };
     }

@@ -2349,30 +2349,39 @@ namespace
 
         auto watcher{ vmhook::watch_static_field<ticker_probe_class, std::int32_t>(
             "counter",
-            std::chrono::milliseconds{ 5 },
-            [&](std::int32_t prev, std::int32_t next)
+            [&](std::int32_t /*prev*/, std::int32_t next)
             {
-                if (next <= prev)
+                // The trap path receives a zero-initialised prev; only
+                // the new value is meaningful.  We rely on `next` being
+                // strictly monotonic (Java side only ever increments).
+                const int previous{ last_seen.exchange(next, std::memory_order_relaxed) };
+                if (previous >= 0 && next <= previous)
                 {
                     change_monotonic.store(false);
                 }
-                last_seen.store(next, std::memory_order_relaxed);
                 ++change_count;
             }) };
 
-        // Ask Java to bump the counter several times.
+        // Ask Java to bump the counter several times.  The trap fires
+        // synchronously on the writing thread (the Java thread itself),
+        // so every write has already triggered the callback by the time
+        // run_java_probe returns.
         ticker_probe_class::set_probe_done(false);
         ticker_probe_class::set_probe_requested(false);
         const bool probe_done{ run_java_probe(ticker_probe_class::set_probe_requested,
                                               ticker_probe_class::get_probe_done) };
         check("tickerProbeDone", probe_done);
 
-        // Give the watcher a moment to drain after the probe finishes.
-        std::this_thread::sleep_for(std::chrono::milliseconds{ 100 });
-
-        check("fieldWatcherSawChange",     change_count.load() > 0);
-        check("fieldWatcherMonotonic",     change_monotonic.load());
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+        check("fieldWatcherSawChange",      change_count.load() > 0);
+        check("fieldWatcherMonotonic",      change_monotonic.load());
         check("fieldWatcherCounterReached", ticker_probe_class::get_counter() > 0);
+#else
+        // The watcher couldn't be armed on this platform — verify it
+        // returned an empty handle rather than silently polling.
+        check("fieldWatcherDisarmedOnUnsupportedPlatform", !watcher.running());
+        check("fieldWatcherCounterReached", ticker_probe_class::get_counter() > 0);
+#endif
     }
 
     // ── on_class_loaded — class-load hook probe ────────────────────────────
@@ -2392,20 +2401,14 @@ namespace
             }) };
 
         // Trigger LateClass loading on the Java side via Main's probe.
+        // The defineClass hook fires synchronously on the Java thread,
+        // so by the time run_java_probe returns the callback has
+        // already run.
         example_class::set_class_load_probe_done(false);
         example_class::set_class_load_probe_requested(false);
         const bool probe_done{ run_java_probe(example_class::set_class_load_probe_requested,
                                               example_class::get_class_load_probe_done) };
         check("classLoadProbeDone", probe_done);
-
-        // Give the in-process hook a moment to fire after the Java side
-        // returns; the hook is synchronous on the Java thread, so the
-        // event has typically already been delivered by the time
-        // run_java_probe returns, but we allow a small grace window.
-        for (int i{ 0 }; i < 50 && !late_seen.load(); ++i)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 5 });
-        }
 
         check("classLoadObservedLateClass", late_seen.load());
     }
