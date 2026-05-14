@@ -3885,7 +3885,10 @@ namespace vmhook
         }
         else if constexpr (std::is_same_v<value_type, std::string> || std::is_same_v<value_type, std::string_view>)
         {
-            void* const string_oop{ vmhook::make_java_string(value) };
+            void* const string_handle{ vmhook::detail::jni_new_string_utf(value) };
+            void* const string_oop{ string_handle
+                ? vmhook::detail::jni_decode_object(string_handle)
+                : vmhook::make_java_string(value) };
             if (!string_oop)
             {
                 return false;
@@ -3895,7 +3898,11 @@ namespace vmhook
         }
         else if constexpr (std::is_same_v<value_type, const char*> || std::is_same_v<value_type, char*>)
         {
-            void* const string_oop{ vmhook::make_java_string(value ? std::string_view{ value } : std::string_view{}) };
+            const std::string_view text{ value ? std::string_view{ value } : std::string_view{} };
+            void* const string_handle{ vmhook::detail::jni_new_string_utf(text) };
+            void* const string_oop{ string_handle
+                ? vmhook::detail::jni_decode_object(string_handle)
+                : vmhook::make_java_string(text) };
             if (!string_oop)
             {
                 return false;
