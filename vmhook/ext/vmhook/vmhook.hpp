@@ -79,11 +79,25 @@
 
 #include <windows.h>
 
+#ifndef VMHOOK_DEBUG_LOGS
+#ifdef NDEBUG
+#define VMHOOK_DEBUG_LOGS 0
+#else
+#define VMHOOK_DEBUG_LOGS 1
+#endif
+#endif
+
+#if VMHOOK_DEBUG_LOGS
+#define VMHOOK_LOG(...) ::std::println(__VA_ARGS__)
+#else
+#define VMHOOK_LOG(...) do { if constexpr (false) { ::std::println(__VA_ARGS__); } } while (false)
+#endif
+
 namespace vmhook
 {
     /*
         @brief Log-prefix tags used in all diagnostic messages printed by this library.
-        @details  These are prepended to every std::println() call so that output from
+        @details  These are prepended to every VMHOOK_LOG() call so that output from
         VMHook can be filtered in the host process console.
     */
     inline constexpr std::string_view error_tag{ "[VMHook ERROR]" };
@@ -537,7 +551,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} symbol.to_string() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} symbol.to_string() {}", vmhook::error_tag, exception.what());
                     return std::string{};
                 }
             }
@@ -580,7 +594,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} constant_pool.get_base() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} constant_pool.get_base() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -614,7 +628,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} const_method.get_constants() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} const_method.get_constants() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -639,7 +653,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} const_method.get_name() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} const_method.get_name() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -664,7 +678,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} const_method.get_signature() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} const_method.get_signature() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -704,7 +718,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} method.get_i2i_entry() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} method.get_i2i_entry() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -728,7 +742,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} method.get_from_interpreted_entry() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} method.get_from_interpreted_entry() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -755,7 +769,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} method.get_access_flags() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} method.get_access_flags() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -797,7 +811,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} method.get_const_method() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} method.get_const_method() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -827,7 +841,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} method.get_name() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} method.get_name() {}", vmhook::error_tag, exception.what());
                     return std::string{};
                 }
             }
@@ -857,7 +871,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} method.get_signature() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} method.get_signature() {}", vmhook::error_tag, exception.what());
                     return std::string{};
                 }
             }
@@ -1037,7 +1051,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} klass.get_name() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} klass.get_name() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -1554,7 +1568,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} class_loader_data.get_klasses() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} class_loader_data.get_klasses() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -1585,7 +1599,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} class_loader_data.get_next() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} class_loader_data.get_next() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -1616,7 +1630,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} class_loader_data.get_dictionary() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} class_loader_data.get_dictionary() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -1740,7 +1754,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} class_loader_data_graph.get_head() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} class_loader_data_graph.get_head() {}", vmhook::error_tag, exception.what());
                     return nullptr;
                 }
             }
@@ -1882,7 +1896,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} java_thread.get_thread_state() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} java_thread.get_thread_state() {}", vmhook::error_tag, exception.what());
                     return vmhook::hotspot::java_thread_state::_thread_uninitialized;
                 }
             }
@@ -1907,7 +1921,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} java_thread.set_thread_state() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} java_thread.set_thread_state() {}", vmhook::error_tag, exception.what());
                 }
             }
 
@@ -1930,7 +1944,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} java_thread.get_suspend_flags() {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} java_thread.get_suspend_flags() {}", vmhook::error_tag, exception.what());
                     return 0;
                 }
             }
@@ -2209,13 +2223,13 @@ namespace vmhook
             {
                 vmhook::hotspot::current_java_thread = existing_thread;
                 vmhook::hotspot::last_java_thread.store(existing_thread, std::memory_order_relaxed);
-                std::println("{} ensure_current_java_thread(): adopted JavaThread 0x{:016X} for OS thread {}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(existing_thread), current_os_thread_id);
+                VMHOOK_LOG("{} ensure_current_java_thread(): adopted JavaThread 0x{:016X} for OS thread {}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(existing_thread), current_os_thread_id);
                 return true;
             }
 
             if (!vmhook::hotspot::attach_current_native_thread())
             {
-                std::println("{} ensure_current_java_thread(): AttachCurrentThread failed for OS thread {}", vmhook::error_tag, current_os_thread_id);
+                VMHOOK_LOG("{} ensure_current_java_thread(): AttachCurrentThread failed for OS thread {}", vmhook::error_tag, current_os_thread_id);
                 return false;
             }
 
@@ -2225,14 +2239,14 @@ namespace vmhook
                 {
                     vmhook::hotspot::current_java_thread = attached_thread;
                     vmhook::hotspot::last_java_thread.store(attached_thread, std::memory_order_relaxed);
-                    std::println("{} ensure_current_java_thread(): attached JavaThread 0x{:016X} for OS thread {}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(attached_thread), current_os_thread_id);
+                    VMHOOK_LOG("{} ensure_current_java_thread(): attached JavaThread 0x{:016X} for OS thread {}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(attached_thread), current_os_thread_id);
                     return true;
                 }
 
                 std::this_thread::yield();
             }
 
-            std::println("{} ensure_current_java_thread(): attached thread was not found in HotSpot thread list for OS thread {}", vmhook::error_tag, current_os_thread_id);
+            VMHOOK_LOG("{} ensure_current_java_thread(): attached thread was not found in HotSpot thread list for OS thread {}", vmhook::error_tag, current_os_thread_id);
             return false;
         }
 
@@ -2766,7 +2780,7 @@ namespace vmhook
             }
             catch (const std::exception& exception)
             {
-                std::println("{} find_hook_location() {}", vmhook::error_tag, exception.what());
+                VMHOOK_LOG("{} find_hook_location() {}", vmhook::error_tag, exception.what());
                 return nullptr;
             }
         }
@@ -3361,7 +3375,7 @@ namespace vmhook
                 }
                 catch (const std::exception& exception)
                 {
-                    std::println("{} midi2i_hook::midi2i_hook {}", vmhook::error_tag, exception.what());
+                    VMHOOK_LOG("{} midi2i_hook::midi2i_hook {}", vmhook::error_tag, exception.what());
                     return;
                 }
 
@@ -3518,7 +3532,7 @@ namespace vmhook
             }
             catch (const std::exception& exception)
             {
-                std::println("{} common_detour() {}", vmhook::error_tag, exception.what());
+                VMHOOK_LOG("{} common_detour() {}", vmhook::error_tag, exception.what());
             }
         }
 
@@ -3645,7 +3659,7 @@ namespace vmhook
         }
         catch (const std::exception& exception)
         {
-            std::println("{} vmhook::find_class() for {}: {}", vmhook::error_tag, class_name, exception.what());
+            VMHOOK_LOG("{} vmhook::find_class() for {}: {}", vmhook::error_tag, class_name, exception.what());
             return nullptr;
         }
     }
@@ -3669,7 +3683,7 @@ namespace vmhook
 
         if (!verified_klass)
         {
-            std::println("{} register_class() for {}: class not found in JVM.", vmhook::error_tag, class_name);
+            VMHOOK_LOG("{} register_class() for {}: class not found in JVM.", vmhook::error_tag, class_name);
             return false;
         }
 
@@ -4020,11 +4034,11 @@ namespace vmhook
 
             if (was_compiled)
             {
-                std::println("{} hook(): '{}' is JIT-compiled (_code=0x{:016X}) - deoptimising.", vmhook::info_tag, method_name, reinterpret_cast<std::uintptr_t>(original_code));
+                VMHOOK_LOG("{} hook(): '{}' is JIT-compiled (_code=0x{:016X}) - deoptimising.", vmhook::info_tag, method_name, reinterpret_cast<std::uintptr_t>(original_code));
             }
             else
             {
-                std::println("{} hook(): '{}' is interpreted - patching i2i stub.", vmhook::info_tag, method_name);
+                VMHOOK_LOG("{} hook(): '{}' is interpreted - patching i2i stub.", vmhook::info_tag, method_name);
             }
 
             // Wrap the user callable: extract typed Java args from the frame and forward them.
@@ -4092,26 +4106,26 @@ namespace vmhook
                 if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                 {
                     found_method->set_from_compiled_entry(c2i_entry);
-                    std::println("{} hook():   _from_compiled_entry → c2i @ 0x{:016X}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
+                    VMHOOK_LOG("{} hook():   _from_compiled_entry → c2i @ 0x{:016X}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
                 }
                 else
                 {
                     // Do not point compiled callers directly at i2i: the compiled-call ABI
                     // expects a c2i adapter. Leaving this entry unchanged is safer; once
                     // _code is cleared, normal interpreted dispatch reaches the hook.
-                    std::println("{} hook():   c2i adapter unavailable; leaving _from_compiled_entry unchanged.", vmhook::info_tag);
+                    VMHOOK_LOG("{} hook():   c2i adapter unavailable; leaving _from_compiled_entry unchanged.", vmhook::info_tag);
                 }
 
                 // 3. Clear _code last so the above entry-point writes are visible first.
                 found_method->set_code(nullptr);
-                std::println("{} hook():   _code cleared - method running via interpreter.", vmhook::info_tag);
+                VMHOOK_LOG("{} hook():   _code cleared - method running via interpreter.", vmhook::info_tag);
             }
 
             return true;
         }
         catch (const std::exception& exception)
         {
-            std::println("{} vmhook::hook() for {}: {}", vmhook::error_tag, method_name, exception.what());
+            VMHOOK_LOG("{} vmhook::hook() for {}: {}", vmhook::error_tag, method_name, exception.what());
             return false;
         }
     }
@@ -4594,14 +4608,14 @@ namespace vmhook
             vmhook::hotspot::klass* const hotspot_klass{ vmhook::find_class(class_name) };
             if (!hotspot_klass)
             {
-                std::println("{} jni_make_unique<{}>(): HotSpot class '{}' not found.", vmhook::error_tag, typeid(wrapper_type).name(), class_name);
+                VMHOOK_LOG("{} jni_make_unique<{}>(): HotSpot class '{}' not found.", vmhook::error_tag, typeid(wrapper_type).name(), class_name);
                 return nullptr;
             }
 
             void* const class_mirror{ hotspot_klass->get_java_mirror() };
             if (!class_mirror || !vmhook::hotspot::is_valid_pointer(class_mirror))
             {
-                std::println("{} jni_make_unique<{}>(): java.lang.Class mirror for '{}' is invalid.", vmhook::error_tag, typeid(wrapper_type).name(), class_name);
+                VMHOOK_LOG("{} jni_make_unique<{}>(): java.lang.Class mirror for '{}' is invalid.", vmhook::error_tag, typeid(wrapper_type).name(), class_name);
                 return nullptr;
             }
 
@@ -4618,7 +4632,7 @@ namespace vmhook
             void* const method_id{ vmhook::detail::jni_get_method_id(klass, "<init>", signature) };
             if (!method_id)
             {
-                std::println("{} jni_make_unique<{}>(): GetMethodID('<init>', '{}') failed.", vmhook::error_tag, typeid(wrapper_type).name(), signature);
+                VMHOOK_LOG("{} jni_make_unique<{}>(): GetMethodID('<init>', '{}') failed.", vmhook::error_tag, typeid(wrapper_type).name(), signature);
                 return nullptr;
             }
 
@@ -4657,14 +4671,14 @@ namespace vmhook
     {
         if (!vmhook::hotspot::ensure_current_java_thread())
         {
-            std::println("{} vmhook::make_unique<{}>(): failed to attach current native thread to the JVM.", vmhook::error_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to attach current native thread to the JVM.", vmhook::error_tag, typeid(wrapper_type).name());
             return nullptr;
         }
 
         auto map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
         if (map_entry == vmhook::type_to_class_map.end())
         {
-            std::println("{} vmhook::make_unique<{}>(): type not registered.", vmhook::error_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): type not registered.", vmhook::error_tag, typeid(wrapper_type).name());
             return nullptr;
         }
 
@@ -4686,7 +4700,7 @@ namespace vmhook
         const std::size_t object_size{ (raw_size + 7u) & ~static_cast<std::size_t>(7u) };
         if (object_size == 0)
         {
-            std::println("{} vmhook::make_unique<{}>(): failed to read HotSpot instance size.", vmhook::error_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): failed to read HotSpot instance size.", vmhook::error_tag, typeid(wrapper_type).name());
             return nullptr;
         }
 
@@ -4720,7 +4734,7 @@ namespace vmhook
 
         if (!object_pointer)
         {
-            std::println("{} vmhook::make_unique<{}>(): current JavaThread TLAB has no room for {} bytes.", vmhook::warning_tag, typeid(wrapper_type).name(), object_size);
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): current JavaThread TLAB has no room for {} bytes.", vmhook::warning_tag, typeid(wrapper_type).name(), object_size);
             return nullptr;
         }
 
@@ -4769,7 +4783,7 @@ namespace vmhook
         }
         else if constexpr (sizeof...(args_t) > 0)
         {
-            std::println("{} vmhook::make_unique<{}>(): object allocated, but wrapper has no matching construct(...) method for the provided arguments.", vmhook::warning_tag, typeid(wrapper_type).name());
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): object allocated, but wrapper has no matching construct(...) method for the provided arguments.", vmhook::warning_tag, typeid(wrapper_type).name());
         }
 
         return result;
@@ -4801,7 +4815,7 @@ namespace vmhook
     {
         if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
         {
-            std::println("{} vmhook::find_field() for '{}': klass pointer is null.", vmhook::error_tag, name);
+            VMHOOK_LOG("{} vmhook::find_field() for '{}': klass pointer is null.", vmhook::error_tag, name);
             return std::nullopt;
         }
 
@@ -4824,7 +4838,7 @@ namespace vmhook
             }
         }
 
-        std::println("{} vmhook::find_field() for '{}': field not found in class hierarchy.", vmhook::error_tag, name);
+        VMHOOK_LOG("{} vmhook::find_field() for '{}': field not found in class hierarchy.", vmhook::error_tag, name);
         return std::nullopt;
     }
 
@@ -4880,7 +4894,7 @@ namespace vmhook
         }
         catch (const std::exception& exception)
         {
-            std::println("{} vmhook::get_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
+            VMHOOK_LOG("{} vmhook::get_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
             return value_type{};
         }
     }
@@ -4931,7 +4945,7 @@ namespace vmhook
         }
         catch (const std::exception& exception)
         {
-            std::println("{} vmhook::set_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
+            VMHOOK_LOG("{} vmhook::set_field<{}>('{}') {}", vmhook::error_tag, typeid(value_type).name(), name, exception.what());
         }
     }
 
@@ -5732,7 +5746,7 @@ namespace vmhook
             void* const klass{ vmhook::detail::jni_get_object_class(object_handle) };
             if (!klass)
             {
-                std::println("{} method_proxy::call_jni('{}{}'): GetObjectClass failed.", vmhook::error_tag, this->name(), this->m_signature);
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetObjectClass failed.", vmhook::error_tag, this->name(), this->m_signature);
                 return value_t{ std::monostate{} };
             }
 
@@ -5743,7 +5757,7 @@ namespace vmhook
 
                 if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
                 {
-                    std::println("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->m_signature);
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->m_signature);
                     return value_t{ std::monostate{} };
                 }
             }
@@ -5761,7 +5775,7 @@ namespace vmhook
                 call_object_method_a_t const call_object_method_a{ vmhook::detail::jni_function<36, call_object_method_a_t>(vmhook::hotspot::current_jni_env) };
                 if (!call_object_method_a)
                 {
-                    std::println("{} method_proxy::call_jni('{}{}'): CallObjectMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallObjectMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
                     return value_t{ std::monostate{} };
                 }
 
@@ -5773,7 +5787,7 @@ namespace vmhook
             call_void_method_a_t const call_void_method_a{ vmhook::detail::jni_function<63, call_void_method_a_t>(vmhook::hotspot::current_jni_env) };
             if (!call_void_method_a)
             {
-                std::println("{} method_proxy::call_jni('{}{}'): CallVoidMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallVoidMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
                 return value_t{ std::monostate{} };
             }
 
@@ -5816,7 +5830,7 @@ namespace vmhook
         {
             if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
             {
-                std::println("{} method_proxy::call(): method pointer is null or invalid.", vmhook::error_tag);
+                VMHOOK_LOG("{} method_proxy::call(): method pointer is null or invalid.", vmhook::error_tag);
                 return value_t{ std::monostate{} };
             }
 
@@ -5825,14 +5839,14 @@ namespace vmhook
 
             if (!vmhook::hotspot::ensure_current_java_thread())
             {
-                std::println("{} method_proxy::call('{}{}'): no current JavaThread.", vmhook::error_tag, this->name(), selected_signature);
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): no current JavaThread.", vmhook::error_tag, this->name(), selected_signature);
                 return value_t{ std::monostate{} };
             }
 
             auto* const thread{ vmhook::hotspot::current_java_thread };
             if (!thread)
             {
-                std::println("{} method_proxy::call('{}{}'): current JavaThread is null after attach.", vmhook::error_tag, this->name(), selected_signature);
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): current JavaThread is null after attach.", vmhook::error_tag, this->name(), selected_signature);
                 return value_t{ std::monostate{} };
             }
 
@@ -5848,7 +5862,7 @@ namespace vmhook
             void* const entry{ selected_method->get_from_interpreted_entry() };
             if (!entry || !vmhook::hotspot::is_valid_pointer(entry))
             {
-                std::println("{} method_proxy::call('{}{}'): interpreted entry is null or invalid.", vmhook::error_tag, this->name(), selected_signature);
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): interpreted entry is null or invalid.", vmhook::error_tag, this->name(), selected_signature);
                 return value_t{ std::monostate{} };
             }
 
@@ -5880,7 +5894,7 @@ namespace vmhook
                         void* const string_oop{ vmhook::make_java_string(a) };
                         if (!string_oop)
                         {
-                            std::println("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
                         }
                         params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
                     }
@@ -5889,7 +5903,7 @@ namespace vmhook
                         void* const string_oop{ vmhook::make_java_string(a) };
                         if (!string_oop)
                         {
-                            std::println("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
                         }
                         params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
                     }
@@ -5898,7 +5912,7 @@ namespace vmhook
                         void* const string_oop{ vmhook::make_java_string(a ? std::string_view{ a } : std::string_view{}) };
                         if (!string_oop)
                         {
-                            std::println("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
+                            VMHOOK_LOG("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
                         }
                         params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
                     }
@@ -6361,7 +6375,7 @@ namespace vmhook
                 void* const mirror{ resolved_klass->get_java_mirror() };
                 if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
                 {
-                    std::println("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
+                    VMHOOK_LOG("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
                     return std::nullopt;
                 }
                 void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
@@ -6370,7 +6384,7 @@ namespace vmhook
 
             if (!this->instance)
             {
-                std::println("{} object::get_field('{}') instance pointer is null.", vmhook::error_tag, name);
+                VMHOOK_LOG("{} object::get_field('{}') instance pointer is null.", vmhook::error_tag, name);
                 return std::nullopt;
             }
 
@@ -6395,14 +6409,14 @@ namespace vmhook
 
             if (!entry->is_static)
             {
-                std::println("{} object::get_field('{}') needs an object instance.", vmhook::error_tag, name);
+                VMHOOK_LOG("{} object::get_field('{}') needs an object instance.", vmhook::error_tag, name);
                 return std::nullopt;
             }
 
             void* const mirror{ resolved_klass->get_java_mirror() };
             if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
             {
-                std::println("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
+                VMHOOK_LOG("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
                 return std::nullopt;
             }
 
@@ -6597,14 +6611,14 @@ namespace vmhook
             const auto type_map_entry{ vmhook::type_to_class_map.find(wrapper_type) };
             if (type_map_entry == vmhook::type_to_class_map.end())
             {
-                std::println("{} object::resolve_klass() type '{}' not registered via register_class<T>().", vmhook::error_tag, wrapper_type.name());
+                VMHOOK_LOG("{} object::resolve_klass() type '{}' not registered via register_class<T>().", vmhook::error_tag, wrapper_type.name());
                 return nullptr;
             }
 
             vmhook::hotspot::klass* const found_klass{ vmhook::find_class(type_map_entry->second) };
             if (!found_klass)
             {
-                std::println("{} object::resolve_klass() class '{}' not found in JVM.", vmhook::error_tag, type_map_entry->second);
+                VMHOOK_LOG("{} object::resolve_klass() class '{}' not found in JVM.", vmhook::error_tag, type_map_entry->second);
             }
 
             return found_klass;

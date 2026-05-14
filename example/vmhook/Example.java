@@ -117,6 +117,12 @@ public class Example
     // The hook on nonStaticCallMe calls nonStaticReturnMe(5) and stores the result here.
     public static volatile boolean methodCallReturnProbeRequested = false;
     public static volatile boolean methodCallReturnProbeDone = false;
+    public static volatile boolean argMutationProbeRequested = false;
+    public static volatile boolean argMutationProbeDone = false;
+    public static volatile int argMutationProbeValue = 0;
+    public static volatile boolean stringArgMutationProbeRequested = false;
+    public static volatile boolean stringArgMutationProbeDone = false;
+    public static volatile String stringArgMutationProbeValue = "";
 
     public static void staticCallMe(final int value)
     {
@@ -141,6 +147,16 @@ public class Example
     public static int staticReturnMe(final int value)
     {
         return value + 2;
+    }
+
+    public void nonStaticArgMutationMe(final int value)
+    {
+        argMutationProbeValue = value;
+    }
+
+    public void nonStaticStringArgMutationMe(final String value)
+    {
+        stringArgMutationProbeValue = value;
     }
 
     // this part's goal is just to check if we can work with Objects correcly

@@ -73,6 +73,14 @@ public class Main
                 () -> Example.instance.nonStaticCallMe(99),
                 () -> Example.methodCallReturnProbeDone = true);
 
+            runProbe(() -> Example.argMutationProbeRequested && !Example.argMutationProbeDone,
+                () -> Example.instance.nonStaticArgMutationMe(7),
+                () -> Example.argMutationProbeDone = true);
+
+            runProbe(() -> Example.stringArgMutationProbeRequested && !Example.stringArgMutationProbeDone,
+                () -> Example.instance.nonStaticStringArgMutationMe("before"),
+                () -> Example.stringArgMutationProbeDone = true);
+
             Thread.sleep(1);
         }
 

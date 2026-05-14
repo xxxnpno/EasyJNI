@@ -965,6 +965,78 @@ public:
     {
         get_field("methodCallReturnProbeDone")->set(v);
     }
+
+    static auto get_arg_mutation_probe_requested()
+        -> bool
+    {
+        return get_field("argMutationProbeRequested")->get();
+    }
+
+    static auto set_arg_mutation_probe_requested(bool v)
+        -> void
+    {
+        get_field("argMutationProbeRequested")->set(v);
+    }
+
+    static auto get_arg_mutation_probe_done()
+        -> bool
+    {
+        return get_field("argMutationProbeDone")->get();
+    }
+
+    static auto set_arg_mutation_probe_done(bool v)
+        -> void
+    {
+        get_field("argMutationProbeDone")->set(v);
+    }
+
+    static auto get_arg_mutation_probe_value()
+        -> std::int32_t
+    {
+        return get_field("argMutationProbeValue")->get();
+    }
+
+    static auto set_arg_mutation_probe_value(std::int32_t v)
+        -> void
+    {
+        get_field("argMutationProbeValue")->set(v);
+    }
+
+    static auto get_string_arg_mutation_probe_requested()
+        -> bool
+    {
+        return get_field("stringArgMutationProbeRequested")->get();
+    }
+
+    static auto set_string_arg_mutation_probe_requested(bool v)
+        -> void
+    {
+        get_field("stringArgMutationProbeRequested")->set(v);
+    }
+
+    static auto get_string_arg_mutation_probe_done()
+        -> bool
+    {
+        return get_field("stringArgMutationProbeDone")->get();
+    }
+
+    static auto set_string_arg_mutation_probe_done(bool v)
+        -> void
+    {
+        get_field("stringArgMutationProbeDone")->set(v);
+    }
+
+    static auto get_string_arg_mutation_probe_value()
+        -> std::string
+    {
+        return get_field("stringArgMutationProbeValue")->get();
+    }
+
+    static auto set_string_arg_mutation_probe_value(const std::string& v)
+        -> void
+    {
+        get_field("stringArgMutationProbeValue")->set(v);
+    }
 };
 
 namespace
@@ -991,6 +1063,12 @@ namespace
     std::atomic_int make_unique_hook_call_count{};
     std::atomic_bool make_unique_allocated{};
     std::atomic_bool make_unique_saw_argument{};
+    std::atomic_int arg_mutation_hook_call_count{};
+    std::atomic_bool arg_mutation_set_arg_ok{};
+    std::atomic_bool arg_mutation_saw_original_argument{};
+    std::atomic_int string_arg_mutation_hook_call_count{};
+    std::atomic_bool string_arg_mutation_set_arg_ok{};
+    std::atomic_bool string_arg_mutation_saw_original_argument{};
     std::atomic_bool make_unique_initialized_value{};
     std::atomic_bool make_unique_initialized_counter{};
     std::atomic_bool list_probe_size_correct{};
@@ -1618,6 +1696,82 @@ namespace
 
         vmhook::shutdown_hooks();
     }
+
+    auto test_arg_mutation()
+        -> void
+    {
+        /*
+            set_arg(index, value) should update the interpreter frame and then
+            let the original Java method run with the replacement argument.
+        */
+        arg_mutation_hook_call_count.store(0);
+        arg_mutation_set_arg_ok.store(false);
+        arg_mutation_saw_original_argument.store(false);
+
+        example_class::set_arg_mutation_probe_value(0);
+        example_class::set_arg_mutation_probe_done(false);
+        example_class::set_arg_mutation_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticArgMutationMe",
+            [](vmhook::return_value& retval, const std::unique_ptr<example_class>& self, std::int32_t value)
+            {
+                ++arg_mutation_hook_call_count;
+                arg_mutation_saw_original_argument.store(self != nullptr && value == 7);
+                arg_mutation_set_arg_ok.store(retval.set_arg(1, static_cast<std::int32_t>(42)));
+            }) };
+        check("argMutationHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        const bool probe_done{ run_java_probe(example_class::set_arg_mutation_probe_requested, example_class::get_arg_mutation_probe_done) };
+
+        check("argMutationProbeDone", probe_done);
+        check_equal("argMutationHookCallCount", arg_mutation_hook_call_count.load(), 1);
+        check("argMutationSawOriginalArgument", arg_mutation_saw_original_argument.load());
+        check("argMutationSetArgOk", arg_mutation_set_arg_ok.load());
+        check_equal("argMutationOriginalSawReplacement", example_class::get_arg_mutation_probe_value(), static_cast<std::int32_t>(42));
+
+        vmhook::shutdown_hooks();
+    }
+
+    auto test_string_arg_mutation()
+        -> void
+    {
+        string_arg_mutation_hook_call_count.store(0);
+        string_arg_mutation_set_arg_ok.store(false);
+        string_arg_mutation_saw_original_argument.store(false);
+
+        example_class::set_string_arg_mutation_probe_value("");
+        example_class::set_string_arg_mutation_probe_done(false);
+        example_class::set_string_arg_mutation_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<example_class>("nonStaticStringArgMutationMe",
+            [](vmhook::return_value& retval, const std::unique_ptr<example_class>& self, const std::string& value)
+            {
+                ++string_arg_mutation_hook_call_count;
+                string_arg_mutation_saw_original_argument.store(self != nullptr && value == "before");
+                string_arg_mutation_set_arg_ok.store(retval.set_arg(1, std::string_view{ "after" }));
+            }) };
+        check("stringArgMutationHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        const bool probe_done{ run_java_probe(example_class::set_string_arg_mutation_probe_requested, example_class::get_string_arg_mutation_probe_done) };
+
+        check("stringArgMutationProbeDone", probe_done);
+        check_equal("stringArgMutationHookCallCount", string_arg_mutation_hook_call_count.load(), 1);
+        check("stringArgMutationSawOriginalArgument", string_arg_mutation_saw_original_argument.load());
+        check("stringArgMutationSetArgOk", string_arg_mutation_set_arg_ok.load());
+        check_equal("stringArgMutationOriginalSawReplacement", example_class::get_string_arg_mutation_probe_value(), std::string{ "after" });
+
+        vmhook::shutdown_hooks();
+    }
 }
 
 static auto WINAPI thread_entry(HMODULE module)
@@ -1648,6 +1802,8 @@ static auto WINAPI thread_entry(HMODULE module)
         test_list_probe(*instance);
         test_poly_probe(*instance);
         test_method_call_return_value(*instance);
+        test_arg_mutation();
+        test_string_arg_mutation();
     }
     else
     {
