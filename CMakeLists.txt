@@ -142,7 +142,23 @@ endfunction()
 
 # ── Example DLL / shared library that drives the JVM tests ──────────────────
 if(VMHOOK_BUILD_EXAMPLE)
-    add_library(vmhook_example MODULE vmhook/src/example.cpp)
+    set(_vmhook_example_sources vmhook/src/example.cpp)
+
+    # Optional JNI-side speed test.  Only built when the JDK include
+    # path is locatable, since pure-JNI calls require <jni.h> — vmhook
+    # itself stays JNI-header-free, the bench is in a separate TU.
+    find_package(JNI QUIET COMPONENTS JVM)
+    if(NOT JNI_FOUND)
+        find_package(JNI QUIET)
+    endif()
+    if(JNI_FOUND)
+        message(STATUS "vmhook bench: JNI found at ${JNI_INCLUDE_DIRS}")
+        list(APPEND _vmhook_example_sources vmhook/src/speedtest.cpp)
+    else()
+        message(STATUS "vmhook bench: <jni.h> not found, speedtest will be a no-op")
+    endif()
+
+    add_library(vmhook_example MODULE ${_vmhook_example_sources})
     set_target_properties(vmhook_example PROPERTIES
         OUTPUT_NAME "vmhook"
         PREFIX     ""
@@ -153,6 +169,10 @@ if(VMHOOK_BUILD_EXAMPLE)
         set_target_properties(vmhook_example PROPERTIES PREFIX "lib")
     endif()
     target_link_libraries(vmhook_example PRIVATE vmhook::vmhook)
+    if(JNI_FOUND)
+        target_include_directories(vmhook_example PRIVATE ${JNI_INCLUDE_DIRS})
+        target_compile_definitions(vmhook_example PRIVATE VMHOOK_BENCH_USE_JNI=1)
+    endif()
     vmhook_apply_warnings(vmhook_example)
     set_target_properties(vmhook_example PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

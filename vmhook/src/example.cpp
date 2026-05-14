@@ -1,5 +1,10 @@
 #include <vmhook/vmhook.hpp>
 
+// Forward declaration for the optional JNI-side microbench.  Defined in
+// vmhook/src/speedtest.cpp.  When the build couldn't find <jni.h>, the
+// linker pulls in the no-op stub from the same file.
+extern "C" auto run_vmhook_vs_jni_speedtest() -> void;
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -2560,6 +2565,12 @@ static auto run_test_suite() -> void
         test_caller_info();
         test_field_watcher();
         test_class_load_watcher();
+
+        // ── vmhook vs pure JNI microbench ────────────────────────────
+        // Lives in a separate translation unit (speedtest.cpp) so the
+        // jni.h include never bleeds into vmhook.hpp itself.  When the
+        // build can't find <jni.h> the function is a no-op stub.
+        run_vmhook_vs_jni_speedtest();
     }
     else
     {

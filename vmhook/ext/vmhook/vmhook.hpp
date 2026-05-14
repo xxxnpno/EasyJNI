@@ -2965,6 +2965,53 @@ namespace vmhook
 
                 return nullptr;
             }
+
+            /*
+                @brief Invokes a callback for every klass stored in this
+                       dictionary by walking the full hashtable.
+                @details
+                Same iteration as find_klass, but without the name match
+                filter — every entry is visited.  Used by
+                class_loader_data_graph::for_each_klass on JDK builds
+                where ClassLoaderData::_klasses is not exposed in
+                VMStructs (JDK 8-17).
+            */
+            template<typename callback_type>
+            auto for_each_klass(callback_type&& callback) const -> void
+            {
+                const std::int32_t table_size{ this->get_table_size() };
+                const std::uint8_t* const buckets{ this->get_buckets() };
+
+                if (!vmhook::hotspot::is_valid_pointer(buckets) || table_size <= 0 || table_size > 0x186A0)
+                {
+                    return;
+                }
+
+                for (std::int32_t bucket_index{ 0 }; bucket_index < table_size; ++bucket_index)
+                {
+                    const std::uint8_t* dict_entry{ reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(buckets + bucket_index * 8))) };
+
+                    std::int32_t chain_visited{ 0 };
+                    while (vmhook::hotspot::is_valid_pointer(dict_entry) && chain_visited < 1048576)
+                    {
+                        ++chain_visited;
+                        const void* const raw_klass{ vmhook::hotspot::safe_read_pointer(dict_entry + 16) };
+                        auto* const candidate_klass{ reinterpret_cast<vmhook::hotspot::klass*>(
+                            const_cast<void*>(vmhook::hotspot::untag_pointer(raw_klass))) };
+
+                        if (vmhook::hotspot::is_valid_pointer(candidate_klass))
+                        {
+                            if (const auto* const sym{ candidate_klass->get_name() };
+                                vmhook::hotspot::is_valid_pointer(sym))
+                            {
+                                callback(sym->to_string(), candidate_klass);
+                            }
+                        }
+
+                        dict_entry = reinterpret_cast<const std::uint8_t*>(vmhook::hotspot::untag_pointer(vmhook::hotspot::safe_read_pointer(dict_entry)));
+                    }
+                }
+            }
         };
 
         /*
@@ -3103,6 +3150,8 @@ namespace vmhook
             {
                 static const bool use_klasses{
                     vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_klasses") != nullptr };
+                static const bool use_cld_dictionary{
+                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_dictionary") != nullptr };
 
                 auto* class_loader_data{ this->get_head() };
                 std::int32_t visited{ 0 };
@@ -3130,9 +3179,39 @@ namespace vmhook
                             current_klass = current_klass->get_next_link();
                         }
                     }
+                    else if (use_cld_dictionary)
+                    {
+                        // JDK 8-17: walk the per-CLD Dictionary hashtable.
+                        auto* const dict{ class_loader_data->get_dictionary() };
+                        if (vmhook::hotspot::is_valid_pointer(dict))
+                        {
+                            dict->for_each_klass(callback);
+                        }
+                    }
 
                     auto* const next{ class_loader_data->get_next() };
                     class_loader_data = vmhook::hotspot::is_valid_pointer(next) ? next : nullptr;
+                }
+
+                // JDK 8 also requires walking SystemDictionary directly
+                // because ClassLoaderData::_dictionary may not be in
+                // VMStructs.  SystemDictionary._dictionary covers
+                // bootstrap classes (java.*, javax.*, sun.*) and
+                // _shared_dictionary covers CDS-archived classes.
+                if (!use_klasses)
+                {
+                    static const vmhook::hotspot::vm_struct_entry_t* const sd_main{
+                        vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_dictionary") };
+                    static const vmhook::hotspot::vm_struct_entry_t* const sd_shared{
+                        vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_shared_dictionary") };
+
+                    for (const auto* const sd_entry : { sd_main, sd_shared })
+                    {
+                        if (!sd_entry || !sd_entry->address) { continue; }
+                        auto* const dict{ *reinterpret_cast<vmhook::hotspot::dictionary**>(sd_entry->address) };
+                        if (!vmhook::hotspot::is_valid_pointer(dict)) { continue; }
+                        dict->for_each_klass(callback);
+                    }
                 }
             }
         };
@@ -6988,6 +7067,75 @@ namespace vmhook
         }
 
         /*
+            @brief Fills a single jni_value slot from one C++ argument.
+            @details
+            Mirrors append_jni_arg's per-type conversion logic but
+            writes into a fixed slot instead of pushing onto a
+            std::vector.  Used by method_proxy::call_jni to pack args
+            on the stack — no heap allocation in the call hot path.
+
+            @param value    Output slot for the jvalue.
+            @param storage  Storage for the indirect-handle pointer
+                            when the arg is an object reference; the
+                            jvalue.l points at this slot.
+            @param arg      C++ value to convert.
+        */
+        template<typename arg_type>
+        inline auto write_jni_arg_to_slot(vmhook::detail::jni_value& value,
+                                           void*& storage,
+                                           arg_type&& arg) noexcept -> void
+        {
+            using clean_t = std::decay_t<arg_type>;
+            value = vmhook::detail::jni_value{};
+
+            if constexpr (std::is_same_v<clean_t, std::string>
+                       || std::is_same_v<clean_t, std::string_view>)
+            {
+                value.l = vmhook::detail::jni_new_string_utf(arg);
+            }
+            else if constexpr (std::is_same_v<clean_t, const char*>
+                            || std::is_same_v<clean_t, char*>)
+            {
+                value.l = arg ? vmhook::detail::jni_new_string_utf(std::string_view{ arg })
+                              : nullptr;
+            }
+            else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+            {
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
+                if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
+                {
+                    storage = arg ? arg->get_instance() : nullptr;
+                    value.l = &storage;
+                }
+            }
+            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
+            {
+                storage = arg.get_instance();
+                value.l = &storage;
+            }
+            else if constexpr (std::is_same_v<clean_t, bool>)
+            {
+                value.z = arg;
+            }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) <= sizeof(std::int32_t))
+            {
+                value.i = static_cast<std::int32_t>(arg);
+            }
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == sizeof(std::int64_t))
+            {
+                value.j = static_cast<std::int64_t>(arg);
+            }
+            else if constexpr (std::is_same_v<clean_t, float>)
+            {
+                value.f = arg;
+            }
+            else if constexpr (std::is_same_v<clean_t, double>)
+            {
+                value.d = arg;
+            }
+        }
+
+        /*
             @brief Constructs a Java object via JNI and wraps it in a std::unique_ptr<wrapper_type>.
             @details
             Finds the HotSpot klass for class_name, obtains its java.lang.Class mirror,
@@ -8334,63 +8482,259 @@ namespace vmhook
         auto call_jni(args_t&&... args) const noexcept
             -> value_t
         {
-            if (!this->object)
+            auto* const env_void{ vmhook::hotspot::current_jni_env };
+            if (!env_void)
             {
                 return value_t{ std::monostate{} };
             }
 
-            void* object_handle_storage{};
-            void* const object_handle{ vmhook::detail::jni_oop_handle(this->object, object_handle_storage) };
-            void* const klass{ vmhook::detail::jni_get_object_class(object_handle) };
-            if (!klass)
+            // Return-type char is parsed once from signature_text
+            // and cached on the proxy.  Skips the rfind() on every
+            // call.  The L/[ branch below still needs `rparen` to
+            // peek at the full return descriptor for String detection,
+            // so compute it lazily there too.
+            std::size_t rparen{ std::string::npos };
+            char ret_char{ this->cached_ret_char };
+            if (!ret_char)
             {
-                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetObjectClass failed.", vmhook::error_tag, this->name(), this->signature_text);
-                return value_t{ std::monostate{} };
-            }
-
-            void* const method_id{ vmhook::detail::jni_get_method_id(klass, this->name(), this->signature_text) };
-            if (!method_id)
-            {
-                vmhook::detail::jni_exception_clear();
-
-                if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
+                rparen = this->signature_text.rfind(')');
+                if (rparen == std::string::npos)
                 {
-                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->signature_text);
                     return value_t{ std::monostate{} };
                 }
+                ret_char = (rparen + 1 < this->signature_text.size())
+                               ? this->signature_text[rparen + 1]
+                               : 'V';
+                this->cached_ret_char = ret_char;
             }
-            void* const resolved_method_id{ method_id ? method_id : reinterpret_cast<void*>(this->method) };
 
-            std::vector<void*> object_handles{};
-            std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, std::forward<args_t>(args)...) };
+            const bool is_static_call{ this->object == nullptr };
 
-            const std::size_t rparen{ this->signature_text.rfind(')') };
-            const std::string_view return_signature{ rparen != std::string::npos ? std::string_view{ this->signature_text }.substr(rparen + 1) : std::string_view{ "V" } };
-
-            if (return_signature == "Ljava/lang/String;")
+            // Resolve jclass + jmethodID.  Both are cached on the
+            // method_proxy so subsequent calls skip the GetMethodID /
+            // FindClass round-trips — they're the dominant cost for
+            // tight call loops.
+            if (!this->cached_method_id)
             {
-                using call_object_method_a_t = void* (*)(void*, void*, void*, const vmhook::detail::jni_value*);
-                call_object_method_a_t const call_object_method_a{ vmhook::detail::jni_function<36, call_object_method_a_t>(vmhook::hotspot::current_jni_env) };
-                if (!call_object_method_a)
+                void* class_handle{ nullptr };
+
+                if (is_static_call)
                 {
-                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallObjectMethodA unavailable.", vmhook::error_tag, this->name(), this->signature_text);
-                    return value_t{ std::monostate{} };
+                    // Static path: get the owning klass's name via the
+                    // Method's pool_holder, then FindClass to obtain a
+                    // jclass.
+                    if (!this->method)
+                    {
+                        return value_t{ std::monostate{} };
+                    }
+                    if (auto* const const_method{ this->method->get_const_method() };
+                        const_method && vmhook::hotspot::is_valid_pointer(const_method))
+                    {
+                        if (auto* const cp{ const_method->get_constants() };
+                            cp && vmhook::hotspot::is_valid_pointer(cp))
+                        {
+                            static const auto* const pool_holder_entry{
+                                vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
+                            if (pool_holder_entry)
+                            {
+                                auto* const holder_klass{ *reinterpret_cast<vmhook::hotspot::klass**>(
+                                    reinterpret_cast<std::uint8_t*>(cp) + pool_holder_entry->offset) };
+                                if (holder_klass && vmhook::hotspot::is_valid_pointer(holder_klass))
+                                {
+                                    if (auto* const name_sym{ holder_klass->get_name() })
+                                    {
+                                        class_handle = vmhook::detail::jni_find_class(name_sym->to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!class_handle)
+                    {
+                        return value_t{ std::monostate{} };
+                    }
+                    this->cached_class_handle = class_handle;
+                    this->cached_method_id    = vmhook::detail::jni_get_static_method_id(
+                        class_handle, this->name(), this->signature_text);
+                }
+                else
+                {
+                    // Instance path: get_object_class to derive the
+                    // jclass from the receiver, then GetMethodID.
+                    void* object_storage{};
+                    void* const object_handle{ vmhook::detail::jni_oop_handle(this->object, object_storage) };
+                    class_handle = vmhook::detail::jni_get_object_class(object_handle);
+                    if (!class_handle)
+                    {
+                        return value_t{ std::monostate{} };
+                    }
+                    this->cached_class_handle = class_handle;
+                    this->cached_method_id    = vmhook::detail::jni_get_method_id(
+                        class_handle, this->name(), this->signature_text);
                 }
 
-                void* const result_handle{ call_object_method_a(vmhook::hotspot::current_jni_env, object_handle, resolved_method_id, values.data()) };
-                return value_t{ vmhook::detail::jni_get_string_utf(result_handle) };
+                if (!this->cached_method_id)
+                {
+                    vmhook::detail::jni_exception_clear();
+                    if (this->method && vmhook::hotspot::is_valid_pointer(this->method))
+                    {
+                        // Fallback: hand the Method* through verbatim.
+                        // Some JNI implementations accept this when
+                        // GetMethodID can't resolve.
+                        this->cached_method_id = reinterpret_cast<void*>(this->method);
+                    }
+                    else
+                    {
+                        return value_t{ std::monostate{} };
+                    }
+                }
             }
 
-            using call_void_method_a_t = void (*)(void*, void*, void*, const vmhook::detail::jni_value*);
-            call_void_method_a_t const call_void_method_a{ vmhook::detail::jni_function<63, call_void_method_a_t>(vmhook::hotspot::current_jni_env) };
-            if (!call_void_method_a)
+            // Build the jvalue array on the stack — no heap
+            // allocation in the call hot path.  All real Java methods
+            // we need to dispatch fit under arity 8.
+            constexpr std::size_t arg_cap{ 8 };
+            static_assert(sizeof...(args_t) <= arg_cap,
+                          "method_proxy::call: max 8 arguments");
+            vmhook::detail::jni_value values[arg_cap]{};
+            void*                     handle_storage[arg_cap]{};
+            std::size_t               arg_index{ 0 };
+            ((vmhook::detail::write_jni_arg_to_slot(values[arg_index],
+                                                     handle_storage[arg_index],
+                                                     std::forward<args_t>(args)),
+              ++arg_index), ...);
+            (void)arg_index;
+
+            void** const table{ *reinterpret_cast<void***>(env_void) };
+            void* const  method_id{ this->cached_method_id };
+
+            // The receiver passed to the JNI Call* function is the
+            // jclass for static calls and the jobject (indirect
+            // handle) for instance calls.  jni_oop_handle is cheap
+            // so we recompute the instance handle each call rather
+            // than caching across mutations of this->object.
+            void* receiver{ this->cached_class_handle };
+            void* instance_storage{};
+            if (!is_static_call)
             {
-                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallVoidMethodA unavailable.", vmhook::error_tag, this->name(), this->signature_text);
-                return value_t{ std::monostate{} };
+                receiver = vmhook::detail::jni_oop_handle(this->object, instance_storage);
             }
 
-            call_void_method_a(vmhook::hotspot::current_jni_env, object_handle, resolved_method_id, values.data());
-            return value_t{ std::monostate{} };
+            // Slot indices for Call(Static)?TypeMethodA in the JNIEnv
+            // function table.  Layout is stable across JNI versions:
+            //   instance Object=36, Bool=39, Byte=42, Char=45,
+            //            Short=48, Int=51, Long=54, Float=57,
+            //            Double=60, Void=63
+            //   static   Object=116, Bool=119, Byte=122, Char=125,
+            //            Short=128, Int=131, Long=134, Float=137,
+            //            Double=140, Void=143
+            switch (ret_char)
+            {
+                case 'V':
+                {
+                    using fn_t = void(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 143u : 63u };
+                    if (auto* const fn{ reinterpret_cast<fn_t>(table[slot]) })
+                    {
+                        fn(env_void, receiver, method_id, values);
+                    }
+                    return value_t{ std::monostate{} };
+                }
+                case 'Z':
+                {
+                    using fn_t = std::uint8_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 119u : 39u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) != 0 }
+                              : value_t{ std::monostate{} };
+                }
+                case 'B':
+                {
+                    using fn_t = std::int8_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 122u : 42u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
+                              : value_t{ std::monostate{} };
+                }
+                case 'C':
+                {
+                    using fn_t = std::uint16_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 125u : 45u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
+                              : value_t{ std::monostate{} };
+                }
+                case 'S':
+                {
+                    using fn_t = std::int16_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 128u : 48u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
+                              : value_t{ std::monostate{} };
+                }
+                case 'I':
+                {
+                    using fn_t = std::int32_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 131u : 51u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
+                              : value_t{ std::monostate{} };
+                }
+                case 'J':
+                {
+                    using fn_t = std::int64_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 134u : 54u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
+                              : value_t{ std::monostate{} };
+                }
+                case 'F':
+                {
+                    using fn_t = float(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 137u : 57u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
+                              : value_t{ std::monostate{} };
+                }
+                case 'D':
+                {
+                    using fn_t = double(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 140u : 60u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
+                              : value_t{ std::monostate{} };
+                }
+                case 'L':
+                case '[':
+                {
+                    using fn_t = void*(*)(void*, void*, void*, const vmhook::detail::jni_value*);
+                    const std::size_t slot{ is_static_call ? 116u : 36u };
+                    auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
+                    if (!fn)
+                    {
+                        return value_t{ std::monostate{} };
+                    }
+                    void* const result_handle{ fn(env_void, receiver, method_id, values) };
+                    // Convenience: when the method returns
+                    // java.lang.String, return a std::string copy.
+                    if (rparen == std::string::npos)
+                    {
+                        rparen = this->signature_text.rfind(')');
+                    }
+                    if (rparen != std::string::npos
+                        && std::string_view{ this->signature_text }.substr(rparen + 1) == "Ljava/lang/String;")
+                    {
+                        return value_t{ vmhook::detail::jni_get_string_utf(result_handle) };
+                    }
+                    // Any other reference type: best-effort return
+                    // the handle's truncated value so callers know it
+                    // was non-null.
+                    return value_t{
+                        static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(result_handle)) };
+                }
+                default:
+                    return value_t{ std::monostate{} };
+            }
         }
 
         /*
@@ -8432,6 +8776,22 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
+            // On modern JDKs (21+) StubRoutines::_call_stub_entry is
+            // often missing from VMStructs.  In that case the entire
+            // call_stub-prep block below is wasted work, so we
+            // short-circuit straight into the JNI path on *this* —
+            // which keeps the proxy's cached_method_id / class_handle
+            // warm across iterations.
+            void* const call_stub{ vmhook::detail::find_call_stub_entry() };
+            if (!call_stub)
+            {
+                if (!vmhook::hotspot::ensure_current_java_thread())
+                {
+                    return value_t{ std::monostate{} };
+                }
+                return this->call_jni(std::forward<args_t>(args)...);
+            }
+
             vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
             const std::string selected_signature{ selected_method ? selected_method->get_signature() : this->signature_text };
 
@@ -8446,15 +8806,6 @@ namespace vmhook
             {
                 VMHOOK_LOG("{} method_proxy::call('{}{}'): current JavaThread is null after attach.", vmhook::error_tag, this->name(), selected_signature);
                 return value_t{ std::monostate{} };
-            }
-
-            // Locate HotSpot's C++-to-Java call gate via VMStructs.
-            // StubRoutines::_call_stub_entry was removed from the VMStruct
-            // export table in some JDK releases; check availability at runtime.
-            void* const call_stub{ vmhook::detail::find_call_stub_entry() };
-            if (!call_stub)
-            {
-                return method_proxy{ this->object, selected_method, selected_signature }.call_jni(std::forward<args_t>(args)...);
             }
 
             void* const entry{ selected_method->get_from_interpreted_entry() };
@@ -8939,6 +9290,19 @@ namespace vmhook
         vmhook::hotspot::method* method;
         std::string signature_text;
         bool        static_field;
+
+        // Lazy caches for the JNI fallback path.  Resolving
+        // jmethodID / jclass once and reusing them across calls is
+        // the single biggest speedup against pure JNI for tight
+        // call loops (GetMethodID is a hashtable lookup inside the
+        // JVM).  Both are mutable because call() is const.
+        mutable void* cached_method_id{ nullptr };
+        mutable void* cached_class_handle{ nullptr };
+        // Cached return-type char parsed from signature_text on the
+        // first call.  Skips the per-call rfind() in the hot path.
+        // Zero means "not yet computed"; the actual chars are all
+        // non-zero (`I`, `J`, `V`, ...).
+        mutable char  cached_ret_char{ 0 };
     };
 
     // --- Object base class ----------------------------------------------------

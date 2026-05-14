@@ -18,6 +18,36 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `java.lang.Throwable::fillInStackTrace()`.  Fires whenever any Throwable
   subclass is constructed through one of the public constructors and
   reports the dynamic class name (read from the oop's narrow-klass header).
+- Optional vmhook-vs-pure-JNI microbench at `vmhook/src/speedtest.cpp`.
+  Lives in its own translation unit so `<jni.h>` never leaks into
+  `vmhook.hpp`; opt-in via CMake's `find_package(JNI)` and runs at the end
+  of the JVM integration suite, printing `[BENCH]` lines with ns/call for
+  both paths.
+
+### Changed
+- `method_proxy::call_jni` now handles **static methods** and every
+  primitive return type (`Z B C S I J F D V` plus `Ljava/lang/String;`).
+  Previously it only supported instance methods returning `void` or
+  `String`, which broke on modern JDKs where
+  `StubRoutines::_call_stub_entry` is no longer in VMStructs and the
+  fallback path was the only way to dispatch.
+- `method_proxy` caches `jmethodID` / `jclass` / return-type char on
+  first call and reuses them across subsequent invocations.  Combined
+  with packing JNI args on the stack instead of through a
+  `std::vector`, this brings a tight `Math.abs`-style call loop from
+  ~36× slower than pure JNI down to ~1.5× — most of the residual gap
+  is the type-safe variant return and the thread-local attach probe.
+- `call()` short-circuits straight into `call_jni` on JDKs where
+  `_call_stub_entry` is unavailable, instead of doing the call-stub
+  prep work (overload resolution, signature reload) on every call only
+  to throw it away.
+
+### Fixed
+- `for_each_loaded_class` returned nothing on JDK 8.  The internal
+  `ClassLoaderDataGraph::for_each_klass` only walked
+  `ClassLoaderData::_klasses` (JDK 21+); the JDK 8 path walks
+  per-CLD `_dictionary` hashtables plus `SystemDictionary::_dictionary`
+  and `_shared_dictionary` for bootstrap classes, which is now wired up.
 
 ## [0.4.0] — 2026-05-14
 
