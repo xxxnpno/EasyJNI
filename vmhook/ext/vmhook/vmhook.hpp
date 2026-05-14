@@ -5649,8 +5649,29 @@ namespace vmhook
         @see midi2i_hook, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
     */
     template<class wrapper_type>
+    static auto hook(const std::string_view method_name,
+                     const std::string_view method_signature,
+                     auto&& user_detour) -> bool;
+
+    template<class wrapper_type>
     static auto hook(const std::string_view method_name, auto&& user_detour)
         -> bool
+    {
+        return vmhook::hook<wrapper_type>(method_name, std::string_view{}, std::forward<decltype(user_detour)>(user_detour));
+    }
+
+    /*
+        @brief Signature-filtered hook overload.
+        @details
+        Same behaviour as hook<T>(name, callback) but selects the method by
+        matching both name and JVM descriptor.  Use when the target class
+        has overloaded methods sharing the same name (e.g. ClassLoader's
+        five `defineClass` variants).
+    */
+    template<class wrapper_type>
+    static auto hook(const std::string_view method_name,
+                     const std::string_view method_signature,
+                     auto&& user_detour) -> bool
     {
         try
         {
@@ -5684,8 +5705,11 @@ namespace vmhook
                 vmhook::hotspot::method* const method_ptr{ methods_array[method_index] };
                 if (method_ptr && vmhook::hotspot::is_valid_pointer(method_ptr) && method_ptr->get_name() == method_name)
                 {
-                    found_method = method_ptr;
-                    break;
+                    if (method_signature.empty() || method_ptr->get_signature() == method_signature)
+                    {
+                        found_method = method_ptr;
+                        break;
+                    }
                 }
             }
 
@@ -9961,83 +9985,137 @@ namespace vmhook
     }
 
     /*
-        @brief Watches the JVM's class-loader graph and invokes a callback
-               for every newly-loaded class.
+        @brief Registry that owns the class-load callbacks installed by
+               on_class_loaded.  Lives inside namespace detail because it
+               is implementation-only; users get the class name through
+               the on_class_loaded callback.
+    */
+    namespace detail
+    {
+        using class_load_callback_t = std::function<void(const std::string&)>;
+        inline std::mutex                                          class_load_mutex{};
+        inline std::vector<std::shared_ptr<class_load_callback_t>> class_load_callbacks{};
+        inline bool                                                class_load_hook_installed{ false };
+
+        // Internal C++ wrapper for java.lang.ClassLoader used only by the
+        // class-load hook.  Not exposed publicly; users see the class
+        // name string in the callback.
+        class class_loader_wrapper : public vmhook::object<class_loader_wrapper>
+        {
+        public:
+            explicit class_loader_wrapper(vmhook::oop_t oop) noexcept
+                : vmhook::object<class_loader_wrapper>{ oop }
+            {
+            }
+        };
+    }
+
+    /*
+        @brief Registers a callback fired whenever java.lang.ClassLoader
+               defines a new class.
         @details
-        Spawns a background thread that periodically snapshots the set of
-        known klasses by walking the ClassLoaderDataGraph.  Every klass
-        present in the new snapshot but absent from the previous one fires
-        the callback as a single event.  The initial snapshot does NOT
-        fire callbacks for already-loaded classes (only for classes that
-        appear after the watcher was registered).
+        Installs an interpreter hook on the Java method
+        `java.lang.ClassLoader::defineClass(String, byte[], int, int,
+        ProtectionDomain)` and dispatches the callback with the internal
+        class name read from the call's first argument.  This is
+        event-driven: zero latency, zero idle cost — no polling.
 
-        Class-load events are intrinsically asynchronous; the callback may
-        fire on a background thread well after the JVM finishes class
-        initialization.  poll_interval trades latency for CPU cost.
+        Limitations:
+          - Only catches classes defined through ClassLoader.defineClass.
+            Bootstrap-loaded classes (java.*, javax.*, sun.*) are not
+            reported because they bypass the Java-side defineClass entry.
+          - The (String, ByteBuffer, ProtectionDomain) overload of
+            defineClass is not yet hooked.
 
-        Complexity: O(N) per poll where N = total loaded classes.
-        Exception safety: noexcept boundary — callback exceptions are caught.
-        Thread safety: callback runs on the watcher thread.
+        Exception safety: noexcept boundary — callback exceptions are caught
+            and logged through VMHOOK_LOG.
+        Thread safety: the callback runs on the Java thread that triggered
+            the class definition.
 
         Example:
             auto handle{ vmhook::on_class_loaded(
-                std::chrono::milliseconds{ 100 },
-                [](const std::string& internal_name, vmhook::hotspot::klass* k)
+                [](const std::string& internal_name)
                 {
-                    std::println("loaded: {} ({})", internal_name, (void*)k);
+                    std::println("loaded: {}", internal_name);
                 }) };
+
+        @tparam callback_type Callable invoked as `void(const std::string&)`.
+                              Argument is the JVM-style `/`-separated name.
     */
     template<typename callback_type>
-    inline auto on_class_loaded(
-        std::chrono::milliseconds poll_interval,
-        callback_type             on_load) -> watch_handle
+    inline auto on_class_loaded(callback_type on_load) -> watch_handle
     {
-        auto block{ std::make_shared<watch_handle::control_block>() };
-        std::chrono::milliseconds captured_interval{ poll_interval };
+        auto cb{ std::make_shared<detail::class_load_callback_t>(std::move(on_load)) };
 
-        block->worker = std::thread{ [block,
-                                       captured_interval,
-                                       on_load = std::move(on_load)]()
+        {
+            std::lock_guard<std::mutex> guard{ detail::class_load_mutex };
+            detail::class_load_callbacks.push_back(cb);
+
+            if (!detail::class_load_hook_installed)
             {
-                std::unordered_map<std::string, vmhook::hotspot::klass*> seen;
-                bool first_pass{ true };
+                if (vmhook::type_to_class_map.find(std::type_index{ typeid(detail::class_loader_wrapper) })
+                    == vmhook::type_to_class_map.end())
+                {
+                    vmhook::register_class<detail::class_loader_wrapper>("java/lang/ClassLoader");
+                }
 
+                const bool installed{ vmhook::hook<detail::class_loader_wrapper>(
+                    "defineClass",
+                    "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;",
+                    [](vmhook::return_value& /*ret*/,
+                       const std::unique_ptr<detail::class_loader_wrapper>& /*self*/,
+                       const std::string& name,
+                       vmhook::oop_t /*bytes*/,
+                       std::int32_t /*offset*/,
+                       std::int32_t /*length*/,
+                       vmhook::oop_t /*protection_domain*/)
+                    {
+                        std::vector<std::shared_ptr<detail::class_load_callback_t>> snapshot;
+                        {
+                            std::lock_guard<std::mutex> guard2{ detail::class_load_mutex };
+                            snapshot = detail::class_load_callbacks;
+                        }
+                        std::string internal_name{ name };
+                        std::replace(internal_name.begin(), internal_name.end(), '.', '/');
+                        for (auto& callback : snapshot)
+                        {
+                            if (!callback) { continue; }
+                            try
+                            {
+                                (*callback)(internal_name);
+                            }
+                            catch (const std::exception& ex)
+                            {
+                                VMHOOK_LOG("{} on_class_loaded callback: {}",
+                                           vmhook::error_tag, ex.what());
+                            }
+                        }
+                    }) };
+
+                if (installed)
+                {
+                    detail::class_load_hook_installed = true;
+                }
+                else
+                {
+                    VMHOOK_LOG("{} on_class_loaded: ClassLoader.defineClass hook installation failed",
+                               vmhook::error_tag);
+                }
+            }
+        }
+
+        auto block{ std::make_shared<watch_handle::control_block>() };
+        block->worker = std::thread{ [block, cb]()
+            {
                 while (block->running.load(std::memory_order_relaxed))
                 {
-                    try
-                    {
-                        const vmhook::hotspot::class_loader_data_graph graph{};
-                        graph.for_each_klass(
-                            [&seen, &on_load, first_pass](const std::string& name,
-                                                          vmhook::hotspot::klass* k) noexcept
-                            {
-                                if (name.empty() || seen.find(name) != seen.end())
-                                {
-                                    return;
-                                }
-                                seen.emplace(name, k);
-                                if (!first_pass)
-                                {
-                                    try
-                                    {
-                                        on_load(name, k);
-                                    }
-                                    catch (const std::exception& ex)
-                                    {
-                                        VMHOOK_LOG("{} on_class_loaded callback: {}",
-                                                   vmhook::error_tag, ex.what());
-                                    }
-                                }
-                            });
-                        first_pass = false;
-                    }
-                    catch (const std::exception& ex)
-                    {
-                        VMHOOK_LOG("{} on_class_loaded poll: {}",
-                                   vmhook::error_tag, ex.what());
-                    }
-                    std::this_thread::sleep_for(captured_interval);
+                    std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
                 }
+                std::lock_guard<std::mutex> guard{ detail::class_load_mutex };
+                detail::class_load_callbacks.erase(
+                    std::remove(detail::class_load_callbacks.begin(),
+                                detail::class_load_callbacks.end(), cb),
+                    detail::class_load_callbacks.end());
             } };
 
         return watch_handle{ std::move(block) };

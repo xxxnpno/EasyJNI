@@ -2375,22 +2375,15 @@ namespace
         check("fieldWatcherCounterReached", ticker_probe_class::get_counter() > 0);
     }
 
-    // ── on_class_loaded — class-load watch probe ───────────────────────────
+    // ── on_class_loaded — class-load hook probe ────────────────────────────
     auto test_class_load_watcher() -> void
     {
         std::atomic_bool late_seen{ false };
         std::atomic_int  any_class_seen{ 0 };
-        std::mutex names_mutex{};
-        std::vector<std::string> observed_names{};
 
         auto watcher{ vmhook::on_class_loaded(
-            std::chrono::milliseconds{ 25 },
-            [&](const std::string& name, vmhook::hotspot::klass* /*klass*/)
+            [&](const std::string& name)
             {
-                {
-                    std::lock_guard<std::mutex> guard{ names_mutex };
-                    observed_names.push_back(name);
-                }
                 ++any_class_seen;
                 if (name == "vmhook/LateClass")
                 {
@@ -2405,26 +2398,16 @@ namespace
                                               example_class::get_class_load_probe_done) };
         check("classLoadProbeDone", probe_done);
 
-        // Give the watcher up to a second to observe the new klass.
-        for (int i{ 0 }; i < 100 && !late_seen.load(); ++i)
+        // Give the in-process hook a moment to fire after the Java side
+        // returns; the hook is synchronous on the Java thread, so the
+        // event has typically already been delivered by the time
+        // run_java_probe returns, but we allow a small grace window.
+        for (int i{ 0 }; i < 50 && !late_seen.load(); ++i)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 10 });
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 5 });
         }
 
-        // On JDK 8 the ClassLoaderData layout does not export _klasses (the
-        // adaptive walker uses _dictionary instead, and our for_each_klass
-        // currently only iterates the _klasses path).  Treat a zero-event
-        // watcher as a known limitation rather than a hard failure on
-        // pre-JDK-9 builds.
-        if (any_class_seen.load() == 0)
-        {
-            write_result("[INFO] classLoadObservedLateClass: skipped "
-                         "(for_each_klass walker requires JDK 9+ _klasses field)");
-        }
-        else
-        {
-            check("classLoadObservedLateClass", late_seen.load());
-        }
+        check("classLoadObservedLateClass", late_seen.load());
     }
 } // namespace (anonymous)
 
