@@ -33,3 +33,5 @@ out/
 test_results.txt
 java_stdout.txt
 java_stderr.txt
+
+.claude/
