@@ -387,6 +387,74 @@ features that depend on the trap.
 - The callback must not allocate Java objects or call back into the JVM
   (those require a JavaThread and a safe-point window).
 
+## Stack traces from inside a hook
+
+`return_value::stack_trace(max_depth = 64)` walks the saved-rbp chain
+the same way `caller()` does, but keeps going as long as each frame
+passes the safe-pointer checks.  It returns a `std::vector<caller_info>`
+ordered from immediate caller (index 0) outward.
+
+```cpp
+auto detour = [](vmhook::return_value& ret,
+                 const std::unique_ptr<my_class>& self)
+{
+    for (auto const& frame : ret.stack_trace())
+    {
+        VMHOOK_LOG("  at {}.{}{}",
+                   frame.class_name, frame.method_name, frame.signature);
+    }
+};
+```
+
+The walk terminates when it hits a compiled or native frame (those
+don't follow the interpreter layout), so the trace covers only the
+interpreted portion of the stack.
+
+## Hooking exception construction
+
+`vmhook::on_exception(callback)` installs a method hook on
+`java.lang.Throwable::fillInStackTrace()` and fires the callback every
+time *any* Throwable (or subclass) is constructed through one of the
+public constructors.  Catches `NullPointerException`, `IOException`,
+`IllegalArgumentException`, your own exceptions, etc.
+
+```cpp
+auto watcher{ vmhook::on_exception(
+    [](const std::string& internal_name)
+    {
+        if (internal_name == "java/lang/NullPointerException")
+        {
+            VMHOOK_LOG("NPE constructed!");
+        }
+    }) };
+```
+
+The callback receives the throwable's *dynamic* class name (read from
+the oop's narrow-klass header, not the static `Throwable` type).
+Misses Throwables built with `writableStackTrace=false` and any
+subclass that overrides `fillInStackTrace` to a no-op.
+
+## Enumerating loaded classes
+
+`vmhook::for_each_loaded_class(visitor)` snapshots the JVM's
+`ClassLoaderDataGraph` and invokes the visitor once per Klass that is
+currently reachable.
+
+```cpp
+vmhook::for_each_loaded_class(
+    [](const std::string& name, vmhook::hotspot::klass*)
+    {
+        if (name.starts_with("net/minecraft/"))
+        {
+            VMHOOK_LOG("loaded: {}", name);
+        }
+    });
+```
+
+It's a *snapshot* — classes loaded later won't be visited.  For live
+notifications, use `vmhook::on_class_loaded` (which is event-driven on
+`ClassLoader.defineClass`).
+
 ## Watching for newly-loaded classes
 
 `vmhook::on_class_loaded(callback)` installs a **method hook on

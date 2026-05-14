@@ -1174,6 +1174,52 @@ namespace vmhook
         auto caller() const noexcept -> caller_info;
 
         /*
+            @brief Captures the full interpreter call stack as a vector
+                   of caller_info, starting with the hooked method's
+                   immediate caller (index 0) and walking outward.
+            @details
+            Walks the saved-rbp chain the same way `caller()` does, but
+            keeps going as long as every read passes the safe-pointer
+            checks.  The walk terminates when:
+              - `max_depth` frames have been captured, or
+              - the next saved-rbp slot fails validation (typically
+                because we have walked into a compiled or native frame
+                that does not follow the interpreter layout), or
+              - the next Method* fails validation.
+
+            The first entry (index 0) is the same value `caller()`
+            returns.  Subsequent entries describe progressively older
+            interpreter frames.  An empty result means the immediate
+            caller already failed validation (compiled / native / no
+            frame).
+
+            Typical use from inside a hook detour:
+
+            @code
+                auto detour = [](vmhook::return_value& ret, const std::unique_ptr<my_class>& self)
+                {
+                    for (auto const& frame : ret.stack_trace())
+                    {
+                        VMHOOK_LOG("  at {}.{}{}",
+                                   frame.class_name, frame.method_name, frame.signature);
+                    }
+                };
+            @endcode
+
+            Complexity: O(D) where D = depth of interpreter frames.
+            Exception safety: noexcept — every dereference is gated by
+                vmhook::hotspot::is_valid_pointer.
+            Thread safety: must be called only from the hook callback,
+                while the interpreter frame layout above the hook is
+                still intact.
+
+            @param max_depth Hard cap on the number of frames returned;
+                             defaults to 64.  Pass 0 for the default.
+        */
+        auto stack_trace(std::size_t max_depth = 64) const noexcept
+            -> std::vector<caller_info>;
+
+        /*
             @brief Returns the intercepted interpreter frame, or nullptr.
             @details
             Exposed for advanced use cases that need to walk the call stack
@@ -1746,9 +1792,28 @@ namespace vmhook
                     {
                         throw vmhook::exception{ "Failed to find ConstMethod._name_index entry." };
                     }
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return nullptr;
+                    }
 
                     const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::const_method*>(this)) + entry->offset) };
-                    return reinterpret_cast<vmhook::hotspot::symbol*>(get_constants()->get_base()[index]);
+                    auto* const cp{ this->get_constants() };
+                    if (!cp || !vmhook::hotspot::is_valid_pointer(cp))
+                    {
+                        return nullptr;
+                    }
+                    void** const base{ cp->get_base() };
+                    if (!base || !vmhook::hotspot::is_valid_pointer(base))
+                    {
+                        return nullptr;
+                    }
+                    void* const entry_pointer{ base[index] };
+                    if (!entry_pointer || !vmhook::hotspot::is_valid_pointer(entry_pointer))
+                    {
+                        return nullptr;
+                    }
+                    return reinterpret_cast<vmhook::hotspot::symbol*>(entry_pointer);
                 }
                 catch (const std::exception& exception)
                 {
@@ -1771,9 +1836,28 @@ namespace vmhook
                     {
                         throw vmhook::exception{ "Failed to find ConstMethod._signature_index entry." };
                     }
+                    if (!vmhook::hotspot::is_valid_pointer(this))
+                    {
+                        return nullptr;
+                    }
 
                     const std::uint16_t index{ *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::const_method*>(this)) + entry->offset) };
-                    return reinterpret_cast<vmhook::hotspot::symbol*>(get_constants()->get_base()[index]);
+                    auto* const cp{ this->get_constants() };
+                    if (!cp || !vmhook::hotspot::is_valid_pointer(cp))
+                    {
+                        return nullptr;
+                    }
+                    void** const base{ cp->get_base() };
+                    if (!base || !vmhook::hotspot::is_valid_pointer(base))
+                    {
+                        return nullptr;
+                    }
+                    void* const entry_pointer{ base[index] };
+                    if (!entry_pointer || !vmhook::hotspot::is_valid_pointer(entry_pointer))
+                    {
+                        return nullptr;
+                    }
+                    return reinterpret_cast<vmhook::hotspot::symbol*>(entry_pointer);
                 }
                 catch (const std::exception& exception)
                 {
@@ -1921,19 +2005,27 @@ namespace vmhook
             auto get_name() const
                 -> std::string
             {
+                // Validate `this` (this Method*) before dereferencing.
+                // Stack walks (e.g. return_value::stack_trace) can hand
+                // us a Method* that passes is_valid_pointer but isn't a
+                // real Method, so any subsequent field read may crash.
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return std::string{};
+                }
                 const vmhook::hotspot::const_method* const const_method_pointer{ this->get_const_method() };
 
                 try
                 {
-                    if (!const_method_pointer)
+                    if (!const_method_pointer || !vmhook::hotspot::is_valid_pointer(const_method_pointer))
                     {
-                        throw vmhook::exception{ "ConstMethod is nullptr." };
+                        throw vmhook::exception{ "ConstMethod is nullptr or invalid." };
                     }
 
                     const vmhook::hotspot::symbol* const symbol_pointer{ const_method_pointer->get_name() };
-                    if (!symbol_pointer)
+                    if (!symbol_pointer || !vmhook::hotspot::is_valid_pointer(symbol_pointer))
                     {
-                        throw vmhook::exception{ "Symbol is nullptr." };
+                        throw vmhook::exception{ "Symbol is nullptr or invalid." };
                     }
 
                     return symbol_pointer->to_string();
@@ -1951,19 +2043,26 @@ namespace vmhook
             auto get_signature() const
                 -> std::string
             {
+                // Same defensive pattern as get_name(): validate `this`
+                // and the ConstMethod / Symbol pointers so stack walks
+                // that drift into garbage memory don't crash here.
+                if (!vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return std::string{};
+                }
                 const vmhook::hotspot::const_method* const const_method_pointer{ this->get_const_method() };
 
                 try
                 {
-                    if (!const_method_pointer)
+                    if (!const_method_pointer || !vmhook::hotspot::is_valid_pointer(const_method_pointer))
                     {
-                        throw vmhook::exception{ "ConstMethod is nullptr." };
+                        throw vmhook::exception{ "ConstMethod is nullptr or invalid." };
                     }
 
                     const vmhook::hotspot::symbol* const symbol_pointer{ const_method_pointer->get_signature() };
-                    if (!symbol_pointer)
+                    if (!symbol_pointer || !vmhook::hotspot::is_valid_pointer(symbol_pointer))
                     {
-                        throw vmhook::exception{ "Symbol is nullptr." };
+                        throw vmhook::exception{ "Symbol is nullptr or invalid." };
                     }
 
                     return symbol_pointer->to_string();
@@ -5235,6 +5334,59 @@ namespace vmhook
     }
 
     /*
+        @brief Invokes a callback for every loaded Java class.
+        @details
+        Walks the global ClassLoaderDataGraph and invokes the visitor
+        once per Klass that is currently reachable through any
+        ClassLoaderData node.  The visitor is called as
+        `visitor(internal_name, klass*)` where `internal_name` uses
+        JVM `/`-separated form (e.g. `"java/lang/String"`).
+
+        The iteration is a *snapshot* taken at call time — classes
+        loaded after `for_each_loaded_class` returns are not visited.
+        Use `vmhook::on_class_loaded` for live notifications.
+
+        On JDK 8 builds where `ClassLoaderData::_klasses` is not in
+        VMStructs, iteration falls back to per-CLD dictionaries and
+        may miss classes registered through internal-only paths; on
+        JDK 21+ every loaded Klass is enumerated.
+
+        Complexity: O(N) where N = total loaded classes.
+        Exception safety: callback exceptions propagate; iteration
+            stops at the throwing visit.
+        Thread safety: safe to call concurrently with normal JVM
+            execution; the underlying graph mutates on class load /
+            unload so the snapshot is best-effort.
+
+        @tparam visitor_type Callable invoked as
+                             `void(const std::string&, vmhook::hotspot::klass*)`.
+
+        Example:
+        @code
+            vmhook::for_each_loaded_class([](const std::string& name, vmhook::hotspot::klass*)
+            {
+                if (name.starts_with("net/minecraft/"))
+                {
+                    VMHOOK_LOG("loaded: {}", name);
+                }
+            });
+        @endcode
+    */
+    template<typename visitor_type>
+    inline auto for_each_loaded_class(visitor_type&& visit) -> void
+    {
+        try
+        {
+            const vmhook::hotspot::class_loader_data_graph graph{};
+            graph.for_each_klass(std::forward<visitor_type>(visit));
+        }
+        catch (const std::exception& ex)
+        {
+            VMHOOK_LOG("{} for_each_loaded_class: {}", vmhook::error_tag, ex.what());
+        }
+    }
+
+    /*
         @brief Associates a C++ type with its corresponding Java class name.
         @tparam T The C++ type to register.
         @param class_name The internal JVM class name using '/' separators.
@@ -5659,6 +5811,106 @@ namespace vmhook
         }
 
         return info;
+    }
+
+    inline auto return_value::stack_trace(std::size_t max_depth) const noexcept
+        -> std::vector<caller_info>
+    {
+        std::vector<caller_info> frames{};
+        if (max_depth == 0)
+        {
+            max_depth = 64;
+        }
+        if (!this->stack_frame)
+        {
+            return frames;
+        }
+
+        // Walk the saved-rbp chain.  Each iteration reads the caller's
+        // rbp from [current_rbp+0], then their Method* from
+        // [caller_rbp - 24].  Every dereference is gated by
+        // is_valid_pointer so a non-interpreter frame produces an early
+        // return rather than a crash.
+        void* current_rbp_slot{ this->stack_frame };
+        frames.reserve(8);
+
+        static const auto* const pool_holder_entry{
+            vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
+
+        for (std::size_t depth{ 0 }; depth < max_depth; ++depth)
+        {
+            if (!vmhook::hotspot::is_valid_pointer(current_rbp_slot))
+            {
+                break;
+            }
+            void* const caller_rbp{ *reinterpret_cast<void* const*>(current_rbp_slot) };
+            if (!vmhook::hotspot::is_valid_pointer(caller_rbp))
+            {
+                break;
+            }
+
+            void* const caller_method_slot{
+                reinterpret_cast<std::uint8_t*>(caller_rbp) - 24 };
+            if (!vmhook::hotspot::is_valid_pointer(caller_method_slot))
+            {
+                break;
+            }
+            auto* const caller_method{
+                *reinterpret_cast<vmhook::hotspot::method* const*>(caller_method_slot) };
+            if (!caller_method || !vmhook::hotspot::is_valid_pointer(caller_method))
+            {
+                break;
+            }
+
+            std::string method_name{ caller_method->get_name() };
+            if (method_name.empty())
+            {
+                break;
+            }
+
+            caller_info info{};
+            info.method      = caller_method;
+            info.method_name = std::move(method_name);
+            info.signature   = caller_method->get_signature();
+
+            // Class-name lookup is best-effort: when the stack walk
+            // strays into invalid territory the chain of pointer reads
+            // through ConstMethod / ConstantPool / Klass can land on
+            // garbage that happens to pass the not-null check.  Gate
+            // every dereference with is_valid_pointer so we leave the
+            // class name empty instead of segfaulting.
+            if (auto* const const_method{ caller_method->get_const_method() };
+                const_method && vmhook::hotspot::is_valid_pointer(const_method))
+            {
+                if (auto* const cp{ const_method->get_constants() };
+                    cp && vmhook::hotspot::is_valid_pointer(cp))
+                {
+                    if (pool_holder_entry)
+                    {
+                        const auto* const slot{
+                            reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset };
+                        if (vmhook::hotspot::is_valid_pointer(slot))
+                        {
+                            auto* const klass{
+                                *reinterpret_cast<vmhook::hotspot::klass* const*>(slot) };
+                            if (klass && vmhook::hotspot::is_valid_pointer(klass))
+                            {
+                                if (auto* const name_symbol{ klass->get_name() };
+                                    name_symbol && vmhook::hotspot::is_valid_pointer(name_symbol))
+                                {
+                                    info.class_name = name_symbol->to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            frames.push_back(std::move(info));
+            current_rbp_slot = caller_rbp;
+        }
+
+        return frames;
     }
 
     template<typename value_type>
@@ -10433,6 +10685,154 @@ namespace vmhook
                     std::remove(detail::class_load_callbacks.begin(),
                                 detail::class_load_callbacks.end(), cb),
                     detail::class_load_callbacks.end());
+            }
+            catch (...) { /* swallowed */ }
+        };
+
+        return watch_handle{ std::move(block) };
+    }
+
+    /*
+        @brief Registry that owns the exception callbacks installed by
+               on_exception.
+    */
+    namespace detail
+    {
+        using exception_callback_t = std::function<void(const std::string&)>;
+        inline std::mutex                                          exception_mutex{};
+        inline std::vector<std::shared_ptr<exception_callback_t>>  exception_callbacks{};
+        inline bool                                                exception_hook_installed{ false };
+
+        // Internal C++ wrapper for java.lang.Throwable used only by the
+        // exception hook.  Not exposed publicly.
+        class throwable_wrapper : public vmhook::object<throwable_wrapper>
+        {
+        public:
+            explicit throwable_wrapper(vmhook::oop_t oop) noexcept
+                : vmhook::object<throwable_wrapper>{ oop }
+            {
+            }
+        };
+    }
+
+    /*
+        @brief Registers a callback fired whenever a `java.lang.Throwable`
+               (or any subclass) is constructed.
+        @details
+        Installs an interpreter hook on
+        `java.lang.Throwable::fillInStackTrace()Ljava/lang/Throwable;`,
+        which every public Throwable constructor calls before
+        returning.  When the hook fires we read the dynamic klass off
+        the receiver oop's narrow-klass header and dispatch the
+        callback with the fully-qualified internal class name (`/`-
+        separated).
+
+        This catches NullPointerException, IOException,
+        IllegalArgumentException, custom exceptions, and any other
+        Throwable whose constructor goes through `fillInStackTrace`.
+        It misses:
+          - exceptions constructed with `writableStackTrace=false`
+            (the 4-bool protected constructor with that flag set),
+          - subclasses that override `fillInStackTrace` to a no-op
+            for performance (rare; some preallocated VM errors do
+            this).
+
+        Event-driven: zero polling, zero idle cost.
+
+        Exception safety: noexcept boundary — callback exceptions are
+            caught and logged through VMHOOK_LOG.
+        Thread safety: the callback runs on the Java thread that
+            constructed the throwable.
+
+        @tparam callback_type Callable invoked as
+                              `void(const std::string&)`.  The string
+                              is the throwable's internal class name
+                              (e.g. `"java/lang/NullPointerException"`).
+    */
+    template<typename callback_type>
+    inline auto on_exception(callback_type on_throw) -> watch_handle
+    {
+        auto cb{ std::make_shared<detail::exception_callback_t>(std::move(on_throw)) };
+
+        {
+            std::lock_guard<std::mutex> guard{ detail::exception_mutex };
+            detail::exception_callbacks.push_back(cb);
+
+            if (!detail::exception_hook_installed)
+            {
+                if (vmhook::type_to_class_map.find(std::type_index{ typeid(detail::throwable_wrapper) })
+                    == vmhook::type_to_class_map.end())
+                {
+                    vmhook::register_class<detail::throwable_wrapper>("java/lang/Throwable");
+                }
+
+                auto fill_in_stack_trace_detour = [](
+                    vmhook::return_value& /*ret*/,
+                    const std::unique_ptr<detail::throwable_wrapper>& self)
+                {
+                    std::string internal_name{};
+                    if (self)
+                    {
+                        if (auto* const dynamic_klass{ vmhook::klass_from_oop(self->get_instance()) })
+                        {
+                            if (auto* const sym{ dynamic_klass->get_name() })
+                            {
+                                internal_name = sym->to_string();
+                            }
+                        }
+                    }
+                    if (internal_name.empty())
+                    {
+                        internal_name = "java/lang/Throwable";
+                    }
+
+                    std::vector<std::shared_ptr<detail::exception_callback_t>> snapshot;
+                    {
+                        std::lock_guard<std::mutex> guard2{ detail::exception_mutex };
+                        snapshot = detail::exception_callbacks;
+                    }
+                    for (auto& callback : snapshot)
+                    {
+                        if (!callback) { continue; }
+                        try
+                        {
+                            (*callback)(internal_name);
+                        }
+                        catch (const std::exception& ex)
+                        {
+                            VMHOOK_LOG("{} on_exception callback: {}",
+                                       vmhook::error_tag, ex.what());
+                        }
+                    }
+                };
+
+                const bool installed = vmhook::hook<detail::throwable_wrapper>(
+                    "fillInStackTrace",
+                    "()Ljava/lang/Throwable;",
+                    fill_in_stack_trace_detour);
+
+                if (installed)
+                {
+                    detail::exception_hook_installed = true;
+                }
+                else
+                {
+                    VMHOOK_LOG("{} on_exception: Throwable.fillInStackTrace hook installation failed",
+                               vmhook::error_tag);
+                }
+            }
+        }
+
+        auto block{ std::make_shared<watch_handle::control_block>() };
+        block->on_stop = [cb]() noexcept
+        {
+            try
+            {
+                std::lock_guard<std::mutex> guard{ detail::exception_mutex };
+                detail::exception_callbacks.erase(
+                    std::remove(detail::exception_callbacks.begin(),
+                                detail::exception_callbacks.end(), cb),
+                    detail::exception_callbacks.end());
             }
             catch (...) { /* swallowed */ }
         };

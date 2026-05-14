@@ -6,6 +6,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `return_value::stack_trace(max_depth = 64)` — walks the saved-rbp chain from
+  inside a hook callback and returns every interpreter frame as a
+  `caller_info`.  Stops at the first compiled / native frame so the result
+  reflects only the interpreted portion of the call stack.
+- `vmhook::for_each_loaded_class(visitor)` — enumerates every Klass reachable
+  through the `ClassLoaderDataGraph`.  Snapshot of the loaded set at call
+  time; pair with `vmhook::on_class_loaded` for live notifications.
+- `vmhook::on_exception(callback)` — event-driven hook on
+  `java.lang.Throwable::fillInStackTrace()`.  Fires whenever any Throwable
+  subclass is constructed through one of the public constructors and
+  reports the dynamic class name (read from the oop's narrow-klass header).
+
 ## [0.4.0] — 2026-05-14
 
 ### Added

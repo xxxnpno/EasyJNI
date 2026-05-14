@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -2294,16 +2295,22 @@ namespace
                     static_cast<std::int32_t>(1 + 126 + 12345 + 18 + 18 + 3 + 2 + 63 + 999));
     }
 
-    // ── return_value::caller() — caller-info probe ─────────────────────────
+    // ── return_value::caller() + stack_trace() — caller-info probe ─────────
     std::atomic_bool caller_probe_method_observed{ false };
     std::atomic_bool caller_probe_name_observed{ false };
     std::atomic_bool caller_probe_class_observed{ false };
+    std::atomic_int  caller_probe_trace_depth{ 0 };
+    std::atomic_bool caller_probe_trace_includes_outer{ false };
+    std::atomic_bool caller_probe_trace_first_matches_caller{ false };
 
     auto test_caller_info() -> void
     {
         caller_probe_method_observed.store(false);
         caller_probe_name_observed.store(false);
         caller_probe_class_observed.store(false);
+        caller_probe_trace_depth.store(0);
+        caller_probe_trace_includes_outer.store(false);
+        caller_probe_trace_first_matches_caller.store(false);
 
         caller_probe_class::set_probe_done(false);
         caller_probe_class::set_probe_requested(false);
@@ -2319,6 +2326,28 @@ namespace
                     caller_probe_method_observed.store(info.method != nullptr);
                     caller_probe_name_observed.store(info.method_name == "outerStep");
                     caller_probe_class_observed.store(info.class_name == "vmhook/CallerProbe");
+                }
+
+                // Also exercise stack_trace(): the trace's index 0 must
+                // agree with caller(), and the trace should contain the
+                // outerStep frame somewhere.
+                const auto trace{ retval.stack_trace() };
+                caller_probe_trace_depth.store(static_cast<int>(trace.size()),
+                                                std::memory_order_relaxed);
+                if (!trace.empty() && info.valid())
+                {
+                    caller_probe_trace_first_matches_caller.store(
+                        trace.front().method      == info.method
+                     && trace.front().method_name == info.method_name);
+                }
+                for (const auto& frame : trace)
+                {
+                    if (frame.method_name == "outerStep"
+                     && frame.class_name  == "vmhook/CallerProbe")
+                    {
+                        caller_probe_trace_includes_outer.store(true);
+                        break;
+                    }
                 }
             }) };
         check("callerProbeHookInstalled", hook_installed);
@@ -2337,7 +2366,62 @@ namespace
         check_equal("callerProbeObservedSum", caller_probe_class::get_observed_sum(),
                     static_cast<std::int32_t>((7 + 1) * 2 * 10));
 
+        // stack_trace() coverage
+        check("stackTraceNonEmpty",         caller_probe_trace_depth.load() >= 1);
+        check("stackTraceFirstMatchesCaller", caller_probe_trace_first_matches_caller.load());
+        check("stackTraceIncludesOuter",    caller_probe_trace_includes_outer.load());
+
         vmhook::shutdown_hooks();
+    }
+
+    // ── for_each_loaded_class — class enumeration probe ────────────────────
+    auto test_for_each_loaded_class() -> void
+    {
+        std::set<std::string> classes_seen{};
+        std::size_t           count{ 0 };
+
+        vmhook::for_each_loaded_class(
+            [&](const std::string& name, vmhook::hotspot::klass*)
+            {
+                ++count;
+                classes_seen.insert(name);
+            });
+
+        check("forEachLoadedClassCountSane", count > 100);
+        check("forEachLoadedClassObject",    classes_seen.contains("java/lang/Object"));
+        check("forEachLoadedClassString",    classes_seen.contains("java/lang/String"));
+        check("forEachLoadedClassMain",      classes_seen.contains("vmhook/Main"));
+        check("forEachLoadedClassExample",   classes_seen.contains("vmhook/Example"));
+    }
+
+    // ── on_exception — exception-construction hook probe ───────────────────
+    auto test_on_exception() -> void
+    {
+        std::atomic_bool ise_observed{ false };
+        std::atomic_int  any_observed{ 0 };
+
+        auto watcher{ vmhook::on_exception(
+            [&](const std::string& name)
+            {
+                ++any_observed;
+                if (name == "java/lang/IllegalStateException")
+                {
+                    ise_observed.store(true);
+                }
+            }) };
+
+        // Re-arm the throwing probe.  Each iteration of Main's loop only
+        // executes a probe if requested && !done, so resetting both flags
+        // queues another run.  The Java side constructs and throws an
+        // IllegalStateException; Throwable.fillInStackTrace runs on the
+        // Java thread before athrow, so our hook fires synchronously.
+        example_class::set_throw_probe_done(false);
+        example_class::set_throw_probe_requested(false);
+        const bool probe_done{ run_java_probe(example_class::set_throw_probe_requested,
+                                              example_class::get_throw_probe_done) };
+        check("onExceptionProbeDone",   probe_done);
+        check("onExceptionAnyObserved", any_observed.load() > 0);
+        check("onExceptionISEObserved", ise_observed.load());
     }
 
     // ── watch_static_field — field-change probe ────────────────────────────
@@ -2463,7 +2547,16 @@ static auto run_test_suite() -> void
         test_overloaded_methods();
         test_return_types();
 
+        // Class enumeration probe — runs early so the snapshot reflects
+        // classes that were eagerly loaded by Main.main before any of
+        // the dynamic class-load tests fire.
+        test_for_each_loaded_class();
+
         // Newer feature surface: caller info, field watcher, class-load watcher.
+        // on_exception is exercised BEFORE test_caller_info because the
+        // latter calls shutdown_hooks() and would tear down our
+        // Throwable.fillInStackTrace hook if it ran first.
+        test_on_exception();
         test_caller_info();
         test_field_watcher();
         test_class_load_watcher();
