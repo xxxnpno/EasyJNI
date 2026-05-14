@@ -1,7 +1,7 @@
 # vmhook
 
-vmhook is a C++23 single-header library for inspecting, wrapping, calling, and
-hooking a running HotSpot JVM from native code. It is intended for injected
+vmhook is a C++20/23 single-header library for inspecting, wrapping, calling,
+and hooking a running HotSpot JVM from native code. It is intended for injected
 tooling that controls the target environment and needs direct access to HotSpot
 metadata without shipping a JVMTI agent.
 
@@ -23,18 +23,68 @@ it reads HotSpot VMStruct metadata, resolves JVM internals directly, and patches
 interpreter entry stubs for hooks. Use it only when the target JVM and runtime
 layout are part of your compatibility surface.
 
-## Platform
+## Platform & toolchains
 
-- Windows x64
-- MSVC with C++23
-- HotSpot JVM
-- CI coverage for Java 8, 11, 17, 21, and 24
+The single header builds on every combination CI exercises:
 
-Build the solution:
+| Host     | Compiler             | Notes                                  |
+|----------|----------------------|----------------------------------------|
+| Windows  | MSVC 19.36+ (cl.exe) | Primary toolchain; runs full JVM tests |
+| Windows  | clang / clang-cl 16+ | Drop-in for MSVC via CMake or vcxproj  |
+| Windows  | MinGW-w64 GCC 13+    | Builds via CMake + MSYS2               |
+| Linux    | GCC 13+              | Builds libvmhook.so; primary Linux CI  |
+| Linux    | Clang 16+            | Drop-in for GCC                        |
+
+HotSpot is required at runtime (Temurin, Corretto, Liberica, Microsoft, ...).
+CI builds and runs unit tests against Java 8, 11, 17, 21, and 24.
+
+### Building with CMake (recommended)
+
+The repository ships a `CMakeLists.txt` that builds the example shared library,
+the Windows-only injector, and the unit-test suite:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+CMake options:
+
+- `VMHOOK_BUILD_EXAMPLE`  (default `ON`)  build the test shared library
+- `VMHOOK_BUILD_INJECTOR` (default `ON`)  build the Windows-only injector
+- `VMHOOK_BUILD_TESTS`    (default `ON`)  build standalone unit tests
+- `VMHOOK_WARNINGS_AS_ERRORS` (default `OFF`)  enforce `-Werror`
+
+Consumers can pull the library into their own CMake project:
+
+```cmake
+add_subdirectory(third_party/vmhook)
+target_link_libraries(my_target PRIVATE vmhook::vmhook)
+```
+
+### Building with MSBuild (legacy)
 
 ```powershell
 MSBuild vmhook.slnx /p:Configuration=Release /p:Platform=x64 /m
 ```
+
+The MSBuild solution still works for the Visual Studio IDE workflow; the
+GitHub Actions CI also builds it to catch regressions.
+
+## Running the tests
+
+Two test suites ship with the project:
+
+1. **Standalone unit tests** (no JVM required)  built into `build/tests` by
+   the CMake build, run via `ctest`.  Covers header compilation on every
+   compiler/platform, ODR sanity across translation units, type-trait static
+   asserts, the `vmhook::os` portability layer (page size, allocate/protect
+   round-trips, safe pointer reads, etc.), and the public API surface.
+2. **JVM integration tests**  the injector loads the example DLL into a
+   running JVM and the DLL asserts every field/method/hook scenario before
+   asking the JVM to exit.  Results land in `test_results.txt`; CI fails if
+   any line starts with `[FAIL]`.
 
 ## Debug And Release Logging
 
@@ -89,8 +139,10 @@ auto register_sdk()
 
 ## Fields
 
-Instance and static fields use `get_field(name)`. Instance calls resolve fields
-from the live object. Static calls resolve fields from the registered class.
+Instance fields use `get_field(name)`.  Static fields use `static_field(name)`.
+The two names exist so the call is unambiguous on every compiler  using a
+single overloaded name worked on MSVC but produced different overload-resolution
+results on GCC / Clang.
 
 ```cpp
 class example : public vmhook::object<example>
@@ -101,6 +153,7 @@ public:
     {
     }
 
+    // Instance field accessor: uses the live OOP held by this wrapper.
     auto get_name() const
         -> std::string
     {
@@ -112,6 +165,13 @@ public:
     {
         this->get_field("score")->set(value);
     }
+
+    // Static field accessor: resolves the Java class via typeid(example).
+    static auto get_total_count()
+        -> std::int32_t
+    {
+        return static_field("totalCount")->get();
+    }
 };
 ```
 
@@ -121,9 +181,11 @@ references as `std::unique_ptr<wrapper_type>`.
 
 ## Methods
 
-Method calls use `get_method(name)->call(args...)`.
+Instance method calls use `get_method(name)->call(args...)`.  Static method
+calls use `static_method(name)->call(args...)`.
 
 ```cpp
+// Instance:
 auto add_score(std::int32_t amount) const
     -> void
 {
@@ -134,6 +196,13 @@ auto compute(std::int32_t value) const
     -> std::int32_t
 {
     return this->get_method("compute")->call(value);
+}
+
+// Static:
+static auto reset_global_state()
+    -> void
+{
+    static_method("resetGlobalState")->call();
 }
 ```
 

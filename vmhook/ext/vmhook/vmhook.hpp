@@ -1,19 +1,23 @@
 #pragma once
 
 /*
-    VMHook - Single-header, header-only C++23 library for hooking Java methods
+    VMHook - Single-header, header-only C++20/23 library for hooking Java methods
     and accessing fields at runtime via HotSpot VMStructs.
 
     Purpose:
         Provides a zero-JNI, zero-JVMTI API to intercept Java method calls
         and read/write instance/static fields by walking HotSpot's internal
-        metadata tables (gHotSpotVMStructs / gHotSpotVMTypes) exported by jvm.dll.
+        metadata tables (gHotSpotVMStructs / gHotSpotVMTypes) exported by
+        jvm.dll on Windows or libjvm.so on Linux.
 
     Dependencies:
-        - C++23 compiler (MSVC recommended; uses <print>, std::format, concepts)
-        - Windows (VirtualAlloc, VirtualProtect, ReadProcessMemory)
+        - C++20-or-newer compiler. <print>/std::format are used when available
+          (MSVC 19.36+, libstdc++ 14+, libc++ 18+); otherwise the header falls
+          back to std::format-only or std::ostringstream formatting.
+        - Tested with MSVC 19.4x, GCC 13+, Clang 16+ on Windows and Linux.
         - A running HotSpot JVM (Temurin, Corretto, Liberica, Microsoft, etc.)
-        - jvm.dll loaded in the current process with gHotSpotVMStructs exported
+        - The JVM's runtime shared library loaded in the current process with
+          gHotSpotVMStructs / gHotSpotVMTypes exported (jvm.dll / libjvm.so).
 
     Thread safety:
         - read-only operations (find_class, find_field, get_field)
@@ -56,9 +60,8 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <format>
-#include <print>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -77,20 +80,141 @@
 #include <functional>
 #include <limits>
 
-#include <windows.h>
+// ---------------------------------------------------------------------------
+// Platform / compiler detection
+// ---------------------------------------------------------------------------
+
+#if defined(_WIN32) || defined(_WIN64)
+    #define VMHOOK_OS_WINDOWS 1
+    #define VMHOOK_OS_LINUX   0
+#elif defined(__linux__)
+    #define VMHOOK_OS_WINDOWS 0
+    #define VMHOOK_OS_LINUX   1
+#else
+    #define VMHOOK_OS_WINDOWS 0
+    #define VMHOOK_OS_LINUX   0
+    #error "vmhook currently supports Windows or Linux on x86_64."
+#endif
+
+#if !defined(__x86_64__) && !defined(_M_X64)
+    #error "vmhook currently supports x86_64 only (HotSpot interpreter assumes x64)."
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+    #define VMHOOK_COMPILER_MSVC 1
+#else
+    #define VMHOOK_COMPILER_MSVC 0
+#endif
+
+#if defined(__clang__)
+    #define VMHOOK_COMPILER_CLANG 1
+#else
+    #define VMHOOK_COMPILER_CLANG 0
+#endif
+
+#if defined(__GNUC__) && !defined(__clang__)
+    #define VMHOOK_COMPILER_GCC 1
+#else
+    #define VMHOOK_COMPILER_GCC 0
+#endif
+
+// std::format requires GCC 13+ / Clang 14+ / MSVC 19.29+
+#if __has_include(<format>)
+    #include <format>
+    #define VMHOOK_HAS_STD_FORMAT 1
+#else
+    #define VMHOOK_HAS_STD_FORMAT 0
+#endif
+
+// std::print/std::println require GCC 14+ / Clang 18+ (libc++) / MSVC 19.37+
+#if __has_include(<print>) && (defined(__cpp_lib_print) && __cpp_lib_print >= 202207L)
+    #include <print>
+    #define VMHOOK_HAS_STD_PRINT 1
+#else
+    #define VMHOOK_HAS_STD_PRINT 0
+#endif
+
+#if VMHOOK_OS_WINDOWS
+    // <windows.h> defines macros (min, max, ERROR, etc.) that clash with C++.
+    // We guard them and undefine the worst offenders right after include.
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+#else
+    #include <dlfcn.h>
+    #include <sys/mman.h>
+    #include <sys/syscall.h>
+    #include <sys/uio.h>
+    #include <unistd.h>
+    #include <cerrno>
+    #include <csignal>
+    #include <fstream>
+#endif
 
 #ifndef VMHOOK_DEBUG_LOGS
-#ifdef NDEBUG
-#define VMHOOK_DEBUG_LOGS 0
-#else
-#define VMHOOK_DEBUG_LOGS 1
-#endif
+    #ifdef NDEBUG
+        #define VMHOOK_DEBUG_LOGS 0
+    #else
+        #define VMHOOK_DEBUG_LOGS 1
+    #endif
 #endif
 
-#if VMHOOK_DEBUG_LOGS
-#define VMHOOK_LOG(...) ::std::println(__VA_ARGS__)
+namespace vmhook::detail
+{
+    /*
+        @brief Format a log line using std::format if available, otherwise stream-format.
+        @details
+        Provides a single API used by VMHOOK_LOG so callers do not need to know whether
+        the host toolchain has shipped std::format / std::print.  When std::format is
+        present we use it; otherwise we ignore the format specifiers and concatenate
+        the format string verbatim, which is enough for diagnostic output.
+    */
+#if VMHOOK_HAS_STD_FORMAT
+    template <typename... args_t>
+    inline auto format_log(std::string_view fmt, args_t&&... args)
+        -> std::string
+    {
+        try
+        {
+            return std::vformat(fmt, std::make_format_args(args...));
+        }
+        catch (...)
+        {
+            return std::string{ fmt };
+        }
+    }
 #else
-#define VMHOOK_LOG(...) do {} while (false)
+    template <typename... args_t>
+    inline auto format_log(std::string_view fmt, args_t&&...)
+        -> std::string
+    {
+        return std::string{ fmt };
+    }
+#endif
+
+    inline auto emit_log_line(std::string const& line) noexcept
+        -> void
+    {
+        try
+        {
+            std::cout << line << '\n';
+            std::cout.flush();
+        }
+        catch (...)
+        {
+            // Never let logging escape.
+        }
+    }
+}
+
+#if VMHOOK_DEBUG_LOGS
+    #define VMHOOK_LOG(...) ::vmhook::detail::emit_log_line(::vmhook::detail::format_log(__VA_ARGS__))
+#else
+    #define VMHOOK_LOG(...) do {} while (false)
 #endif
 
 namespace vmhook
@@ -128,6 +252,452 @@ namespace vmhook
     private:
         std::string message;
     };
+
+    // -------------------------------------------------------------------------
+    // OS abstraction layer
+    //
+    // Wraps Windows-only and POSIX-only primitives behind a portable surface so
+    // the HotSpot probing/hooking code can stay platform-agnostic.  All members
+    // are noexcept and never throw; failure is reported via returned values.
+    // -------------------------------------------------------------------------
+    namespace os
+    {
+#if VMHOOK_OS_WINDOWS
+        using module_handle = ::HMODULE;
+        using thread_id_t   = ::DWORD;
+#else
+        using module_handle = void*;
+        using thread_id_t   = std::uint64_t;
+#endif
+
+        /*
+            @brief Memory-protection flags expressed in portable terms.
+        */
+        enum class memory_protection : std::uint32_t
+        {
+            no_access      = 0,
+            read           = 1,
+            read_write     = 2,
+            execute_read   = 3,
+            execute_rw     = 4,
+        };
+
+        /*
+            @brief Information about a single VM memory region (allocated or free).
+            @details
+            Returned by query_region() and used by the trampoline allocator to find
+            a free region within +/- 2 GiB of the hook target.
+        */
+        struct region_info
+        {
+            void*       base{ nullptr };
+            std::size_t size{ 0 };
+            bool        committed{ false };
+            bool        free{ false };
+            bool        readable{ false };
+            bool        executable{ false };
+            bool        guarded{ false };
+        };
+
+        /*
+            @brief Returns the host CPU page size in bytes.
+        */
+        inline auto page_size() noexcept -> std::size_t
+        {
+#if VMHOOK_OS_WINDOWS
+            SYSTEM_INFO si{};
+            ::GetSystemInfo(&si);
+            return static_cast<std::size_t>(si.dwPageSize);
+#else
+            const long ps{ ::sysconf(_SC_PAGESIZE) };
+            return ps > 0 ? static_cast<std::size_t>(ps) : static_cast<std::size_t>(4096);
+#endif
+        }
+
+        /*
+            @brief Returns the host VM allocation granularity (aligned-to bytes).
+        */
+        inline auto allocation_granularity() noexcept -> std::size_t
+        {
+#if VMHOOK_OS_WINDOWS
+            SYSTEM_INFO si{};
+            ::GetSystemInfo(&si);
+            return static_cast<std::size_t>(si.dwAllocationGranularity);
+#else
+            return page_size();
+#endif
+        }
+
+        /*
+            @brief Maximum user-space address; pointers above this are kernel/non-canonical.
+        */
+        inline constexpr std::uintptr_t user_address_ceiling{ 0x00007FFFFFFFFFFFull };
+
+        /*
+            @brief Minimum sane user-space address; pointers below this are noise.
+        */
+        inline constexpr std::uintptr_t user_address_floor{ 0xFFFFull };
+
+        /*
+            @brief Looks up a previously loaded shared library by leaf filename.
+            @details
+            Tries the platform's "find loaded module" call (GetModuleHandle on
+            Windows, dlopen(name, RTLD_NOW | RTLD_NOLOAD) on Linux).  Returns
+            nullptr if the module is not currently loaded into the process.
+        */
+        inline auto find_loaded_module(const char* name) noexcept -> module_handle
+        {
+#if VMHOOK_OS_WINDOWS
+            return ::GetModuleHandleA(name);
+#else
+            // RTLD_NOLOAD: only return handle if already loaded.
+            return ::dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
+#endif
+        }
+
+        /*
+            @brief Locates the JVM runtime shared library currently loaded.
+            @details
+            Tries the platform-specific candidate names (jvm.dll on Windows,
+            libjvm.so on Linux) until one resolves to a non-null module.
+        */
+        inline auto find_jvm_module() noexcept -> module_handle
+        {
+#if VMHOOK_OS_WINDOWS
+            static const char* const candidates[]{ "jvm.dll" };
+#else
+            static const char* const candidates[]{ "libjvm.so", "libjvm.so.0" };
+#endif
+            for (const char* name : candidates)
+            {
+                if (module_handle const handle{ find_loaded_module(name) })
+                {
+                    return handle;
+                }
+            }
+            return nullptr;
+        }
+
+        /*
+            @brief Resolves an exported symbol from a previously loaded module.
+        */
+        inline auto get_proc_address(module_handle module, const char* symbol) noexcept -> void*
+        {
+            if (!module || !symbol)
+            {
+                return nullptr;
+            }
+#if VMHOOK_OS_WINDOWS
+            return reinterpret_cast<void*>(::GetProcAddress(module, symbol));
+#else
+            return ::dlsym(module, symbol);
+#endif
+        }
+
+        /*
+            @brief Returns the OS-level identifier of the calling thread.
+        */
+        inline auto current_thread_id() noexcept -> thread_id_t
+        {
+#if VMHOOK_OS_WINDOWS
+            return ::GetCurrentThreadId();
+#else
+            return static_cast<thread_id_t>(::syscall(SYS_gettid));
+#endif
+        }
+
+#if VMHOOK_OS_WINDOWS
+        inline auto to_native_protect(memory_protection prot) noexcept -> DWORD
+        {
+            switch (prot)
+            {
+            case memory_protection::no_access:    return PAGE_NOACCESS;
+            case memory_protection::read:         return PAGE_READONLY;
+            case memory_protection::read_write:   return PAGE_READWRITE;
+            case memory_protection::execute_read: return PAGE_EXECUTE_READ;
+            case memory_protection::execute_rw:   return PAGE_EXECUTE_READWRITE;
+            }
+            return PAGE_NOACCESS;
+        }
+#else
+        inline auto to_native_protect(memory_protection prot) noexcept -> int
+        {
+            switch (prot)
+            {
+            case memory_protection::no_access:    return PROT_NONE;
+            case memory_protection::read:         return PROT_READ;
+            case memory_protection::read_write:   return PROT_READ | PROT_WRITE;
+            case memory_protection::execute_read: return PROT_READ | PROT_EXEC;
+            case memory_protection::execute_rw:   return PROT_READ | PROT_WRITE | PROT_EXEC;
+            }
+            return PROT_NONE;
+        }
+#endif
+
+        /*
+            @brief Changes the protection of a memory region in place.
+            @return true on success.
+        */
+        inline auto protect(void* address, std::size_t size, memory_protection prot,
+                            std::uint32_t* old_prot = nullptr) noexcept -> bool
+        {
+            if (!address || size == 0)
+            {
+                return false;
+            }
+#if VMHOOK_OS_WINDOWS
+            DWORD prev{};
+            const BOOL ok{ ::VirtualProtect(address, size, to_native_protect(prot), &prev) };
+            if (ok && old_prot)
+            {
+                *old_prot = static_cast<std::uint32_t>(prev);
+            }
+            return ok != 0;
+#else
+            // mprotect requires page-aligned base + length.
+            const std::size_t ps{ page_size() };
+            std::uintptr_t base{ reinterpret_cast<std::uintptr_t>(address) };
+            const std::uintptr_t end{ base + size };
+            base &= ~(static_cast<std::uintptr_t>(ps) - 1);
+            const std::size_t aligned_size{ static_cast<std::size_t>(end - base + ps - 1) & ~(ps - 1) };
+            const int rc{ ::mprotect(reinterpret_cast<void*>(base), aligned_size, to_native_protect(prot)) };
+            if (rc == 0 && old_prot)
+            {
+                *old_prot = 0;
+            }
+            return rc == 0;
+#endif
+        }
+
+        /*
+            @brief Reserves and commits `size` bytes of writable, executable memory.
+            @details
+            On Windows uses VirtualAlloc with PAGE_EXECUTE_READWRITE.
+            On Linux uses mmap with PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS|MAP_PRIVATE.
+            `address_hint` is treated as a non-binding placement preference.
+        */
+        inline auto allocate_rwx(void* address_hint, std::size_t size) noexcept -> void*
+        {
+            if (size == 0)
+            {
+                return nullptr;
+            }
+#if VMHOOK_OS_WINDOWS
+            return ::VirtualAlloc(address_hint, size,
+                                  MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_EXECUTE_READWRITE);
+#else
+            void* const requested{ address_hint };
+            void* result{ ::mmap(requested, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+            if (result == MAP_FAILED)
+            {
+                return nullptr;
+            }
+            return result;
+#endif
+        }
+
+        /*
+            @brief Releases memory previously returned by allocate_rwx.
+        */
+        inline auto release(void* address, std::size_t size) noexcept -> void
+        {
+            if (!address)
+            {
+                return;
+            }
+#if VMHOOK_OS_WINDOWS
+            (void)size;
+            ::VirtualFree(address, 0, MEM_RELEASE);
+#else
+            ::munmap(address, size);
+#endif
+        }
+
+        /*
+            @brief Returns information about the VM region containing `address`.
+            @details
+            Used by safe_readable() and by the trampoline allocator.
+        */
+        inline auto query_region(const void* address) noexcept -> region_info
+        {
+            region_info info{};
+            if (!address)
+            {
+                return info;
+            }
+#if VMHOOK_OS_WINDOWS
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(address, &mbi, sizeof(mbi)) == 0)
+            {
+                return info;
+            }
+            info.base = mbi.BaseAddress;
+            info.size = mbi.RegionSize;
+            info.committed = (mbi.State == MEM_COMMIT);
+            info.free = (mbi.State == MEM_FREE);
+            const DWORD prot{ mbi.Protect };
+            info.readable = (prot & (PAGE_READONLY | PAGE_READWRITE
+                                     | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+                                     | PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY)) != 0;
+            info.executable = (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ
+                                       | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+            info.guarded = (prot & PAGE_GUARD) != 0;
+            return info;
+#else
+            // Parse /proc/self/maps to find the region containing the address.
+            const std::uintptr_t target{ reinterpret_cast<std::uintptr_t>(address) };
+            std::ifstream maps{ "/proc/self/maps" };
+            std::string line;
+            std::uintptr_t prev_end{ 0 };
+            while (std::getline(maps, line))
+            {
+                if (line.empty())
+                {
+                    continue;
+                }
+                std::uintptr_t begin{ 0 };
+                std::uintptr_t end{ 0 };
+                char perms[5]{};
+                const int parsed{ std::sscanf(line.c_str(), "%lx-%lx %4s",
+                                              &begin, &end, perms) };
+                if (parsed < 3)
+                {
+                    continue;
+                }
+                if (target < begin)
+                {
+                    // Address is in a free hole between prev_end and begin.
+                    info.base = reinterpret_cast<void*>(prev_end);
+                    info.size = static_cast<std::size_t>(begin - prev_end);
+                    info.free = true;
+                    return info;
+                }
+                if (target >= begin && target < end)
+                {
+                    info.base = reinterpret_cast<void*>(begin);
+                    info.size = static_cast<std::size_t>(end - begin);
+                    info.committed = true;
+                    info.readable   = perms[0] == 'r';
+                    info.executable = perms[2] == 'x';
+                    return info;
+                }
+                prev_end = end;
+            }
+            info.base = reinterpret_cast<void*>(prev_end);
+            info.size = (std::numeric_limits<std::uintptr_t>::max)() - prev_end;
+            info.free = true;
+            return info;
+#endif
+        }
+
+#if !VMHOOK_OS_WINDOWS
+        namespace detail_signal
+        {
+            // Thread-local jmp-buf machinery to recover from SIGSEGV during
+            // safe pointer probing on POSIX systems.
+            struct probe_state
+            {
+                bool          active{ false };
+                volatile bool fault{ false };
+                sigjmp_buf    env{};
+            };
+
+            inline thread_local probe_state* active_state{ nullptr };
+
+            inline auto handler(int /*sig*/, siginfo_t* /*info*/, void* /*ctx*/) -> void
+            {
+                if (active_state)
+                {
+                    active_state->fault = true;
+                    ::siglongjmp(active_state->env, 1);
+                }
+                // Not in a probe; let the default handler take over.
+                struct sigaction sa{};
+                sa.sa_handler = SIG_DFL;
+                ::sigaction(SIGSEGV, &sa, nullptr);
+            }
+
+            inline auto install_once() noexcept -> bool
+            {
+                static const bool installed{ []() noexcept
+                {
+                    struct sigaction sa{};
+                    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+                    sa.sa_sigaction = &handler;
+                    ::sigemptyset(&sa.sa_mask);
+                    return ::sigaction(SIGSEGV, &sa, nullptr) == 0
+                        && ::sigaction(SIGBUS,  &sa, nullptr) == 0;
+                }() };
+                return installed;
+            }
+        } // namespace detail_signal
+#endif
+
+        /*
+            @brief Reads `size` bytes from `src` into `dst` without faulting on bad pointers.
+            @details
+            On Windows uses ReadProcessMemory on the current process so the kernel
+            performs the read with a fault-safe path.  On Linux uses process_vm_readv
+            with /proc/self/mem (zero-copy) and falls back to a SIGSEGV-catching
+            sigsetjmp protected read.  Returns true on success.
+        */
+        inline auto safe_read(void* dst, const void* src, std::size_t size) noexcept -> bool
+        {
+            if (!dst || !src || size == 0)
+            {
+                return false;
+            }
+#if VMHOOK_OS_WINDOWS
+            SIZE_T transferred{ 0 };
+            const BOOL ok{ ::ReadProcessMemory(::GetCurrentProcess(), src, dst,
+                                               size, &transferred) };
+            return ok && transferred == size;
+#else
+            iovec local{ dst, size };
+            iovec remote{ const_cast<void*>(src), size };
+            const ssize_t n{ ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) };
+            if (n == static_cast<ssize_t>(size))
+            {
+                return true;
+            }
+            // Fall back to signal-protected read.
+            if (!detail_signal::install_once())
+            {
+                return false;
+            }
+            detail_signal::probe_state state{};
+            state.active = true;
+            detail_signal::active_state = &state;
+            bool success{ false };
+            if (::sigsetjmp(state.env, 1) == 0)
+            {
+                std::memcpy(dst, src, size);
+                success = true;
+            }
+            detail_signal::active_state = nullptr;
+            return success && !state.fault;
+#endif
+        }
+
+        /*
+            @brief Hints the CPU/OS that an instruction range has been written.
+        */
+        inline auto flush_instruction_cache(void* address, std::size_t size) noexcept -> void
+        {
+            if (!address || size == 0)
+            {
+                return;
+            }
+#if VMHOOK_OS_WINDOWS
+            ::FlushInstructionCache(::GetCurrentProcess(), address, size);
+#else
+            __builtin___clear_cache(static_cast<char*>(address),
+                                    static_cast<char*>(address) + size);
+#endif
+        }
+    } // namespace os
 
     namespace hotspot
     {
@@ -440,40 +1010,62 @@ namespace vmhook
         };
 
         /*
-            @brief Returns the module handle for jvm.dll loaded in the current process.
+            @brief Returns the module handle of the HotSpot JVM library loaded in the process.
+            @details
+            Returns the handle for jvm.dll on Windows, or libjvm.so on Linux.  Cached
+            after the first lookup; if no JVM library is present the function returns
+            nullptr (callers must check before dereferencing the result).
         */
         inline auto get_jvm_module() noexcept
-            -> HMODULE
+            -> vmhook::os::module_handle
         {
-            static HMODULE module{ GetModuleHandleA("jvm.dll") };
+            static vmhook::os::module_handle module{ vmhook::os::find_jvm_module() };
             return module;
         }
 
         /*
             @brief Returns a pointer to the global array of HotSpot VM type entries.
             @details
-            Resolves gHotSpotVMTypes from jvm.dll via GetProcAddress on first call
-            and caches the typed pointer so subsequent calls are free.
+            Resolves gHotSpotVMTypes from the JVM module via the OS dynamic-symbol
+            API on first call and caches the typed pointer so subsequent calls are free.
         */
         inline auto get_vm_types() noexcept
             -> vmhook::hotspot::vm_type_entry_t*
         {
-            static FARPROC procedure_address{ GetProcAddress(vmhook::hotspot::get_jvm_module(), "gHotSpotVMTypes") };
-            static vmhook::hotspot::vm_type_entry_t* pointer{ *reinterpret_cast<vmhook::hotspot::vm_type_entry_t**>(procedure_address) };
+            static vmhook::hotspot::vm_type_entry_t* pointer{ []() noexcept
+                -> vmhook::hotspot::vm_type_entry_t*
+                {
+                    void* const procedure_address{ vmhook::os::get_proc_address(
+                        vmhook::hotspot::get_jvm_module(), "gHotSpotVMTypes") };
+                    if (!procedure_address)
+                    {
+                        return nullptr;
+                    }
+                    return *reinterpret_cast<vmhook::hotspot::vm_type_entry_t**>(procedure_address);
+                }() };
             return pointer;
         }
 
         /*
             @brief Returns a pointer to the global array of HotSpot VM struct entries.
             @details
-            Resolves gHotSpotVMStructs from jvm.dll via GetProcAddress on first call
-            and caches the typed pointer so subsequent calls are free.
+            Resolves gHotSpotVMStructs from the JVM module via the OS dynamic-symbol
+            API on first call and caches the typed pointer so subsequent calls are free.
         */
         inline auto get_vm_structs() noexcept
             -> vmhook::hotspot::vm_struct_entry_t*
         {
-            static FARPROC procedure_address{ GetProcAddress(vmhook::hotspot::get_jvm_module(), "gHotSpotVMStructs") };
-            static vmhook::hotspot::vm_struct_entry_t* pointer{ *reinterpret_cast<vmhook::hotspot::vm_struct_entry_t**>(procedure_address) };
+            static vmhook::hotspot::vm_struct_entry_t* pointer{ []() noexcept
+                -> vmhook::hotspot::vm_struct_entry_t*
+                {
+                    void* const procedure_address{ vmhook::os::get_proc_address(
+                        vmhook::hotspot::get_jvm_module(), "gHotSpotVMStructs") };
+                    if (!procedure_address)
+                    {
+                        return nullptr;
+                    }
+                    return *reinterpret_cast<vmhook::hotspot::vm_struct_entry_t**>(procedure_address);
+                }() };
             return pointer;
         }
 
@@ -512,51 +1104,50 @@ namespace vmhook
         /*
             @brief Checks whether a pointer refers to committed readable memory.
             @details
-            Extends is_valid_pointer with a VirtualQuery call to verify that the memory
-            region containing pointer is actually committed and readable.
+            Extends is_valid_pointer with an OS-region query to verify that the memory
+            region containing pointer is actually committed and readable.  Implementation
+            uses VirtualQuery on Windows and /proc/self/maps on Linux via os::query_region.
         */
         static auto is_readable_pointer(const void* const pointer) noexcept
             -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
 
-            if (addr <= 0xFFFF || addr >= 0x00007FFFFFFFFFFF || (addr & 0x7) != 0)
+            if (addr <= vmhook::os::user_address_floor
+                || addr >= vmhook::os::user_address_ceiling
+                || (addr & 0x7) != 0)
             {
                 return false;
             }
 
-            MEMORY_BASIC_INFORMATION memory_basic_info{};
-            if (VirtualQuery(pointer, &memory_basic_info, sizeof(memory_basic_info)) == 0)
-            {
-                return false;
-            }
-
-            return memory_basic_info.State == MEM_COMMIT && (memory_basic_info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY)) != 0 && (memory_basic_info.Protect & PAGE_GUARD) == 0;
+            const vmhook::os::region_info info{ vmhook::os::query_region(pointer) };
+            return info.committed && info.readable && !info.guarded;
         }
 
         /*
             @brief Checks whether a pointer is likely valid for dereferencing.
             @details
             Filters out null pointers, low sentinel values used by HotSpot to mark
-            the end of linked lists, and kernel-space addresses above 0x00007FFFFFFFFFFF.
+            the end of linked lists, and kernel-space addresses above the user ceiling.
         */
         inline static auto is_valid_pointer(const void* const pointer) noexcept
             -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
-            return addr > 0xFFFF && addr < 0x00007FFFFFFFFFFF;
+            return addr > vmhook::os::user_address_floor && addr < vmhook::os::user_address_ceiling;
         }
 
         /*
             @brief Removes GC tag bits from a HotSpot pointer to recover the real address.
             @details
-            Masking with 0x00007FFFFFFFFFFF strips high GC tag bits and recovers
-            the underlying canonical user-space address.
+            Masking with user_address_ceiling strips high GC tag bits and recovers the
+            underlying canonical user-space address.
         */
         inline static auto untag_pointer(const void* const pointer) noexcept
             -> const void*
         {
-            return reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(pointer) & 0x00007FFFFFFFFFFF);
+            return reinterpret_cast<const void*>(
+                reinterpret_cast<std::uintptr_t>(pointer) & vmhook::os::user_address_ceiling);
         }
 
         /*
@@ -571,11 +1162,11 @@ namespace vmhook
         }
 
         /*
-            @brief Safely reads a pointer value from a memory address using ReadProcessMemory.
+            @brief Safely reads a pointer value from a memory address without faulting.
             @details
-            Uses ReadProcessMemory to safely dereference a pointer without risking an
-            access violation. Pre-checks filter out null, low, non-canonical, and unaligned
-            addresses before calling ReadProcessMemory.
+            Uses os::safe_read which maps to ReadProcessMemory on Windows and a
+            fault-safe path on Linux.  Pre-checks filter out null, low, non-canonical,
+            and unaligned addresses before crossing the OS boundary.
         */
         static auto safe_read_pointer(const void* const pointer) noexcept
             -> const void*
@@ -587,15 +1178,15 @@ namespace vmhook
 
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
 
-            if (addr <= 0xFFFF || addr >= 0x00007FFFFFFFFFFF || (addr & 0x7) != 0)
+            if (addr <= vmhook::os::user_address_floor
+                || addr >= vmhook::os::user_address_ceiling
+                || (addr & 0x7) != 0)
             {
                 return nullptr;
             }
 
             const void* result{ nullptr };
-            SIZE_T bytes_read{ 0 };
-
-            if (!ReadProcessMemory(GetCurrentProcess(), pointer, &result, sizeof(result), &bytes_read) || bytes_read != sizeof(result))
+            if (!vmhook::os::safe_read(&result, pointer, sizeof(result)))
             {
                 return nullptr;
             }
@@ -2134,19 +2725,20 @@ namespace vmhook
             }
 
             /*
-                @brief Returns the Windows OS thread ID of this JavaThread.
+                @brief Returns the OS-level thread ID of this JavaThread.
                 @details
                 Walks JavaThread (or Thread) -> OSThread -> _thread_id.
                 _osthread is probed on both JavaThread and Thread for JDK version
-                compatibility.
+                compatibility.  On Windows the value is a Win32 thread ID; on Linux
+                it is the kernel TID (same value returned by gettid()).
 
                 Complexity: O(1) after VMStruct offsets are cached on first call.
                 Exception safety: noexcept — returns 0 on any failure.
 
-                @return The DWORD OS thread ID, or 0 if the field cannot be located.
+                @return The OS thread ID, or 0 if the field cannot be located.
             */
             auto get_os_thread_id() const noexcept
-                -> DWORD
+                -> vmhook::os::thread_id_t
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const osthread_entry{ []()
                     -> const vmhook::hotspot::vm_struct_entry_t*
@@ -2177,7 +2769,12 @@ namespace vmhook
                     return 0;
                 }
 
-                return *reinterpret_cast<const DWORD*>(reinterpret_cast<const std::uint8_t*>(os_thread) + thread_id_entry->offset);
+                // HotSpot exports OSThread::_thread_id with a platform-specific underlying
+                // type (32-bit DWORD on Windows, pid_t on Linux). Read the raw 32-bit slot
+                // and zero-extend so callers always see a uniformly-typed value.
+                return static_cast<vmhook::os::thread_id_t>(
+                    *reinterpret_cast<const std::uint32_t*>(
+                        reinterpret_cast<const std::uint8_t*>(os_thread) + thread_id_entry->offset));
             }
 
             /*
@@ -2313,10 +2910,10 @@ namespace vmhook
             Complexity: O(N) where N = number of live Java threads.
             Exception safety: noexcept — returns nullptr if not found.
 
-            @param os_thread_id  Windows OS thread ID returned by GetCurrentThreadId().
+            @param os_thread_id  OS thread ID (Win32 thread ID on Windows, kernel TID on Linux).
             @return Matching JavaThread*, or nullptr if not found.
         */
-        static auto find_java_thread_by_os_thread_id(const DWORD os_thread_id) noexcept
+        static auto find_java_thread_by_os_thread_id(const vmhook::os::thread_id_t os_thread_id) noexcept
             -> vmhook::hotspot::java_thread*
         {
             if (os_thread_id == 0)
@@ -2394,7 +2991,7 @@ namespace vmhook
         static auto attach_current_native_thread() noexcept
             -> bool
         {
-            HMODULE const jvm_module{ GetModuleHandleA("jvm.dll") };
+            vmhook::os::module_handle const jvm_module{ vmhook::hotspot::get_jvm_module() };
             if (!jvm_module)
             {
                 return false;
@@ -2424,7 +3021,8 @@ namespace vmhook
             };
 
             using get_created_java_vms_t = jint (*)(JavaVM**, jint, jint*);
-            auto* const get_created_java_vms{ reinterpret_cast<get_created_java_vms_t>(GetProcAddress(jvm_module, "JNI_GetCreatedJavaVMs")) };
+            auto* const get_created_java_vms{ reinterpret_cast<get_created_java_vms_t>(
+                vmhook::os::get_proc_address(jvm_module, "JNI_GetCreatedJavaVMs")) };
             if (!get_created_java_vms)
             {
                 return false;
@@ -2488,7 +3086,7 @@ namespace vmhook
                 return true;
             }
 
-            const DWORD current_os_thread_id{ GetCurrentThreadId() };
+            const vmhook::os::thread_id_t current_os_thread_id{ vmhook::os::current_thread_id() };
             if (vmhook::hotspot::java_thread* const existing_thread{ vmhook::hotspot::find_java_thread_by_os_thread_id(current_os_thread_id) })
             {
                 vmhook::hotspot::current_java_thread = existing_thread;
@@ -2982,11 +3580,19 @@ namespace vmhook
         static auto find_stub_size(const std::uint8_t* start)
             -> std::size_t
         {
-            MEMORY_BASIC_INFORMATION mbi{};
-            VirtualQuery(start, &mbi, sizeof(mbi));
-
-            const std::size_t region_size{ static_cast<std::size_t>(reinterpret_cast<std::uint8_t*>(mbi.BaseAddress) + mbi.RegionSize - start) };
-            return (std::min)(region_size, static_cast<std::size_t>(0x2000));
+            const vmhook::os::region_info info{ vmhook::os::query_region(start) };
+            if (!info.base || info.size == 0)
+            {
+                return static_cast<std::size_t>(0x2000);
+            }
+            const std::uint8_t* const region_end{
+                reinterpret_cast<const std::uint8_t*>(info.base) + info.size };
+            if (region_end <= start)
+            {
+                return static_cast<std::size_t>(0x2000);
+            }
+            const std::size_t remaining{ static_cast<std::size_t>(region_end - start) };
+            return (std::min)(remaining, static_cast<std::size_t>(0x2000));
         }
 
         /*
@@ -3101,15 +3707,16 @@ namespace vmhook
         }
 
         /*
-            @brief Allocates a block of executable memory within a 32-bit relative jump range
-                   of a given address.
+            @brief Allocates a block of executable memory within a 32-bit relative jump
+                   range of a given address.
             @details
-            Walks the process address space with VirtualQuery and allocates inside a free
-            region that is reachable by a 5-byte relative JMP. HotSpot often reserves dense
-            areas around code stubs, so blindly probing exact offsets with VirtualAlloc can
-            fail even when a usable nearby free region exists.
+            Walks the process address space and allocates inside a free region that is
+            reachable by a 5-byte relative JMP.  HotSpot often reserves dense areas around
+            code stubs, so blindly probing exact offsets can fail even when a usable
+            nearby free region exists.  The implementation uses the platform-specific
+            primitives wrapped behind vmhook::os::query_region / vmhook::os::allocate_rwx.
         */
-        static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size, const DWORD protect) noexcept
+        static auto allocate_nearby_memory(std::uint8_t* nearby_addr, const std::size_t size) noexcept
             -> std::uint8_t*
         {
             if (!nearby_addr || size == 0)
@@ -3117,14 +3724,13 @@ namespace vmhook
                 return nullptr;
             }
 
-            SYSTEM_INFO system_info{};
-            GetSystemInfo(&system_info);
-
-            const std::uintptr_t minimum_application_address{ reinterpret_cast<std::uintptr_t>(system_info.lpMinimumApplicationAddress) };
-            const std::uintptr_t maximum_application_address{ reinterpret_cast<std::uintptr_t>(system_info.lpMaximumApplicationAddress) };
-            const std::uintptr_t allocation_granularity{ static_cast<std::uintptr_t>(system_info.dwAllocationGranularity) };
+            const std::uintptr_t minimum_application_address{ static_cast<std::uintptr_t>(0x10000) };
+            const std::uintptr_t maximum_application_address{ vmhook::os::user_address_ceiling };
+            const std::uintptr_t allocation_granularity{ static_cast<std::uintptr_t>(
+                vmhook::os::allocation_granularity()) };
             const std::uintptr_t target_address{ reinterpret_cast<std::uintptr_t>(nearby_addr) };
-            const std::uintptr_t relative_limit{ static_cast<std::uintptr_t>((std::numeric_limits<std::int32_t>::max)()) };
+            const std::uintptr_t relative_limit{ static_cast<std::uintptr_t>(
+                (std::numeric_limits<std::int32_t>::max)()) };
 
             const auto align_up = [](const std::uintptr_t value, const std::uintptr_t alignment) noexcept
                 -> std::uintptr_t
@@ -3139,13 +3745,19 @@ namespace vmhook
             };
 
             const std::uintptr_t search_min{
-                (std::max)(minimum_application_address, target_address > relative_limit ? target_address - relative_limit : minimum_application_address)
+                (std::max)(minimum_application_address,
+                    target_address > relative_limit
+                        ? target_address - relative_limit
+                        : minimum_application_address)
             };
             const std::uintptr_t search_max{
-                target_address > maximum_application_address - relative_limit ? maximum_application_address : (std::min)(maximum_application_address, target_address + relative_limit)
+                target_address > maximum_application_address - relative_limit
+                    ? maximum_application_address
+                    : (std::min)(maximum_application_address, target_address + relative_limit)
             };
 
-            auto try_allocate_in_region = [&](const std::uintptr_t region_base, const std::uintptr_t region_end) noexcept
+            auto try_allocate_in_region = [&](const std::uintptr_t region_base,
+                                              const std::uintptr_t region_end) noexcept
                 -> std::uint8_t*
             {
                 if (region_end <= region_base || region_end - region_base < size)
@@ -3173,14 +3785,16 @@ namespace vmhook
                     align_down(target_address, allocation_granularity)
                 };
 
-                if (void* const allocated{ VirtualAlloc(reinterpret_cast<void*>(preferred_candidate), size, MEM_COMMIT | MEM_RESERVE, protect) })
+                if (void* const allocated{ vmhook::os::allocate_rwx(
+                        reinterpret_cast<void*>(preferred_candidate), size) })
                 {
                     return reinterpret_cast<std::uint8_t*>(allocated);
                 }
 
                 if (preferred_candidate != first_candidate)
                 {
-                    if (void* const allocated{ VirtualAlloc(reinterpret_cast<void*>(first_candidate), size, MEM_COMMIT | MEM_RESERVE, protect) })
+                    if (void* const allocated{ vmhook::os::allocate_rwx(
+                            reinterpret_cast<void*>(first_candidate), size) })
                     {
                         return reinterpret_cast<std::uint8_t*>(allocated);
                     }
@@ -3188,7 +3802,8 @@ namespace vmhook
 
                 if (preferred_candidate != last_candidate && first_candidate != last_candidate)
                 {
-                    if (void* const allocated{ VirtualAlloc(reinterpret_cast<void*>(last_candidate), size, MEM_COMMIT | MEM_RESERVE, protect) })
+                    if (void* const allocated{ vmhook::os::allocate_rwx(
+                            reinterpret_cast<void*>(last_candidate), size) })
                     {
                         return reinterpret_cast<std::uint8_t*>(allocated);
                     }
@@ -3197,20 +3812,23 @@ namespace vmhook
                 return nullptr;
             };
 
-            MEMORY_BASIC_INFORMATION memory_basic_info{};
+            const std::size_t page_size{ vmhook::os::page_size() };
             for (std::uintptr_t current{ search_min }; current < search_max; )
             {
-                if (!VirtualQuery(reinterpret_cast<void*>(current), &memory_basic_info, sizeof(memory_basic_info)))
+                const vmhook::os::region_info info{ vmhook::os::query_region(
+                    reinterpret_cast<void*>(current)) };
+
+                if (!info.base)
                 {
-                    current += system_info.dwPageSize;
+                    current += page_size;
                     continue;
                 }
 
-                const std::uintptr_t region_base{ reinterpret_cast<std::uintptr_t>(memory_basic_info.BaseAddress) };
-                const std::uintptr_t region_size{ memory_basic_info.RegionSize };
+                const std::uintptr_t region_base{ reinterpret_cast<std::uintptr_t>(info.base) };
+                const std::uintptr_t region_size{ info.size };
                 const std::uintptr_t region_end{ region_base + region_size };
 
-                if (memory_basic_info.State == MEM_FREE)
+                if (info.free)
                 {
                     if (std::uint8_t* const allocated{ try_allocate_in_region(region_base, region_end) })
                     {
@@ -3628,17 +4246,25 @@ namespace vmhook
             midi2i_hook(std::uint8_t* const target, const vmhook::hotspot::detour_function_t detour)
                 : target{ target }
                 , allocated{ nullptr }
+                , allocated_size{ 0 }
                 , error{ true }
             {
                 static constexpr std::int32_t HOOK_SIZE{ 8 };
                 static constexpr std::int32_t JMP_SIZE{ 5 };
+                static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+
+#if VMHOOK_OS_WINDOWS
+                // ------------------------------------------------------------
+                // Microsoft x64 calling convention trampoline.
+                // Args: rcx, rdx, r8, r9.  Shadow space: 32 bytes.
+                // Caller-saved: rax, rcx, rdx, r8, r9, r10, r11.
+                // ------------------------------------------------------------
                 static constexpr std::int32_t JE_OFFSET{ 0x32 };   // offset of je in assembly
                 static constexpr std::int32_t JE_SIZE{ 6 };
                 static constexpr std::int32_t RESUME_OFFSET{ 0x63 };
                 static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x73 };
                 static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
-                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x78 }; // offset of data slot
-                static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x78 };
 
                 // Stack layout after the two pushes:
                 //   [rsp+0]  return_slot::cancel  (bool, 1 byte; rest zeroed)
@@ -3705,8 +4331,91 @@ namespace vmhook
                     // data slot: detour function pointer
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
                 };
+#else
+                // ------------------------------------------------------------
+                // System V AMD64 calling convention trampoline.
+                // Args: rdi, rsi, rdx, rcx, r8, r9.  No shadow space.
+                // Caller-saved: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+                // ------------------------------------------------------------
+                static constexpr std::int32_t JE_OFFSET{ 0x36 };
+                static constexpr std::int32_t JE_SIZE{ 6 };
+                static constexpr std::int32_t RESUME_OFFSET{ 0x6B };
+                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x7D };
+                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
+                static constexpr std::int32_t DETOUR_ADDRESS_OFFSET{ 0x82 };
 
-                this->allocated = vmhook::hotspot::allocate_nearby_memory(target, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READWRITE);
+                std::uint8_t assembly[]
+                {
+                    0x50,                                           // push rax
+                    0x57,                                           // push rdi
+                    0x56,                                           // push rsi
+                    0x52,                                           // push rdx
+                    0x51,                                           // push rcx
+                    0x41, 0x50,                                     // push r8
+                    0x41, 0x51,                                     // push r9
+                    0x41, 0x52,                                     // push r10
+                    0x41, 0x53,                                     // push r11
+                    0x55,                                           // push rbp
+                    0x6A, 0x00,                                     // push 0  ; retval
+                    0x6A, 0x00,                                     // push 0  ; cancel
+
+                    0x48, 0x89, 0xEF,                               // mov rdi, rbp   ; arg1 frame*
+                    0x4C, 0x89, 0xFE,                               // mov rsi, r15   ; arg2 java_thread*
+                    0x48, 0x89, 0xE2,                               // mov rdx, rsp   ; arg3 return_slot*
+
+                    0x48, 0x89, 0xE5,                               // mov rbp, rsp
+                    0x48, 0x83, 0xE4, 0xF0,                         // and rsp, -16
+
+                    0xFF, 0x15, 0x4D, 0x00, 0x00, 0x00,             // call [rip+0x4D]
+
+                    0x48, 0x89, 0xEC,                               // mov rsp, rbp
+
+                    0x80, 0x3C, 0x24, 0x00,                         // cmp byte ptr [rsp], 0
+                    0x0F, 0x84, 0x00, 0x00, 0x00, 0x00,             // je resume  (offset filled below)
+
+                    // cancel path:
+                    0x48, 0x8B, 0x44, 0x24, 0x08,                   // mov rax, [rsp+8]
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                   // movq xmm0, rax
+                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10
+                    0x5D,                                           // pop rbp
+                    0x41, 0x5B,                                     // pop r11
+                    0x41, 0x5A,                                     // pop r10
+                    0x41, 0x59,                                     // pop r9
+                    0x41, 0x58,                                     // pop r8
+                    0x59,                                           // pop rcx
+                    0x5A,                                           // pop rdx
+                    0x5E,                                           // pop rsi
+                    0x5F,                                           // pop rdi
+                    0x48, 0x83, 0xC4, 0x08,                         // add rsp, 0x8 ; discard saved rax
+                    0x48, 0x8B, 0x5D, 0xF8,                         // mov rbx, [rbp-8]
+                    0x48, 0x89, 0xEC,                               // mov rsp, rbp
+                    0x5D,                                           // pop rbp
+                    0x5E,                                           // pop rsi
+                    0x48, 0x89, 0xDC,                               // mov rsp, rbx
+                    0xFF, 0xE6,                                     // jmp rsi
+
+                    // resume path:
+                    0x48, 0x83, 0xC4, 0x10,                         // add rsp, 0x10
+                    0x5D,                                           // pop rbp
+                    0x41, 0x5B,                                     // pop r11
+                    0x41, 0x5A,                                     // pop r10
+                    0x41, 0x59,                                     // pop r9
+                    0x41, 0x58,                                     // pop r8
+                    0x59,                                           // pop rcx
+                    0x5A,                                           // pop rdx
+                    0x5E,                                           // pop rsi
+                    0x5F,                                           // pop rdi
+                    0x58,                                           // pop rax
+                    0xE9, 0x00, 0x00, 0x00, 0x00,                   // jmp target+HOOK_SIZE
+
+                    // data slot:
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                };
+#endif
+
+                const std::size_t total_size{ static_cast<std::size_t>(HOOK_SIZE) + sizeof(assembly) };
+                this->allocated = vmhook::hotspot::allocate_nearby_memory(target, total_size);
+                this->allocated_size = total_size;
 
                 try
                 {
@@ -3724,7 +4433,8 @@ namespace vmhook
                 const std::int32_t je_delta{ RESUME_OFFSET - (JE_OFFSET + JE_SIZE) };
                 *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
 
-                const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(target + HOOK_SIZE - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
+                const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
+                    target + HOOK_SIZE - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(assembly + RESUME_JMP_OFFSET + 1) = resume_jmp_delta;
 
                 *reinterpret_cast<vmhook::hotspot::detour_function_t*>(assembly + DETOUR_ADDRESS_OFFSET) = detour;
@@ -3732,15 +4442,23 @@ namespace vmhook
                 std::memcpy(this->allocated, target, HOOK_SIZE);
                 std::memcpy(this->allocated + HOOK_SIZE, assembly, sizeof(assembly));
 
-                DWORD old_protect{};
-                VirtualProtect(this->allocated, HOOK_SIZE + sizeof(assembly), PAGE_EXECUTE_READ, &old_protect);
-                VirtualProtect(target, JMP_SIZE, PAGE_EXECUTE_READWRITE, &old_protect);
+                std::uint32_t old_protect{};
+                vmhook::os::protect(this->allocated, total_size,
+                                    vmhook::os::memory_protection::execute_read, &old_protect);
+                vmhook::os::protect(target, JMP_SIZE,
+                                    vmhook::os::memory_protection::execute_rw, &old_protect);
 
                 target[0] = JMP_OPCODE;
                 const std::int32_t jmp_delta{ static_cast<std::int32_t>(this->allocated - (target + JMP_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(target + 1) = jmp_delta;
 
-                VirtualProtect(target, JMP_SIZE, old_protect, &old_protect);
+                // Restore the target page's original protection.  We don't have a portable
+                // way to spell the original native flags, so we apply execute_read which
+                // matches the JVM's normal state for generated code.
+                vmhook::os::protect(target, JMP_SIZE,
+                                    vmhook::os::memory_protection::execute_read, &old_protect);
+                vmhook::os::flush_instruction_cache(target, JMP_SIZE);
+                vmhook::os::flush_instruction_cache(this->allocated, total_size);
 
                 this->error = false;
             }
@@ -3757,14 +4475,18 @@ namespace vmhook
 
                 static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
-                DWORD old_protect{};
-                if (this->target[0] == JMP_OPCODE && VirtualProtect(this->target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
+                std::uint32_t old_protect{};
+                if (this->target[0] == JMP_OPCODE
+                    && vmhook::os::protect(this->target, 5,
+                                           vmhook::os::memory_protection::execute_rw, &old_protect))
                 {
                     std::memcpy(this->target, this->allocated, 5);
-                    VirtualProtect(this->target, 5, old_protect, &old_protect);
+                    vmhook::os::protect(this->target, 5,
+                                        vmhook::os::memory_protection::execute_read, &old_protect);
+                    vmhook::os::flush_instruction_cache(this->target, 5);
                 }
 
-                VirtualFree(this->allocated, 0, MEM_RELEASE);
+                vmhook::os::release(this->allocated, this->allocated_size);
             }
 
             inline auto has_error() const noexcept -> bool
@@ -3775,6 +4497,7 @@ namespace vmhook
         private:
             std::uint8_t* target{ nullptr };
             std::uint8_t* allocated{ nullptr };
+            std::size_t   allocated_size{ 0 };
             bool          error{ true };
         };
 
@@ -4163,7 +4886,6 @@ namespace vmhook
             }
 
             void* const raw_value{ locals[-index] };
-            const std::uintptr_t raw_bits{ reinterpret_cast<std::uintptr_t>(raw_value) };
 
             // Decode a compressed OOP (32-bit narrow value) to a full 64-bit pointer.
             auto decode_oop = [](void* raw_value)
@@ -4307,9 +5029,11 @@ namespace vmhook
 
         if constexpr (vmhook::detail::is_unique_object_ptr<clean_value_type>::value)
         {
-            return store_oop(value.get()
-                ? static_cast<const vmhook::object_base*>(value.get())->get_instance()
-                : nullptr);
+            // Explicit base-class qualification reaches object_base::get_instance()
+            // even when the derived wrapper shadows the name (e.g. with a same-named
+            // static helper).  Avoids the static_cast<object_base*> which produces an
+            // "incomplete type" warning under GCC at template-definition time.
+            return store_oop(value ? value->vmhook::object_base::get_instance() : nullptr);
         }
         else if constexpr (std::is_base_of_v<vmhook::object_base, clean_value_type>)
         {
@@ -6411,7 +7135,19 @@ namespace vmhook
             {
                 if (this->field_pointer)
                 {
-                    const std::uint32_t compressed{ value.get() ? vmhook::hotspot::encode_oop_pointer(static_cast<const vmhook::object_base*>(value.get())->get_instance()) : 0 };
+                    // Explicit base-class qualification reaches object_base::get_instance()
+                    // even when the derived wrapper shadows the name with a same-named
+                    // static helper (e.g. example_class::get_instance() returning a
+                    // unique_ptr).  Resolved at instantiation; never requires object_base
+                    // to be complete at template-definition time.
+                    void* oop_pointer{ nullptr };
+                    if (value)
+                    {
+                        oop_pointer = value->vmhook::object_base::get_instance();
+                    }
+                    const std::uint32_t compressed{ oop_pointer
+                        ? vmhook::hotspot::encode_oop_pointer(oop_pointer)
+                        : std::uint32_t{ 0 } };
                     std::memcpy(this->field_pointer, &compressed, sizeof(compressed));
                 }
             }
@@ -7730,16 +8466,21 @@ namespace vmhook
     };
 
     /*
-        @brief CRTP base class that adds deducing-this overloads for instance vs. static dispatch.
+        @brief CRTP base class for typed Java-object wrappers.
         @details
-        Derive from vmhook::object<YourClass> (not object_base directly) so that the
-        deducing-this get_field() / get_method() overloads are available.  They allow
-        the compiler to distinguish:
-          - instance call site (has 'this') -> deducing-this overloads -> object_base instance overloads
-          - static call site (no 'this')    -> static overloads -> object_base static overloads
+        Derive from vmhook::object<YourClass> (not object_base directly) so that:
 
-        Without this CRTP layer, a static call to get_field("name") in a static C++ method
-        would incorrectly match the non-static overload at compile time.
+          - Instance access uses the inherited get_field("name") /
+            get_method("name") overloads from object_base.  These work from
+            non-static C++ methods because the implicit 'this' provides the
+            OOP needed for instance Java fields.
+
+          - Static access uses static_field("name") / static_method("name").
+            These do not require an object instance; they resolve the Java
+            class via typeid(derived).  The distinct method names sidestep
+            the cross-compiler issue where some compilers (e.g. older g++)
+            do not exclude deducing-this overloads from static-context
+            overload resolution.
 
         Usage:
             class my_entity : public vmhook::object<my_entity>
@@ -7747,8 +8488,8 @@ namespace vmhook
             public:
                 explicit my_entity(vmhook::oop_t oop) : vmhook::object<my_entity>{ oop } {}
 
-                auto get_health() -> int { return get_field("health")->get(); }
-                static auto get_count() -> int { return get_field("entityCount")->get(); }
+                auto get_health()        -> int  { return get_field("health")->get(); }
+                static auto get_count() -> int  { return static_field("entityCount")->get(); }
             };
     */
     template<typename derived>
@@ -7757,70 +8498,39 @@ namespace vmhook
     public:
         using object_base::object_base;
 
-        /*
-            @brief Instance get_field / get_method  C++23 deducing-this overloads.
-
-            A deducing-this function requires an explicit object to be called.
-            MSVC (and all conformant compilers) correctly exclude it from the
-            overload set when there is no 'this' in scope (i.e. inside a static
-            C++ method).  This avoids the C2352 "non-static member requires object"
-            that MSVC erroneously fires when a regular non-static overload is the
-            best type match from static context.
-
-            From instance context, string literals are an exact match for
-            const char*, so these deducing-this overloads win over the static
-            string_view overloads below.  The call is forwarded to
-            object_base::get_field / get_method, which carries the live OOP
-            pointer needed for instance Java fields.
-
-            Usage:
-                auto get_health()  -> int  { return get_field("health")->get(); }
-                auto set_health(int v)     { get_field("health")->set(v); }
-        */
-        auto get_field(this const object_base& self, const char* const name)
-            -> std::optional<vmhook::field_proxy>
-        {
-            return self.object_base::get_field(name);
-        }
-
-        auto get_method(this const object_base& self, const char* const name)
-            -> std::optional<vmhook::method_proxy>
-        {
-            return self.object_base::get_method(name);
-        }
-
-        auto get_method(this const object_base& self, const char* const name, const char* const signature)
-            -> std::optional<vmhook::method_proxy>
-        {
-            return self.object_base::get_method(name, signature);
-        }
+        // Instance get_field / get_method are inherited from object_base.
+        // They are non-static const members; they pick up the live OOP via
+        // the implicit `this`.
+        using object_base::get_field;
+        using object_base::get_method;
 
         /*
-            @brief Static get_field / get_method  for static Java fields called
-            from static C++ methods.
-
-            From a static C++ method the deducing-this overloads above are not
-            in the candidate set (no object), so these static overloads are the
-            only viable candidates.  They resolve the class via type_index (no
-            OOP needed for the Java mirror that backs static fields).
-
-            Usage:
-                static auto get_version() -> std::string { return get_field("version")->get(); }
-                static auto reset()        -> void        { get_method("reset")->call(); }
+            @brief Static field accessor for static Java fields.
+            @details
+            Resolves the Java klass through the type-to-class map using
+            typeid(derived), then returns a field_proxy bound to the
+            class's mirror.  Use this from static C++ methods on the
+            wrapper class.
         */
-        static auto get_field(const std::string_view name)
+        static auto static_field(const std::string_view name)
             -> std::optional<vmhook::field_proxy>
         {
             return object_base::get_field(std::type_index{ typeid(derived) }, name);
         }
 
-        static auto get_method(const std::string_view name)
+        /*
+            @brief Static method accessor for static Java methods.
+        */
+        static auto static_method(const std::string_view name)
             -> std::optional<vmhook::method_proxy>
         {
             return object_base::get_method(std::type_index{ typeid(derived) }, name);
         }
 
-        static auto get_method(const std::string_view name, const std::string_view signature)
+        /*
+            @brief Static method accessor with explicit JVM descriptor.
+        */
+        static auto static_method(const std::string_view name, const std::string_view signature)
             -> std::optional<vmhook::method_proxy>
         {
             return object_base::get_method(std::type_index{ typeid(derived) }, name, signature);

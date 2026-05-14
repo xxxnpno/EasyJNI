@@ -1,9 +1,39 @@
-#include <print>
-#include <filesystem>
-#include <string>
+// injector — Windows-only helper that walks the process list, finds a running
+// JVM, and uses LoadLibraryW via CreateRemoteThread to inject vmhook.dll into
+// it.  The injection mechanism is intrinsically tied to the Windows process
+// model; on Linux the supported workflow is to launch the JVM with
+// `-Djava.library.path=...` and call System.loadLibrary("vmhook") from Java
+// (or use LD_PRELOAD with libvmhook.so).  See the README.
 
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <vector>
+
+#if !defined(_WIN32) && !defined(_WIN64)
+#  error "injector targets Windows only; on Linux use System.loadLibrary or LD_PRELOAD"
+#endif
+
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
 #include <windows.h>
 #include <tlhelp32.h>
+
+// Replacement for std::println / std::print that works on toolchains that
+// have not yet shipped <print> (MinGW-w64 GCC 13, libc++ < 18, MSVC < 19.37).
+template <typename... args_t>
+static auto log_line(args_t&&... parts) -> void
+{
+    std::ostringstream stream{};
+    ((stream << parts), ...);
+    std::cout << stream.str() << '\n';
+    std::cout.flush();
+}
 
 // std::println has no formatter<wchar_t> for narrow output; convert manually.
 static auto wstr_to_str(const std::wstring& ws)
@@ -71,7 +101,7 @@ static auto inject_dll(const DWORD pid, const std::wstring& dll_path)
 
     if (!process_handle)
     {
-        std::println("[ERROR] Failed to open process with PID {}, error {}.", pid, GetLastError());
+        log_line("[ERROR] Failed to open process with PID ", pid, ", error ", GetLastError(), ".");
 
         return false;
     }
@@ -82,7 +112,7 @@ static auto inject_dll(const DWORD pid, const std::wstring& dll_path)
 
     if (!remote_buffer)
     {
-        std::println("[ERROR] VirtualAllocEx failed, error {}", GetLastError());
+        log_line("[ERROR] VirtualAllocEx failed, error ", GetLastError());
 
         CloseHandle(process_handle);
 
@@ -91,7 +121,7 @@ static auto inject_dll(const DWORD pid, const std::wstring& dll_path)
 
     if (!WriteProcessMemory(process_handle, remote_buffer, dll_path.c_str(), path_bytes, nullptr))
     {
-        std::println("[ERROR] WriteProcessMemory failed, error {}", GetLastError());
+        log_line("[ERROR] WriteProcessMemory failed, error ", GetLastError());
 
         VirtualFreeEx(process_handle, remote_buffer, 0, MEM_RELEASE);
 
@@ -108,7 +138,7 @@ static auto inject_dll(const DWORD pid, const std::wstring& dll_path)
 
     if (!remote_thread)
     {
-        std::println("[ERROR] CreateRemoteThread failed, error {}", GetLastError());
+        log_line("[ERROR] CreateRemoteThread failed, error ", GetLastError());
 
         VirtualFreeEx(process_handle, remote_buffer, 0, MEM_RELEASE);
 
@@ -137,16 +167,16 @@ auto main(std::int32_t argc, char** argv)
 {
     const std::wstring dll_path{ resolve_dll_path() };
 
-    std::println("[INFO] dll_path : {}.", wstr_to_str(dll_path));
+    log_line("[INFO] dll_path : ", wstr_to_str(dll_path), ".");
 
     if (!std::filesystem::exists(dll_path))
     {
-        std::println("[ERROR] vmhook.dll not found.");
+        log_line("[ERROR] vmhook.dll not found.");
 
         return EXIT_FAILURE;
     }
 
-    std::println("[OK] dll found.");
+    log_line("[OK] dll found.");
 
     DWORD target_pid{ 0 };
 
@@ -158,16 +188,16 @@ auto main(std::int32_t argc, char** argv)
         }
         catch (...)
         {
-            std::println("[ERROR] Invalid PID provided.");
+            log_line("[ERROR] Invalid PID provided.");
 
             return EXIT_FAILURE;
         }
 
-        std::println("[INFO] Using provided PID {}.", target_pid);
+        log_line("[INFO] Using provided PID ", target_pid, ".");
     }
     else
     {
-        std::println("[INFO] No PID provided. Scanning for JVM processes...");
+        log_line("[INFO] No PID provided. Scanning for JVM processes...");
     }
 
     std::vector<process_entry> processes{ find_processes(L"javaw.exe") };
@@ -179,7 +209,7 @@ auto main(std::int32_t argc, char** argv)
 
     if (processes.empty())
     {
-        std::println("[ERROR] No running JVM processes found.");
+        log_line("[ERROR] No running JVM processes found.");
 
         return EXIT_FAILURE;
     }
@@ -188,26 +218,26 @@ auto main(std::int32_t argc, char** argv)
     {
         target_pid = processes[0].pid;
 
-        std::println("[INFO] Found 1 process: {}, injecting automatically.", target_pid);
+        log_line("[INFO] Found 1 process: ", target_pid, ", injecting automatically.");
     }
     else
     {
-        std::println("[ERROR] Multiple JVM processes found, aborting automatic injection.");
+        log_line("[ERROR] Multiple JVM processes found, aborting automatic injection.");
 
         return EXIT_FAILURE;
     }
 
-    std::println("[INFO] Injecting into process {}", target_pid);
+    log_line("[INFO] Injecting into process ", target_pid);
 
     if (inject_dll(target_pid, dll_path))
     {
-        std::println("[OK] Injection successful.");
+        log_line("[OK] Injection successful.");
 
         return EXIT_SUCCESS;
     }
     else
     {
-        std::println("[ERROR] Injection failed.");
+        log_line("[ERROR] Injection failed.");
 
         return EXIT_FAILURE;
     }
