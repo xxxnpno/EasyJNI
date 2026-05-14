@@ -7,6 +7,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- `vmhook::for_each_thread(visitor)` + `struct thread_info` — walks HotSpot's
+  live JavaThread list (classic `Threads::_thread_list` on JDK 8/9, falls
+  back to `ThreadsSMRSupport::_java_thread_list` on JDK 10+) and reports each
+  thread's state + OS thread ID + raw `java_thread*`.  Completes the
+  introspection trio with `for_each_loaded_class` and `for_each_instance`.
+- Documented `vmhook::read_java_string(oop)` in the README; the helper has
+  existed since 0.2 but was not publicly surfaced.  Decodes a Java String
+  (char[] in JDK 8, byte[] + coder in JDK 9+) to a UTF-8 `std::string`
+  without needing to register `java/lang/String` as a wrapper.
 - `vmhook::scoped_hook<T>(name, callback)` + `class hook_handle` — RAII variant
   of `vmhook::hook<T>`.  The returned `hook_handle` uninstalls just that hook
   when it goes out of scope, restoring the method's original entry points and

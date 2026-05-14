@@ -2450,6 +2450,68 @@ namespace
     }
 
     // ── for_each_instance — heap iteration probe ───────────────────────────
+    // ── for_each_thread — JavaThread enumeration probe ─────────────────────
+    auto test_for_each_thread() -> void
+    {
+        std::size_t total_threads{ 0 };
+        bool        saw_in_java_state{ false };
+        bool        saw_current_thread{ false };
+
+        const auto current_jt{ vmhook::hotspot::current_java_thread };
+
+        vmhook::for_each_thread([&](const vmhook::thread_info& info)
+        {
+            ++total_threads;
+            if (info.state == vmhook::hotspot::java_thread_state::_thread_in_Java
+             || info.state == vmhook::hotspot::java_thread_state::_thread_in_native)
+            {
+                saw_in_java_state = true;
+            }
+            if (info.thread == current_jt)
+            {
+                saw_current_thread = true;
+            }
+        });
+
+        check("forEachThreadVisitedAtLeastOne",   total_threads > 0);
+        check("forEachThreadReasonableCount",     total_threads < 4096);
+        check("forEachThreadSawRunningOrNative",  saw_in_java_state);
+        if (current_jt)
+        {
+            check("forEachThreadSawCurrent", saw_current_thread);
+        }
+    }
+
+    // ── read_java_string — direct String reader probe ───────────────────────
+    auto test_read_java_string() -> void
+    {
+        // Read Example.stringField (set Java-side) directly via the
+        // free helper without needing a java/lang/String wrapper.
+        const auto example_instance{ example_class::get_instance() };
+        if (!example_instance)
+        {
+            check("readJavaStringHasExampleInstance", false);
+            return;
+        }
+
+        const auto str_field_proxy{
+            example_instance->vmhook::object_base::get_field("notStaticString") };
+        if (!str_field_proxy.has_value())
+        {
+            check("readJavaStringFieldFound", false);
+            return;
+        }
+        const auto raw{ str_field_proxy->get_compressed_oop() };
+        const std::string decoded{
+            vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(raw)) };
+
+        check("readJavaStringNonEmpty", !decoded.empty());
+        // set_expected_values() runs earlier in the suite and writes
+        // "cppwins!" into notStaticString via the C++ setter, so
+        // that's the value we expect to read back here.
+        check_equal("readJavaStringValue", decoded, std::string{ "cppwins!" });
+    }
+
     auto test_for_each_instance() -> void
     {
         // Walk the heap for instances of Example.  At least one
@@ -2647,6 +2709,12 @@ static auto run_test_suite() -> void
         // Heap iteration probe — also runs early before any other
         // hooks mess with the test_log thread's state.
         test_for_each_instance();
+
+        // JavaThread enumeration + direct String reader.  Both run
+        // early because they only need the JVM in a quiescent state,
+        // not any installed hooks.
+        test_for_each_thread();
+        test_read_java_string();
 
         // Newer feature surface: caller info, field watcher, class-load watcher.
         // on_exception is exercised BEFORE test_caller_info because the

@@ -5466,6 +5466,133 @@ namespace vmhook
     }
 
     /*
+        @brief Snapshot of one HotSpot JavaThread, suitable for passing
+               to the for_each_thread visitor.
+        @details
+        `thread` is the underlying JavaThread* — pass it back to
+        vmhook's java_thread helpers (`get_thread_state`,
+        `get_suspend_flags`, etc.) for deeper introspection.  Treat
+        the pointer as valid only for the duration of the visit:
+        the JVM may reclaim a JavaThread once the corresponding Java
+        thread exits.
+    */
+    struct thread_info
+    {
+        vmhook::hotspot::java_thread*       thread{ nullptr };
+        vmhook::hotspot::java_thread_state  state{ vmhook::hotspot::java_thread_state::_thread_uninitialized };
+        vmhook::os::thread_id_t             os_thread_id{ 0 };
+    };
+
+    /*
+        @brief Invokes the visitor for every JavaThread currently live
+               in the JVM.
+        @details
+        Walks HotSpot's intrusive `Threads::_thread_list` (the same
+        list used internally by `find_java_thread_by_os_thread_id`),
+        capping at 4 096 entries as a runaway-list guard.  The visitor
+        receives a `thread_info` snapshot — the underlying JavaThread*
+        is safe to dereference during the visit, but should not be
+        held past the call's return because the JVM may reclaim it
+        when the Java thread exits.
+
+        Concurrent thread creation / exit during iteration may show
+        up as missed entries; HotSpot doesn't pin the list for us.
+        For a stable view, walk during a quiescent period or after
+        installing a JVMTI agent (out of scope for vmhook).
+
+        Complexity: O(N) where N = number of live Java threads.
+        Exception safety: callback exceptions propagate; iteration
+            stops at the throwing visit.
+
+        @tparam visitor_type Callable accepting `const thread_info&`.
+
+        Example:
+        @code
+            vmhook::for_each_thread([](const vmhook::thread_info& t)
+            {
+                VMHOOK_LOG("thread {:p}: state={}, tid={}",
+                           reinterpret_cast<void*>(t.thread),
+                           static_cast<int>(t.state), t.os_thread_id);
+            });
+        @endcode
+    */
+    template<typename visitor_type>
+    inline auto for_each_thread(visitor_type&& visit) -> void
+    {
+        const auto invoke_visitor = [&](vmhook::hotspot::java_thread* const t) -> void
+        {
+            if (!t || !vmhook::hotspot::is_valid_pointer(t))
+            {
+                return;
+            }
+            thread_info info{};
+            info.thread       = t;
+            info.state        = t->get_thread_state();
+            info.os_thread_id = t->get_os_thread_id();
+            visit(info);
+        };
+
+        // Path 1: classic Threads::_thread_list intrusive list,
+        // present on JDK 8-9 and (where the JVM ships the VMStruct
+        // entry) still useful on later builds.
+        std::int32_t visited_count{ 0 };
+        bool         path1_visited_anything{ false };
+        for (auto* current{ vmhook::hotspot::find_any_java_thread() };
+             current && vmhook::hotspot::is_valid_pointer(current) && visited_count < 4096;
+             ++visited_count)
+        {
+            invoke_visitor(current);
+            path1_visited_anything = true;
+            auto* const next{ current->get_next() };
+            current = (next && vmhook::hotspot::is_valid_pointer(next)) ? next : nullptr;
+        }
+        if (path1_visited_anything)
+        {
+            return;
+        }
+
+        // Path 2: JDK 10+ Safe Memory Reclamation snapshot.  The
+        // thread list lives in `ThreadsSMRSupport::_java_thread_list`
+        // (static, points at a ThreadsList containing _length +
+        // _threads JavaThread**).
+        static const auto* const smr_list_entry{
+            vmhook::hotspot::iterate_struct_entries("ThreadsSMRSupport", "_java_thread_list") };
+        static const auto* const list_length_entry{
+            vmhook::hotspot::iterate_struct_entries("ThreadsList", "_length") };
+        static const auto* const list_threads_entry{
+            vmhook::hotspot::iterate_struct_entries("ThreadsList", "_threads") };
+
+        if (!smr_list_entry || !smr_list_entry->address
+         || !list_length_entry || !list_threads_entry)
+        {
+            return;
+        }
+
+        void* const threads_list{
+            *reinterpret_cast<void**>(smr_list_entry->address) };
+        if (!vmhook::hotspot::is_valid_pointer(threads_list))
+        {
+            return;
+        }
+
+        const std::int32_t length{
+            *reinterpret_cast<const std::int32_t*>(
+                reinterpret_cast<const std::uint8_t*>(threads_list) + list_length_entry->offset) };
+        auto** const threads_array{
+            *reinterpret_cast<vmhook::hotspot::java_thread***>(
+                reinterpret_cast<std::uint8_t*>(threads_list) + list_threads_entry->offset) };
+        if (length <= 0 || length > 4096 || !threads_array)
+        {
+            return;
+        }
+
+        for (std::int32_t i{ 0 }; i < length; ++i)
+        {
+            invoke_visitor(threads_array[i]);
+        }
+    }
+
+    /*
         @brief Visits every live instance of a registered C++ wrapper class.
         @details
         Walks `Universe::_collectedHeap::_reserved` linearly in 4 KiB

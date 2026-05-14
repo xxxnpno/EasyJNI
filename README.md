@@ -500,6 +500,46 @@ brought to a safepoint, so:
 The scan is O(heap-size) — typically 0.5–2 s on a 4 GiB heap.
 `max_visits` short-circuits as soon as you have enough.
 
+## Enumerating Java threads
+
+`vmhook::for_each_thread(visitor)` walks HotSpot's live thread list
+(`Threads::_thread_list` on JDK 8/9, `ThreadsSMRSupport::_java_thread_list`
+on JDK 10+) and invokes the visitor with a `thread_info` snapshot for
+every JavaThread the JVM currently owns:
+
+```cpp
+vmhook::for_each_thread([](const vmhook::thread_info& t)
+{
+    VMHOOK_LOG("tid={} state={} jt={:p}",
+               t.os_thread_id,
+               static_cast<int>(t.state),
+               reinterpret_cast<void*>(t.thread));
+});
+```
+
+`thread_info::thread` is the underlying `vmhook::hotspot::java_thread*`
+— hand it back to vmhook's helpers (`get_thread_state`,
+`get_suspend_flags`, etc.) for deeper introspection.  Treat it as
+valid only for the duration of the visit; the JVM may reclaim a
+JavaThread once the corresponding Java thread exits.
+
+## Reading a Java String directly
+
+`vmhook::read_java_string(oop)` decodes a `java.lang.String` to a
+UTF-8 `std::string` without needing to register `java/lang/String`
+as a wrapper.  Handles both pre-Java-9 `char[]` and Java-9+
+`byte[] + coder` layouts:
+
+```cpp
+const std::uint32_t compressed{
+    field_proxy->get_compressed_oop() };
+const std::string text{
+    vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(compressed)) };
+```
+
+Truncates at 4 KiB as a sanity guard.  Returns an empty string on
+failure.
+
 ## Enumerating loaded classes
 
 `vmhook::for_each_loaded_class(visitor)` snapshots the JVM's
