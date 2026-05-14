@@ -1,5 +1,10 @@
 # vmhook
 
+[![CI](https://github.com/xxxnpno/vmhook/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/xxxnpno/vmhook/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-See%20LICENSE.txt-blue)](LICENSE.txt)
+[![Single header](https://img.shields.io/badge/Single%20header-vmhook.hpp-brightgreen)](vmhook/ext/vmhook/vmhook.hpp)
+[![C++ Standard](https://img.shields.io/badge/C%2B%2B-20%20%2F%2023-blue)](https://en.cppreference.com/w/cpp/23)
+
 vmhook is a C++20/23 single-header library for inspecting, wrapping, calling,
 and hooking a running HotSpot JVM from native code. It is intended for injected
 tooling that controls the target environment and needs direct access to HotSpot
@@ -13,6 +18,9 @@ The library currently supports:
 - Java object allocation through registered wrapper types
 - interpreted Java method hooks
 - hook return cancellation and forced return values
+- caller-info introspection from inside any hook
+- event-driven class-load notifications
+- event-driven field-change notifications (Windows trap-based)
 - hook argument replacement through `vmhook::return_value::set_arg`
 - HotSpot metadata lookup with JNI fallbacks where needed
 

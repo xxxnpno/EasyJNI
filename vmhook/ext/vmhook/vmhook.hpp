@@ -58,6 +58,29 @@
           the caller (hook<T>) catches it and returns false.
 */
 
+// ---------------------------------------------------------------------------
+// Library version.  Bump these macros for every released change.  Semantic
+// versioning: MAJOR for API breaks, MINOR for additive features, PATCH for
+// fixes.  The packed VMHOOK_VERSION integer makes it easy to gate consumer
+// code on a minimum version via `#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0,3,0)`.
+// ---------------------------------------------------------------------------
+#define VMHOOK_VERSION_MAJOR 0
+#define VMHOOK_VERSION_MINOR 4
+#define VMHOOK_VERSION_PATCH 0
+
+#define VMHOOK_MAKE_VERSION(major, minor, patch) \
+    (((major) * 1000000) + ((minor) * 1000) + (patch))
+
+#define VMHOOK_VERSION \
+    VMHOOK_MAKE_VERSION(VMHOOK_VERSION_MAJOR, VMHOOK_VERSION_MINOR, VMHOOK_VERSION_PATCH)
+
+#define VMHOOK_VERSION_STRING_HELPER2(x) #x
+#define VMHOOK_VERSION_STRING_HELPER(x) VMHOOK_VERSION_STRING_HELPER2(x)
+#define VMHOOK_VERSION_STRING                                    \
+    VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MAJOR) "."        \
+    VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MINOR) "."        \
+    VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_PATCH)
+
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
