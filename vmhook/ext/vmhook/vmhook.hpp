@@ -1038,7 +1038,16 @@ namespace vmhook
         Keys   - internal JVM class names (e.g. "java/lang/String").
         Values - lambda functions: +[](void* oop) { return std::make_unique<T>(oop); }
     */
-    using type_factory_function_t = std::unique_ptr<class object_base>(*)(void* instance);
+    // The factory returns a heap-allocated wrapper as a raw pointer so the
+    // factory's signature is free of `std::unique_ptr<object_base>`.
+    // libstdc++ and libc++ both eagerly check sizeof(object_base) inside
+    // unique_ptr's destructor static_assert when the lambda is parsed, even
+    // though the unique_ptr never actually destructs (the caller calls
+    // .release() immediately).  Returning the raw pointer avoids the
+    // incomplete-type-in-destructor instantiation entirely.  Callers wrap
+    // the returned pointer in a unique_ptr at the consumption site where
+    // object_base is already complete.
+    using type_factory_function_t = class object_base*(*)(void* instance);
     inline std::unordered_map<std::string, type_factory_function_t> g_type_factory_map{};
 
     template<class wrapper_type>
@@ -4940,10 +4949,12 @@ namespace vmhook
 
         // Store a factory function so field_proxy::get_as<T>() and frame::get_arguments()
         // can construct C++ wrapper objects from decoded Java object references.
+        // The factory returns a raw pointer; consumers immediately wrap it in
+        // a unique_ptr at the call site.  See type_factory_function_t for why.
         vmhook::g_type_factory_map.emplace(std::string{ class_name }, +[](void* instance)
-            -> std::unique_ptr<object_base>
+            -> object_base*
             {
-                return std::make_unique<wrapper_type>(instance);
+                return new wrapper_type{ instance };
             }
         );
 
@@ -5092,7 +5103,9 @@ namespace vmhook
                 {
                     return nullptr;
                 }
-                return base_t{ static_cast<element_t*>(factory_it->second(oop).release()) };
+                // factory returns object_base*; downcast to element_t* and
+                // hand it to the unique_ptr at the call site.
+                return base_t{ static_cast<element_t*>(factory_it->second(oop)) };
             }
             else if constexpr (std::is_pointer_v<base_t>)
             {

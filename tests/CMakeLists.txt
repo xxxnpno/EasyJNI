@@ -15,12 +15,19 @@ function(vmhook_add_test name)
     target_link_libraries("vmhook_test_${name}" PRIVATE vmhook::vmhook)
     vmhook_apply_warnings("vmhook_test_${name}")
 
-    # iOS / tvOS / watchOS / Android targets require an Xcode product
-    # bundle identifier on every binary they produce; CMake doesn't fill
-    # one in by default.  We synthesize a unique one per test target.
+    # Apple Xcode-generated builds need a bundle identifier on every
+    # binary they produce; CMake doesn't fill one in by default.  iOS
+    # builds further require code-signing identities (which the
+    # GitHub-hosted runners don't have) — we disable signing for the
+    # test targets since we never deploy or run them on a device.
     if(VMHOOK_PLATFORM_IOS OR APPLE)
         set_target_properties("vmhook_test_${name}" PROPERTIES
-            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.vmhook.test.${name}")
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.vmhook.test.${name}"
+            XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED          "NO"
+            XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY            ""
+            XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED         "NO"
+            XCODE_ATTRIBUTE_ENABLE_BITCODE                "NO"
+            XCODE_ATTRIBUTE_EXPANDED_CODE_SIGN_IDENTITY   "-")
     endif()
 
     add_test(NAME "${name}" COMMAND "vmhook_test_${name}")
