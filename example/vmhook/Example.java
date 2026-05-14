@@ -238,6 +238,12 @@ public class Example
     public static volatile boolean edgeProbeDone      = false;
     public static volatile boolean edgeProbeAllSeen   = false;
 
+    // ── Class-load watch probe ────────────────────────────────────────────
+    // The C++ side registers a class-load watcher; this probe triggers
+    // loading of vmhook.LateClass so the watcher has something to observe.
+    public static volatile boolean classLoadProbeRequested = false;
+    public static volatile boolean classLoadProbeDone      = false;
+
     // ── Probe targets ─────────────────────────────────────────────────────
 
     public static void staticCallMe(final int value)       { staticCalled++; }

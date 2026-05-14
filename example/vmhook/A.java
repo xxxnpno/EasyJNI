@@ -1,30 +1,44 @@
 package vmhook;
 
+/**
+ * Base-class probe target.  Verifies that vmhook can:
+ *   - Read every visibility level (public, package-private, protected, private).
+ *   - Walk the superclass chain when {@link B} extends this class.
+ *   - Call a constructor that increments a static counter (used by the
+ *     make_unique tests on the C++ side).
+ */
 public class A
 {
-    private String string = "test";
-    public static int counter = 0;
-    public int field = 0;
-    private int val = 0;
+    // ── Fields exercised by the C++ wrapper ────────────────────────────────
+    public        String string         = "test";
+    public static int    counter        = 0;
+    public        int    field          = 0;
+    public        int    val            = 0;
 
-    // protected fields to test hierarchy field access from B
-    protected int protectedInt = 1337;
-    protected String protectedString = "from_A";
+    // Protected fields used by the inheritance/polymorphism probe.  B
+    // inherits them; vmhook's field lookup walks the super chain so B's
+    // wrapper can read them through its own klass*.
+    protected     int    protectedInt    = 1337;
+    protected     String protectedString = "from_A";
 
-    // default constructor used by Example (private A a = new A())
-    A()
+    // ── Constructors ───────────────────────────────────────────────────────
+    /** Default constructor; bumps the static counter. */
+    public A()
     {
-        this.counter++;
+        counter++;
     }
 
-    // we're testing vmhook::make_unique
-    A(final String a)
+    /** Convenience constructor used by the make_unique tests. */
+    public A(final String initialString)
     {
-        this.string = a;
-
-        this.counter++;
+        this.string = initialString;
+        counter++;
     }
 
-    // protected method to test hierarchy method access
-    protected int protectedAdd(final int x) { return x + protectedInt; }
+    // ── Methods ────────────────────────────────────────────────────────────
+    /** Reads the protected int.  B inherits this method too. */
+    protected int protectedAdd(final int x)
+    {
+        return x + this.protectedInt;
+    }
 }

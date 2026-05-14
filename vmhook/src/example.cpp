@@ -280,6 +280,58 @@ public:
     auto outer_plus_inner() -> std::int32_t { return get_method("outerPlusInner")->call(); }
 };
 
+// ── CallerProbe wrapper ────────────────────────────────────────────────────
+// Used by the caller-info test: outerStep() calls innerStep(), and the C++
+// hook installed on innerStep asks return_value::caller() for the
+// outerStep frame.
+class caller_probe_class : public vmhook::object<caller_probe_class>
+{
+public:
+    explicit caller_probe_class(vmhook::oop_t instance)
+        : vmhook::object<caller_probe_class>{ instance }
+    {
+    }
+
+    auto outer_step(std::int32_t x) -> std::int32_t
+    {
+        return get_method("outerStep")->call(x);
+    }
+
+    static auto get_probe_requested() -> bool { return static_field("probeRequested")->get(); }
+    static auto set_probe_requested(bool v)   { static_field("probeRequested")->set(v); }
+    static auto get_probe_done() -> bool      { return static_field("probeDone")->get(); }
+    static auto set_probe_done(bool v)        { static_field("probeDone")->set(v); }
+    static auto get_observed_sum() -> std::int32_t { return static_field("observedSum")->get(); }
+};
+
+// ── TickerProbe wrapper (field-watcher target) ─────────────────────────────
+class ticker_probe_class : public vmhook::object<ticker_probe_class>
+{
+public:
+    explicit ticker_probe_class(vmhook::oop_t instance)
+        : vmhook::object<ticker_probe_class>{ instance }
+    {
+    }
+
+    static auto get_counter() -> std::int32_t       { return static_field("counter")->get(); }
+    static auto get_probe_requested() -> bool       { return static_field("probeRequested")->get(); }
+    static auto set_probe_requested(bool v)         { static_field("probeRequested")->set(v); }
+    static auto get_probe_done() -> bool            { return static_field("probeDone")->get(); }
+    static auto set_probe_done(bool v)              { static_field("probeDone")->set(v); }
+};
+
+// ── LateClass wrapper (class-load watch target) ────────────────────────────
+class late_class : public vmhook::object<late_class>
+{
+public:
+    explicit late_class(vmhook::oop_t instance)
+        : vmhook::object<late_class>{ instance }
+    {
+    }
+
+    static auto get_beacon() -> std::int32_t { return static_field("beacon")->get(); }
+};
+
 class example_class : public vmhook::object<example_class>
 {
 public:
@@ -1236,6 +1288,11 @@ public:
     static auto get_edge_probe_done() -> bool        { return static_field("edgeProbeDone")->get(); }
     static auto set_edge_probe_done(bool v)          { static_field("edgeProbeDone")->set(v); }
     static auto get_edge_probe_all_seen() -> bool    { return static_field("edgeProbeAllSeen")->get(); }
+
+    static auto get_class_load_probe_requested() -> bool { return static_field("classLoadProbeRequested")->get(); }
+    static auto set_class_load_probe_requested(bool v)   { static_field("classLoadProbeRequested")->set(v); }
+    static auto get_class_load_probe_done() -> bool      { return static_field("classLoadProbeDone")->get(); }
+    static auto set_class_load_probe_done(bool v)        { static_field("classLoadProbeDone")->set(v); }
 };
 
 namespace
@@ -2236,6 +2293,124 @@ namespace
         check_equal("returnTypesProbeAccum", example_class::get_return_types_probe_accum(),
                     static_cast<std::int32_t>(1 + 126 + 12345 + 18 + 18 + 3 + 2 + 63 + 999));
     }
+
+    // ── return_value::caller() — caller-info probe ─────────────────────────
+    std::atomic_bool caller_probe_method_observed{ false };
+    std::atomic_bool caller_probe_name_observed{ false };
+    std::atomic_bool caller_probe_class_observed{ false };
+
+    auto test_caller_info() -> void
+    {
+        caller_probe_method_observed.store(false);
+        caller_probe_name_observed.store(false);
+        caller_probe_class_observed.store(false);
+
+        caller_probe_class::set_probe_done(false);
+        caller_probe_class::set_probe_requested(false);
+
+        const bool hook_installed{ vmhook::hook<caller_probe_class>("innerStep",
+            [](vmhook::return_value& retval,
+               const std::unique_ptr<caller_probe_class>& /*self*/,
+               std::int32_t /*value*/)
+            {
+                const auto info{ retval.caller() };
+                if (info.valid())
+                {
+                    caller_probe_method_observed.store(info.method != nullptr);
+                    caller_probe_name_observed.store(info.method_name == "outerStep");
+                    caller_probe_class_observed.store(info.class_name == "vmhook/CallerProbe");
+                }
+            }) };
+        check("callerProbeHookInstalled", hook_installed);
+
+        if (!hook_installed)
+        {
+            return;
+        }
+
+        const bool probe_done{ run_java_probe(caller_probe_class::set_probe_requested,
+                                               caller_probe_class::get_probe_done) };
+        check("callerProbeDone",          probe_done);
+        check("callerInfoMethodPtrFound", caller_probe_method_observed.load());
+        check("callerInfoMethodName",     caller_probe_name_observed.load());
+        check("callerInfoClassName",      caller_probe_class_observed.load());
+        check_equal("callerProbeObservedSum", caller_probe_class::get_observed_sum(),
+                    static_cast<std::int32_t>((7 + 1) * 2 * 10));
+
+        vmhook::shutdown_hooks();
+    }
+
+    // ── watch_static_field — field-change probe ────────────────────────────
+    auto test_field_watcher() -> void
+    {
+        std::atomic_int  change_count{ 0 };
+        std::atomic_bool change_monotonic{ true };
+        std::atomic_int  last_seen{ -1 };
+
+        auto watcher{ vmhook::watch_static_field<ticker_probe_class, std::int32_t>(
+            "counter",
+            std::chrono::milliseconds{ 5 },
+            [&](std::int32_t prev, std::int32_t next)
+            {
+                if (next <= prev)
+                {
+                    change_monotonic.store(false);
+                }
+                last_seen.store(next, std::memory_order_relaxed);
+                ++change_count;
+            }) };
+
+        // Ask Java to bump the counter several times.
+        ticker_probe_class::set_probe_done(false);
+        ticker_probe_class::set_probe_requested(false);
+        const bool probe_done{ run_java_probe(ticker_probe_class::set_probe_requested,
+                                              ticker_probe_class::get_probe_done) };
+        check("tickerProbeDone", probe_done);
+
+        // Give the watcher a moment to drain after the probe finishes.
+        std::this_thread::sleep_for(std::chrono::milliseconds{ 100 });
+
+        check("fieldWatcherSawChange",     change_count.load() > 0);
+        check("fieldWatcherMonotonic",     change_monotonic.load());
+        check("fieldWatcherCounterReached", ticker_probe_class::get_counter() > 0);
+    }
+
+    // ── on_class_loaded — class-load watch probe ───────────────────────────
+    auto test_class_load_watcher() -> void
+    {
+        std::atomic_bool late_seen{ false };
+        std::mutex names_mutex{};
+        std::vector<std::string> observed_names{};
+
+        auto watcher{ vmhook::on_class_loaded(
+            std::chrono::milliseconds{ 25 },
+            [&](const std::string& name, vmhook::hotspot::klass* /*klass*/)
+            {
+                {
+                    std::lock_guard<std::mutex> guard{ names_mutex };
+                    observed_names.push_back(name);
+                }
+                if (name == "vmhook/LateClass")
+                {
+                    late_seen.store(true);
+                }
+            }) };
+
+        // Trigger LateClass loading on the Java side via Main's probe.
+        example_class::set_class_load_probe_done(false);
+        example_class::set_class_load_probe_requested(false);
+        const bool probe_done{ run_java_probe(example_class::set_class_load_probe_requested,
+                                              example_class::get_class_load_probe_done) };
+        check("classLoadProbeDone", probe_done);
+
+        // Give the watcher up to a second to observe the new klass.
+        for (int i{ 0 }; i < 100 && !late_seen.load(); ++i)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 10 });
+        }
+
+        check("classLoadObservedLateClass", late_seen.load());
+    }
 } // namespace (anonymous)
 
 static auto run_test_suite() -> void
@@ -2254,6 +2429,8 @@ static auto run_test_suite() -> void
     vmhook::register_class<nested_host_class>("vmhook/NestedHost");
     vmhook::register_class<nested_static_class>("vmhook/NestedHost$StaticNested");
     vmhook::register_class<nested_inner_class>("vmhook/NestedHost$Inner");
+    vmhook::register_class<caller_probe_class>("vmhook/CallerProbe");
+    vmhook::register_class<ticker_probe_class>("vmhook/TickerProbe");
 
     const auto instance{ example_class::get_instance() };
 
@@ -2284,6 +2461,11 @@ static auto run_test_suite() -> void
         test_throwing_method();
         test_overloaded_methods();
         test_return_types();
+
+        // Newer feature surface: caller info, field watcher, class-load watcher.
+        test_caller_info();
+        test_field_watcher();
+        test_class_load_watcher();
     }
     else
     {

@@ -33,6 +33,10 @@ public class Main
         Class.forName("vmhook.NestedHost");
         Class.forName("vmhook.NestedHost$StaticNested");
         Class.forName("vmhook.NestedHost$Inner");
+        Class.forName("vmhook.CallerProbe");
+        Class.forName("vmhook.TickerProbe");
+        // LateClass is deliberately NOT loaded here — the class-load probe
+        // triggers it later so the C++ on_class_loaded watcher observes it.
 
         // we let vmhook.dll do its things in the jvm
         // vmhook has to get_field("stopJVM")->set(true) to stop the JVM
@@ -168,6 +172,48 @@ public class Main
                     Example.returnTypesProbeAccum = accum;
                 },
                 () -> Example.returnTypesProbeDone = true);
+
+            // Caller-info probe: outerStep(7) calls innerStep(8); innerStep is
+            // hooked on the C++ side and asks return_value::caller() for the
+            // outerStep frame.
+            runProbe(() -> CallerProbe.probeRequested && !CallerProbe.probeDone,
+                () ->
+                {
+                    final CallerProbe probe = new CallerProbe();
+                    CallerProbe.observedSum = probe.outerStep(7);
+                },
+                () -> CallerProbe.probeDone = true);
+
+            // Field-watcher probe: bump TickerProbe.counter several times so
+            // the C++ watch_static_field watcher observes the transitions.
+            runProbe(() -> TickerProbe.probeRequested && !TickerProbe.probeDone,
+                () ->
+                {
+                    for (int i = 0; i < 25; i++)
+                    {
+                        TickerProbe.tick();
+                        try { Thread.sleep(2); } catch (final InterruptedException ie) { /* ignore */ }
+                    }
+                },
+                () -> TickerProbe.probeDone = true);
+
+            // Class-load probe: trigger loading of LateClass so the C++
+            // on_class_loaded watcher observes a brand-new klass.
+            runProbe(() -> Example.classLoadProbeRequested && !Example.classLoadProbeDone,
+                () ->
+                {
+                    try
+                    {
+                        Class.forName("vmhook.LateClass");
+                    }
+                    catch (final ClassNotFoundException ex)
+                    {
+                        // Print to stderr; the C++ test will still fail
+                        // because the class never appears.
+                        System.err.println("LateClass not on classpath: " + ex);
+                    }
+                },
+                () -> Example.classLoadProbeDone = true);
 
             // Edge-value probe: confirm the boundary primitive fields are
             // still readable through Java itself (sanity check that nothing

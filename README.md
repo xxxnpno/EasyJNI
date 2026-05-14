@@ -303,6 +303,79 @@ Remove installed hooks before unloading:
 vmhook::shutdown_hooks();
 ```
 
+## Caller information from inside a hook
+
+`return_value::caller()` walks the saved-rbp chain on the interpreter
+stack and reports the method that invoked the currently-hooked one.
+
+```cpp
+vmhook::hook<my_class>("innerStep",
+    [](vmhook::return_value& ret,
+       const std::unique_ptr<my_class>& self,
+       std::int32_t value)
+    {
+        const auto info{ ret.caller() };
+        if (info.valid())
+        {
+            // info.class_name  == "vmhook/CallerProbe"
+            // info.method_name == "outerStep"
+            // info.signature   == "(I)I"
+            // info.method      == raw vmhook::hotspot::method* (cached for
+            //                     further calls to method_proxy etc.)
+        }
+    });
+```
+
+`caller()` returns an empty `caller_info` (`valid() == false`) when the
+caller frame is not interpreted (compiled, native, or unidentifiable).
+Only the immediate caller is exposed; walking deeper requires reading
+saved-rbp chains manually starting from `ret.frame()`.
+
+## Watching a static field for changes
+
+`vmhook::watch_static_field<T, value_t>(name, interval, callback)` spawns
+a background thread that polls a static field and invokes the callback
+whenever the value changes.  Destroying the returned `watch_handle`
+stops the watcher.
+
+```cpp
+auto watcher{ vmhook::watch_static_field<my_class, std::int32_t>(
+    "tickCount",
+    std::chrono::milliseconds{ 50 },
+    [](std::int32_t prev, std::int32_t next)
+    {
+        std::println("tickCount changed: {} -> {}", prev, next);
+    }) };
+
+// ... do work ...
+
+watcher.stop();   // optional; happens automatically on scope exit
+```
+
+Polling-based, so the callback latency is bounded by `interval`.  The
+first read seeds the baseline and does NOT fire the callback; only
+subsequent value changes do.
+
+## Watching for newly-loaded classes
+
+`vmhook::on_class_loaded(interval, callback)` snapshots the JVM's
+ClassLoaderData graph at the given interval and invokes the callback
+once per newly-discovered class.  Classes already loaded when the
+watcher starts are not reported.
+
+```cpp
+auto watcher{ vmhook::on_class_loaded(
+    std::chrono::milliseconds{ 100 },
+    [](const std::string& internal_name, vmhook::hotspot::klass* k)
+    {
+        std::println("loaded: {} (klass {:p})", internal_name, (void*)k);
+    }) };
+```
+
+`internal_name` uses JVM `/`-separated form (e.g.
+`"net/minecraft/client/Minecraft"`).  Like the field watcher, this is
+polling-based; lower intervals give better latency at the cost of CPU.
+
 ## Object Construction
 
 `vmhook::make_unique<T>(args...)` allocates a Java object for a registered
@@ -353,6 +426,17 @@ The complete example lives in `vmhook/src/example.cpp` with Java fixtures in
 - Java object allocation with `make_unique`
 - superclass field and method lookup
 - `java.util.List` conversion to `std::vector<std::unique_ptr<T>>`
+- enum singletons (`Color.RED/GREEN/BLUE` with constructor args)
+- interface default methods + override dispatch (`Animal` + `Dog`)
+- static nested classes + non-static inner classes with synthetic outer ref
+- overloaded methods (same name, three signatures)
+- every primitive return type plus void and null-returning methods
+- throwing methods (observing the exception from a non-hooked call)
+- caller info from inside a hook (`return_value::caller()`)
+- field-change watcher (`watch_static_field`)
+- class-load watcher (`on_class_loaded`)
+- boundary primitive values (MIN/MAX, NaN, +/- infinity, negatives)
+- string edge cases (empty, unicode, long, interned, null)
 
 The GitHub Actions matrix builds and runs the native harness against multiple
 JDK versions. The harness writes `test_results.txt`; CI fails if any `[FAIL]`

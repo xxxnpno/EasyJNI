@@ -927,6 +927,14 @@ namespace vmhook
             bool         cancel{ false };
             std::int64_t retval{ 0 };
         };
+
+        // Forward declarations used by return_value::caller_info; full
+        // definitions appear further down in the file.
+        struct method;
+        struct klass;
+        struct symbol;
+        struct const_method;
+        struct constant_pool;
     }
 
     class object_base;
@@ -991,6 +999,58 @@ namespace vmhook
         template<typename value_type>
         auto set_arg(std::int32_t index, value_type&& value) noexcept
             -> bool;
+
+        /*
+            @brief Information about the method that invoked the hooked method.
+            @details
+            Populated by return_value::caller() when the call originates from
+            another HotSpot interpreter frame.  All string fields are empty and
+            method is nullptr when the caller frame is not interpreted (compiled,
+            native, or unidentifiable).
+        */
+        struct caller_info
+        {
+            vmhook::hotspot::method* method{ nullptr };
+            std::string class_name{};
+            std::string method_name{};
+            std::string signature{};
+
+            /*
+                @brief Returns true when the caller frame was identified.
+            */
+            auto valid() const noexcept -> bool
+            {
+                return this->method != nullptr;
+            }
+        };
+
+        /*
+            @brief Returns information about the caller of the hooked method.
+            @details
+            Walks the saved-rbp chain on the interpreter stack: the caller's
+            frame base lives at [rbp], and its Method* lives at
+            [caller_rbp - 24] in the HotSpot x64 interpreter layout.  We
+            validate every pointer with the existing safe-read helpers before
+            dereferencing, so an unfamiliar frame layout produces an empty
+            caller_info rather than a crash.
+
+            Complexity: O(1) once the VMStruct offsets are cached.
+            Exception safety: noexcept — bad pointers map to an empty result.
+            Thread safety: must be called only from the hook callback.
+        */
+        auto caller() const noexcept -> caller_info;
+
+        /*
+            @brief Returns the intercepted interpreter frame, or nullptr.
+            @details
+            Exposed for advanced use cases that need to walk the call stack
+            themselves; callers should prefer caller() when only the
+            immediate caller is required.
+        */
+        auto frame() const noexcept -> vmhook::hotspot::frame*
+        {
+            return this->stack_frame;
+        }
 
     private:
         vmhook::hotspot::return_slot* return_slot{ nullptr };
@@ -2791,6 +2851,57 @@ namespace vmhook
                 }
 
                 return nullptr;
+            }
+
+            /*
+                @brief Invokes a callback for every klass currently reachable
+                       through the ClassLoaderData graph.
+                @details
+                Used by the class-load watcher to snapshot loaded classes.
+                The callback receives the klass's internal name (with '/'
+                separators) and the raw klass pointer.  Iteration is best-
+                effort: unreadable nodes are skipped silently.
+
+                Complexity: O(N) where N = total loaded classes.
+                Exception safety: noexcept boundary — callback exceptions
+                    are propagated as-is; iteration stops at the throw.
+            */
+            template<typename callback_type>
+            auto for_each_klass(callback_type&& callback) const -> void
+            {
+                static const bool use_klasses{
+                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_klasses") != nullptr };
+
+                auto* class_loader_data{ this->get_head() };
+                std::int32_t visited{ 0 };
+                while (vmhook::hotspot::is_valid_pointer(class_loader_data)
+                    && class_loader_data
+                    && visited < 65536)
+                {
+                    ++visited;
+
+                    if (use_klasses)
+                    {
+                        // JDK 21+: walk the _klasses linked list.
+                        auto* current_klass{ class_loader_data->get_klasses() };
+                        std::int32_t kl_visited{ 0 };
+                        while (current_klass
+                            && vmhook::hotspot::is_valid_pointer(current_klass)
+                            && kl_visited < 1048576)
+                        {
+                            ++kl_visited;
+                            const auto* const sym{ current_klass->get_name() };
+                            if (vmhook::hotspot::is_valid_pointer(sym))
+                            {
+                                callback(sym->to_string(), current_klass);
+                            }
+                            current_klass = current_klass->get_next_link();
+                        }
+                    }
+
+                    auto* const next{ class_loader_data->get_next() };
+                    class_loader_data = vmhook::hotspot::is_valid_pointer(next) ? next : nullptr;
+                }
             }
         };
 
@@ -5029,6 +5140,94 @@ namespace vmhook
         return true;
     }
 
+    // -------------------------------------------------------------------------
+    // Watchers: long-lived background pollers for field-value changes and
+    // for newly-loaded Java classes.  Both are polling-based — the JVM
+    // doesn't expose interpreter-level field-write or class-load events
+    // through gHotSpotVMStructs alone, so we observe at a configurable
+    // cadence.  watch_handle stops the watcher when it goes out of scope.
+    // -------------------------------------------------------------------------
+
+    /*
+        @brief RAII handle for a background watcher (field-change / class-load).
+        @details
+        The watcher thread keeps running as long as at least one handle is
+        live.  Destroying the last handle signals the thread to exit and
+        joins it.  Move-only.
+    */
+    class watch_handle
+    {
+    public:
+        struct control_block
+        {
+            std::atomic_bool running{ true };
+            std::thread     worker;
+        };
+
+        watch_handle() = default;
+        explicit watch_handle(std::shared_ptr<control_block> cb) noexcept
+            : block{ std::move(cb) }
+        {
+        }
+
+        watch_handle(const watch_handle&) = delete;
+        auto operator=(const watch_handle&) -> watch_handle & = delete;
+
+        watch_handle(watch_handle&& other) noexcept
+            : block{ std::move(other.block) }
+        {
+        }
+
+        auto operator=(watch_handle&& other) noexcept -> watch_handle &
+        {
+            if (this != &other)
+            {
+                this->stop();
+                this->block = std::move(other.block);
+            }
+            return *this;
+        }
+
+        ~watch_handle()
+        {
+            this->stop();
+        }
+
+        /*
+            @brief Stops the watcher synchronously (idempotent).
+        */
+        auto stop() noexcept -> void
+        {
+            if (!this->block)
+            {
+                return;
+            }
+            this->block->running.store(false, std::memory_order_relaxed);
+            if (this->block->worker.joinable())
+            {
+                this->block->worker.join();
+            }
+            this->block.reset();
+        }
+
+        /*
+            @brief Returns true while the background thread is running.
+        */
+        auto running() const noexcept -> bool
+        {
+            return this->block && this->block->running.load(std::memory_order_relaxed);
+        }
+
+    private:
+        std::shared_ptr<control_block> block{};
+    };
+
+    // The function templates `watch_static_field` and `on_class_loaded`
+    // depend on `vmhook::object_base::get_field` (a static method).  At
+    // this point in the header object_base is only forward-declared,
+    // which Clang's template-body checker flags eagerly.  The full
+    // definitions live further down (search for "watch_static_field").
+
     // --- Internal helpers for typed hook API ---------------------------------
 
     namespace detail
@@ -5235,6 +5434,86 @@ namespace vmhook
         inline auto jni_new_string_utf(std::string_view value) noexcept
             -> void*;
     } // namespace detail
+
+    inline auto return_value::caller() const noexcept -> caller_info
+    {
+        caller_info empty{};
+        if (!this->stack_frame)
+        {
+            return empty;
+        }
+
+        // The HotSpot x64 interpreter writes the caller's rbp at [rbp+0].
+        // Saved-rbp chains only work when the caller is *also* an
+        // interpreted frame; if the caller is compiled or native, the
+        // chain breaks and pointer checks below will reject the read.
+        void* const caller_rbp_slot{ this->stack_frame };
+        if (!vmhook::hotspot::is_valid_pointer(caller_rbp_slot))
+        {
+            return empty;
+        }
+        void* const caller_rbp{ *reinterpret_cast<void* const*>(caller_rbp_slot) };
+        if (!vmhook::hotspot::is_valid_pointer(caller_rbp))
+        {
+            return empty;
+        }
+
+        // The Method* lives 3 words (24 bytes) below rbp in the
+        // interpreter frame layout (see frame::get_method for the
+        // matching read on the current frame).
+        void* const caller_method_slot{
+            reinterpret_cast<std::uint8_t*>(caller_rbp) - 24 };
+        if (!vmhook::hotspot::is_valid_pointer(caller_method_slot))
+        {
+            return empty;
+        }
+        auto* const caller_method{
+            *reinterpret_cast<vmhook::hotspot::method* const*>(caller_method_slot) };
+        if (!caller_method || !vmhook::hotspot::is_valid_pointer(caller_method))
+        {
+            return empty;
+        }
+
+        // Validate by trying to read the method name through the same safe
+        // path the rest of vmhook uses.  An empty string signals an
+        // unidentifiable frame.
+        std::string method_name{ caller_method->get_name() };
+        if (method_name.empty())
+        {
+            return empty;
+        }
+
+        caller_info info{};
+        info.method      = caller_method;
+        info.method_name = std::move(method_name);
+        info.signature   = caller_method->get_signature();
+
+        // Best-effort class-name lookup.  Method -> ConstMethod ->
+        // ConstantPool holds a back-pointer to the owning Klass via
+        // _pool_holder; we read it through the cached VMStruct offset.
+        if (const auto* const const_method{ caller_method->get_const_method() })
+        {
+            if (auto* const cp{ const_method->get_constants() })
+            {
+                static const auto* const pool_holder_entry{
+                    vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
+                if (pool_holder_entry)
+                {
+                    auto* const klass{ *reinterpret_cast<vmhook::hotspot::klass* const*>(
+                        reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset) };
+                    if (klass && vmhook::hotspot::is_valid_pointer(klass))
+                    {
+                        if (auto* const name_symbol{ klass->get_name() })
+                        {
+                            info.class_name = name_symbol->to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        return info;
+    }
 
     template<typename value_type>
     auto return_value::set_arg(const std::int32_t index, value_type&& value) noexcept
@@ -9580,5 +9859,187 @@ namespace vmhook
         }
         void* const decoded_pointer{ vmhook::hotspot::decode_oop_pointer(compressed) };
         return (decoded_pointer && vmhook::hotspot::is_valid_pointer(decoded_pointer)) ? decoded_pointer : nullptr;
+    }
+
+    // -------------------------------------------------------------------------
+    // Background watchers (definitions).  Declared above as part of the
+    // public API; defined here so the lambda bodies see the complete
+    // `vmhook::object_base` type.
+    // -------------------------------------------------------------------------
+
+    /*
+        @brief Watches a Java static field and invokes a callback when it changes.
+        @details
+        Spawns a background thread that periodically reads the static field
+        and compares the value against the previously-seen one.  The first
+        read seeds the baseline and does NOT fire the callback.  Subsequent
+        reads that observe a different value fire the callback with
+        (old_value, new_value).
+
+        Type requirements:
+          - field_type must be the C++ representation the field_proxy::get<T>()
+            path supports (primitives, std::string, std::vector<T>, etc).
+
+        Complexity: O(1) per poll for primitives; O(N) for strings/arrays.
+        Exception safety: noexcept boundary — callback exceptions are caught
+            and logged through VMHOOK_LOG.
+        Thread safety: the callback runs on the watcher thread; protect
+            shared state appropriately.
+
+        Example:
+            auto handle{ vmhook::watch_static_field<my_class, int>(
+                "tickCount",
+                std::chrono::milliseconds{ 50 },
+                [](int old_value, int new_value)
+                {
+                    std::println("tick changed: {} -> {}", old_value, new_value);
+                }) };
+            // handle.stop() to end early; handle goes out of scope at exit.
+
+        @tparam wrapper_type  Registered C++ wrapper for the Java class.
+        @tparam field_type    Expected value type (must match the JVM type).
+        @tparam callback_type Callable invoked with (field_type, field_type).
+    */
+    template<class wrapper_type, typename field_type, typename callback_type>
+    inline auto watch_static_field(
+        std::string_view                 field_name,
+        std::chrono::milliseconds        poll_interval,
+        callback_type                    on_change) -> watch_handle
+    {
+        auto block{ std::make_shared<watch_handle::control_block>() };
+        std::string                 captured_field{ field_name };
+        std::chrono::milliseconds   captured_interval{ poll_interval };
+
+        block->worker = std::thread{ [block,
+                                       captured_field    = std::move(captured_field),
+                                       captured_interval,
+                                       on_change         = std::move(on_change)]()
+            {
+                std::optional<field_type> last_value{};
+                while (block->running.load(std::memory_order_relaxed))
+                {
+                    try
+                    {
+                        const auto field_proxy{ vmhook::object_base::get_field(
+                            std::type_index{ typeid(wrapper_type) }, captured_field) };
+                        if (field_proxy.has_value())
+                        {
+                            field_type current{ field_proxy->get() };
+                            if (last_value.has_value())
+                            {
+                                if (!(*last_value == current))
+                                {
+                                    field_type prev{ std::move(*last_value) };
+                                    last_value = current;
+                                    try
+                                    {
+                                        on_change(std::move(prev), current);
+                                    }
+                                    catch (const std::exception& ex)
+                                    {
+                                        VMHOOK_LOG("{} watch_static_field callback: {}",
+                                                   vmhook::error_tag, ex.what());
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                last_value = std::move(current);
+                            }
+                        }
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        VMHOOK_LOG("{} watch_static_field poll: {}",
+                                   vmhook::error_tag, ex.what());
+                    }
+                    std::this_thread::sleep_for(captured_interval);
+                }
+            } };
+
+        return watch_handle{ std::move(block) };
+    }
+
+    /*
+        @brief Watches the JVM's class-loader graph and invokes a callback
+               for every newly-loaded class.
+        @details
+        Spawns a background thread that periodically snapshots the set of
+        known klasses by walking the ClassLoaderDataGraph.  Every klass
+        present in the new snapshot but absent from the previous one fires
+        the callback as a single event.  The initial snapshot does NOT
+        fire callbacks for already-loaded classes (only for classes that
+        appear after the watcher was registered).
+
+        Class-load events are intrinsically asynchronous; the callback may
+        fire on a background thread well after the JVM finishes class
+        initialization.  poll_interval trades latency for CPU cost.
+
+        Complexity: O(N) per poll where N = total loaded classes.
+        Exception safety: noexcept boundary — callback exceptions are caught.
+        Thread safety: callback runs on the watcher thread.
+
+        Example:
+            auto handle{ vmhook::on_class_loaded(
+                std::chrono::milliseconds{ 100 },
+                [](const std::string& internal_name, vmhook::hotspot::klass* k)
+                {
+                    std::println("loaded: {} ({})", internal_name, (void*)k);
+                }) };
+    */
+    template<typename callback_type>
+    inline auto on_class_loaded(
+        std::chrono::milliseconds poll_interval,
+        callback_type             on_load) -> watch_handle
+    {
+        auto block{ std::make_shared<watch_handle::control_block>() };
+        std::chrono::milliseconds captured_interval{ poll_interval };
+
+        block->worker = std::thread{ [block,
+                                       captured_interval,
+                                       on_load = std::move(on_load)]()
+            {
+                std::unordered_map<std::string, vmhook::hotspot::klass*> seen;
+                bool first_pass{ true };
+
+                while (block->running.load(std::memory_order_relaxed))
+                {
+                    try
+                    {
+                        const vmhook::hotspot::class_loader_data_graph graph{};
+                        graph.for_each_klass(
+                            [&seen, &on_load, first_pass](const std::string& name,
+                                                          vmhook::hotspot::klass* k) noexcept
+                            {
+                                if (name.empty() || seen.find(name) != seen.end())
+                                {
+                                    return;
+                                }
+                                seen.emplace(name, k);
+                                if (!first_pass)
+                                {
+                                    try
+                                    {
+                                        on_load(name, k);
+                                    }
+                                    catch (const std::exception& ex)
+                                    {
+                                        VMHOOK_LOG("{} on_class_loaded callback: {}",
+                                                   vmhook::error_tag, ex.what());
+                                    }
+                                }
+                            });
+                        first_pass = false;
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        VMHOOK_LOG("{} on_class_loaded poll: {}",
+                                   vmhook::error_tag, ex.what());
+                    }
+                    std::this_thread::sleep_for(captured_interval);
+                }
+            } };
+
+        return watch_handle{ std::move(block) };
     }
 }
