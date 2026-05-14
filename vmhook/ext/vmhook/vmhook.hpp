@@ -68,6 +68,7 @@
 #include <unordered_map>
 #include <typeindex>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <chrono>
 #include <algorithm>
@@ -234,6 +235,7 @@
         #define NOMINMAX
     #endif
     #include <windows.h>
+    #include <tlhelp32.h>   // CreateToolhelp32Snapshot, THREADENTRY32, ...
 #elif VMHOOK_OS_POSIX
     #include <cerrno>
     #include <cstdio>
@@ -902,6 +904,113 @@ namespace vmhook
             (void)size;
 #endif
         }
+
+        // ------------------------------------------------------------
+        // Hardware data breakpoints
+        // ------------------------------------------------------------
+        // x86_64 exposes four debug registers (DR0–DR3) that fire a
+        // #DB exception when a configured memory access matches.  On
+        // Windows we set them via SetThreadContext and catch the
+        // exception with a vectored exception handler; the watch
+        // remains zero-overhead until the trap actually fires.
+        //
+        // Currently a Windows-only path; on other platforms the
+        // companion vmhook::watch_static_field<> falls back to its
+        // polling implementation.  The capability flag below lets
+        // callers query support at compile time.
+
+#if VMHOOK_OS_WINDOWS && VMHOOK_ARCH_X86_64
+        #define VMHOOK_HAS_HW_DATA_BREAKPOINTS 1
+#else
+        #define VMHOOK_HAS_HW_DATA_BREAKPOINTS 0
+#endif
+
+        /*
+            @brief Type of memory access the breakpoint should trap on.
+        */
+        enum class data_breakpoint_kind : std::uint8_t
+        {
+            write    = 0b01,  // only writes
+            read_write = 0b11,  // reads and writes (no execute)
+        };
+
+        /*
+            @brief Length of the memory window the breakpoint guards.
+        */
+        enum class data_breakpoint_length : std::uint8_t
+        {
+            one_byte    = 0b00,
+            two_bytes   = 0b01,
+            eight_bytes = 0b10,
+            four_bytes  = 0b11,
+        };
+
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+        namespace detail_dr
+        {
+            /*
+                @brief Builds a DR7 control mask enabling the given slot
+                       (0-3) for the given access kind / length.
+                @details
+                Per Intel SDM:
+                  - L0/L1/L2/L3 (bits 0,2,4,6) enable the local breakpoint.
+                  - R/W and LEN fields live at (16+4*slot) and (18+4*slot)
+                    respectively.  We keep the global enables (G*) cleared
+                    so the trap only applies to threads we explicitly
+                    configure.
+            */
+            inline auto build_dr7(int slot, data_breakpoint_kind rw,
+                                  data_breakpoint_length len) noexcept -> std::uint64_t
+            {
+                const std::uint64_t local_enable{ std::uint64_t{ 1 } << (slot * 2) };
+                const std::uint64_t rw_bits     { static_cast<std::uint64_t>(rw)
+                                                  << (16 + slot * 4) };
+                const std::uint64_t len_bits    { static_cast<std::uint64_t>(len)
+                                                  << (18 + slot * 4) };
+                return local_enable | rw_bits | len_bits;
+            }
+
+            /*
+                @brief Enumerates every thread of the current process.
+                @details
+                Uses Toolhelp on Windows.  Each thread that belongs to
+                this process is passed to `callback(HANDLE)`; the handle
+                is closed automatically when the callback returns.
+            */
+            template<typename callback_type>
+            inline auto for_each_thread(callback_type&& callback) -> void
+            {
+                const HANDLE snap{ ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+                if (snap == INVALID_HANDLE_VALUE)
+                {
+                    return;
+                }
+                THREADENTRY32 te{};
+                te.dwSize = sizeof(te);
+                if (::Thread32First(snap, &te))
+                {
+                    const DWORD self_pid{ ::GetCurrentProcessId() };
+                    do
+                    {
+                        if (te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(te.th32OwnerProcessID)
+                            && te.th32OwnerProcessID == self_pid)
+                        {
+                            const HANDLE thread{ ::OpenThread(
+                                THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                FALSE, te.th32ThreadID) };
+                            if (thread)
+                            {
+                                callback(thread);
+                                ::CloseHandle(thread);
+                            }
+                        }
+                        te.dwSize = sizeof(te);
+                    } while (::Thread32Next(snap, &te));
+                }
+                ::CloseHandle(snap);
+            }
+        } // namespace detail_dr
+#endif
     } // namespace os
 
     namespace hotspot
@@ -7730,6 +7839,19 @@ namespace vmhook
         }
 
         /*
+            @brief Returns the raw memory address backing this field.
+            @details
+            For instance fields this is `decoded_object + field_offset`; for
+            static fields it is `java.lang.Class mirror + field_offset`.
+            Exposed so that watch_static_field can install a hardware
+            breakpoint on the slot; most code should prefer get()/set().
+        */
+        auto raw_address() const noexcept -> void*
+        {
+            return this->field_pointer;
+        }
+
+        /*
             @brief Returns true if this field has JVM_ACC_STATIC set.
             @details
             Static fields are read from / written to the java.lang.Class mirror
@@ -9892,37 +10014,173 @@ namespace vmhook
     // -------------------------------------------------------------------------
 
     /*
+        @brief Registry that owns hardware-data-breakpoint state for the
+               trap-based watch_static_field path.  At most four
+               simultaneous watches per process (the CPU exposes DR0-DR3).
+    */
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+    namespace detail
+    {
+        struct dr_slot
+        {
+            void*                                                    address{ nullptr };
+            std::function<void(const void*)>                         callback{};
+            std::uint64_t                                            dr7_bits{ 0 };
+            std::atomic_bool                                         in_use{ false };
+        };
+
+        inline std::mutex   dr_mutex{};
+        inline dr_slot      dr_slots[4]{};
+        inline PVOID        dr_veh_handle{ nullptr };
+
+        inline auto find_free_slot() -> int
+        {
+            for (int i{ 0 }; i < 4; ++i)
+            {
+                if (!dr_slots[i].in_use.load(std::memory_order_acquire))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        inline auto refresh_thread_drs(int slot, std::uint64_t address, std::uint64_t dr7_bits) -> void
+        {
+            vmhook::os::detail_dr::for_each_thread([&](HANDLE thread)
+            {
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (::GetThreadContext(thread, &ctx))
+                {
+                    switch (slot)
+                    {
+                        case 0: ctx.Dr0 = address; break;
+                        case 1: ctx.Dr1 = address; break;
+                        case 2: ctx.Dr2 = address; break;
+                        case 3: ctx.Dr3 = address; break;
+                        default: return;
+                    }
+                    // Set Dr7 with our slot's bits or'd in (don't clobber
+                    // other slots that may be configured).
+                    const std::uint64_t slot_mask_local{ std::uint64_t{ 0b11 } << (slot * 2) };
+                    const std::uint64_t slot_mask_rwlen{ std::uint64_t{ 0xF }  << (16 + slot * 4) };
+                    const std::uint64_t mask{ slot_mask_local | slot_mask_rwlen };
+                    ctx.Dr7 = (ctx.Dr7 & ~mask) | (dr7_bits & mask);
+                    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    ::SetThreadContext(thread, &ctx);
+                }
+            });
+        }
+
+        inline auto clear_thread_drs(int slot) -> void
+        {
+            vmhook::os::detail_dr::for_each_thread([&](HANDLE thread)
+            {
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (::GetThreadContext(thread, &ctx))
+                {
+                    switch (slot)
+                    {
+                        case 0: ctx.Dr0 = 0; break;
+                        case 1: ctx.Dr1 = 0; break;
+                        case 2: ctx.Dr2 = 0; break;
+                        case 3: ctx.Dr3 = 0; break;
+                        default: return;
+                    }
+                    const std::uint64_t slot_mask_local{ std::uint64_t{ 0b11 } << (slot * 2) };
+                    const std::uint64_t slot_mask_rwlen{ std::uint64_t{ 0xF }  << (16 + slot * 4) };
+                    ctx.Dr7 &= ~(slot_mask_local | slot_mask_rwlen);
+                    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    ::SetThreadContext(thread, &ctx);
+                }
+            });
+        }
+
+        inline auto WINAPI dr_exception_handler(EXCEPTION_POINTERS* eptrs) -> LONG
+        {
+            if (eptrs->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            const std::uint64_t dr6{ eptrs->ContextRecord->Dr6 };
+            int slot{ -1 };
+            if      (dr6 & 0x1) { slot = 0; }
+            else if (dr6 & 0x2) { slot = 1; }
+            else if (dr6 & 0x4) { slot = 2; }
+            else if (dr6 & 0x8) { slot = 3; }
+            if (slot < 0)
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            dr_slot* slot_ptr{ nullptr };
+            {
+                std::lock_guard<std::mutex> guard{ dr_mutex };
+                if (dr_slots[slot].in_use.load(std::memory_order_relaxed))
+                {
+                    slot_ptr = &dr_slots[slot];
+                }
+            }
+            if (slot_ptr && slot_ptr->callback)
+            {
+                try
+                {
+                    slot_ptr->callback(slot_ptr->address);
+                }
+                catch (...)
+                {
+                    // never let user exceptions escape into the kernel.
+                }
+            }
+            // Clear DR6 status and set RF so we don't re-trigger on the
+            // very instruction that just fired.
+            eptrs->ContextRecord->Dr6   = 0;
+            eptrs->ContextRecord->EFlags |= 0x10000;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        inline auto ensure_dr_handler_installed() -> void
+        {
+            if (dr_veh_handle != nullptr)
+            {
+                return;
+            }
+            dr_veh_handle = ::AddVectoredExceptionHandler(1, &dr_exception_handler);
+        }
+    } // namespace detail
+#endif // VMHOOK_HAS_HW_DATA_BREAKPOINTS
+
+    /*
         @brief Watches a Java static field and invokes a callback when it changes.
         @details
-        Spawns a background thread that periodically reads the static field
-        and compares the value against the previously-seen one.  The first
-        read seeds the baseline and does NOT fire the callback.  Subsequent
-        reads that observe a different value fire the callback with
-        (old_value, new_value).
+        On Windows x86_64 this installs a hardware data breakpoint (one of
+        DR0-DR3) on the field's address.  The trap fires *instantly* on
+        every write — no polling, no idle CPU.  The callback runs inside
+        a vectored exception handler on whichever thread issued the write,
+        so it must not allocate Java objects or call back into the JVM
+        (those operations require a JavaThread and a safe-point window).
 
-        Type requirements:
-          - field_type must be the C++ representation the field_proxy::get<T>()
-            path supports (primitives, std::string, std::vector<T>, etc).
+        On platforms without hardware data-breakpoint support, the
+        implementation falls back to a polling background thread that
+        reads the field every `poll_interval` and fires the callback on
+        observed changes.  Pass a reasonable poll_interval (e.g.
+        50 ms) — it's only used on the fallback path.
 
-        Complexity: O(1) per poll for primitives; O(N) for strings/arrays.
-        Exception safety: noexcept boundary — callback exceptions are caught
-            and logged through VMHOOK_LOG.
-        Thread safety: the callback runs on the watcher thread; protect
-            shared state appropriately.
-
-        Example:
-            auto handle{ vmhook::watch_static_field<my_class, int>(
-                "tickCount",
-                std::chrono::milliseconds{ 50 },
-                [](int old_value, int new_value)
-                {
-                    std::println("tick changed: {} -> {}", old_value, new_value);
-                }) };
-            // handle.stop() to end early; handle goes out of scope at exit.
+        Limits (trap path):
+          - At most 4 simultaneous trap-based watches per process.
+          - Threads that exist when the watch is installed get the trap
+            armed; threads created later do NOT.  Hooking thread creation
+            so they are caught too is a known improvement.
+          - The callback receives the field's address; if the value-type
+            is known statically, the caller can read it directly with
+            `*reinterpret_cast<const field_type*>(addr)`.
 
         @tparam wrapper_type  Registered C++ wrapper for the Java class.
-        @tparam field_type    Expected value type (must match the JVM type).
-        @tparam callback_type Callable invoked with (field_type, field_type).
+        @tparam field_type    Expected value type for the polling path.
+        @tparam callback_type Callable invoked with (field_type, field_type)
+                              on the polling path, or (field_type)
+                              on the trap path (no "old" value cached).
     */
     template<class wrapper_type, typename field_type, typename callback_type>
     inline auto watch_static_field(
@@ -9930,6 +10188,85 @@ namespace vmhook
         std::chrono::milliseconds        poll_interval,
         callback_type                    on_change) -> watch_handle
     {
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+        // Resolve the field's address through the field-proxy machinery.
+        const auto proxy{ vmhook::object_base::get_field(
+            std::type_index{ typeid(wrapper_type) }, field_name) };
+        if (!proxy.has_value())
+        {
+            VMHOOK_LOG("{} watch_static_field<{}>('{}'): field not found",
+                       vmhook::error_tag, typeid(wrapper_type).name(), field_name);
+            return watch_handle{};
+        }
+        void* const address{ proxy->raw_address() };
+        if (!address)
+        {
+            VMHOOK_LOG("{} watch_static_field<{}>('{}'): null address",
+                       vmhook::error_tag, typeid(wrapper_type).name(), field_name);
+            return watch_handle{};
+        }
+
+        // Choose a DR slot.
+        std::lock_guard<std::mutex> guard{ detail::dr_mutex };
+        const int slot{ detail::find_free_slot() };
+        if (slot < 0)
+        {
+            VMHOOK_LOG("{} watch_static_field: all 4 hardware breakpoint slots in use",
+                       vmhook::error_tag);
+            return watch_handle{};
+        }
+        detail::ensure_dr_handler_installed();
+
+        // The trap fires on every write of any size that touches the
+        // field's bytes; we use the field type's size to decide LEN.
+        constexpr auto length{
+            sizeof(field_type) == 1 ? vmhook::os::data_breakpoint_length::one_byte    :
+            sizeof(field_type) == 2 ? vmhook::os::data_breakpoint_length::two_bytes   :
+            sizeof(field_type) == 4 ? vmhook::os::data_breakpoint_length::four_bytes  :
+                                       vmhook::os::data_breakpoint_length::eight_bytes };
+        const std::uint64_t dr7_bits{ vmhook::os::detail_dr::build_dr7(
+            slot, vmhook::os::data_breakpoint_kind::write, length) };
+
+        detail::dr_slots[slot].address  = address;
+        detail::dr_slots[slot].dr7_bits = dr7_bits;
+        detail::dr_slots[slot].callback = [on_change = std::move(on_change), address](const void*) mutable
+        {
+            // The trap arrives *during* the write instruction.  The
+            // memory at `address` may or may not already hold the new
+            // value depending on how the CPU pipelines the access; we
+            // call the user callback with what we observe now.
+            try
+            {
+                field_type current{};
+                std::memcpy(&current, address, sizeof(field_type));
+                on_change(field_type{}, current);
+            }
+            catch (...) { /* swallowed */ }
+        };
+        detail::dr_slots[slot].in_use.store(true, std::memory_order_release);
+
+        detail::refresh_thread_drs(slot, reinterpret_cast<std::uint64_t>(address), dr7_bits);
+
+        // Return a handle whose worker thread just blocks until stop()
+        // is invoked, then disarms the DR slot.
+        auto block{ std::make_shared<watch_handle::control_block>() };
+        block->worker = std::thread{ [block, slot]()
+        {
+            while (block->running.load(std::memory_order_relaxed))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds{ 50 });
+            }
+            std::lock_guard<std::mutex> guard{ detail::dr_mutex };
+            detail::clear_thread_drs(slot);
+            detail::dr_slots[slot].in_use.store(false, std::memory_order_release);
+            detail::dr_slots[slot].address = nullptr;
+            detail::dr_slots[slot].callback = nullptr;
+            detail::dr_slots[slot].dr7_bits = 0;
+        } };
+        (void)poll_interval;
+        return watch_handle{ std::move(block) };
+#else
+        // Polling fallback on platforms without hardware data breakpoints.
         auto block{ std::make_shared<watch_handle::control_block>() };
         std::string                 captured_field{ field_name };
         std::chrono::milliseconds   captured_interval{ poll_interval };
@@ -9944,32 +10281,25 @@ namespace vmhook
                 {
                     try
                     {
-                        const auto field_proxy{ vmhook::object_base::get_field(
+                        const auto proxy{ vmhook::object_base::get_field(
                             std::type_index{ typeid(wrapper_type) }, captured_field) };
-                        if (field_proxy.has_value())
+                        if (proxy.has_value())
                         {
-                            field_type current{ field_proxy->get() };
+                            field_type current{ proxy->get() };
                             if (last_value.has_value())
                             {
                                 if (!(*last_value == current))
                                 {
                                     field_type prev{ std::move(*last_value) };
                                     last_value = current;
-                                    try
-                                    {
-                                        on_change(std::move(prev), current);
-                                    }
-                                    catch (const std::exception& ex)
-                                    {
+                                    try { on_change(std::move(prev), current); }
+                                    catch (const std::exception& ex) {
                                         VMHOOK_LOG("{} watch_static_field callback: {}",
                                                    vmhook::error_tag, ex.what());
                                     }
                                 }
                             }
-                            else
-                            {
-                                last_value = std::move(current);
-                            }
+                            else { last_value = std::move(current); }
                         }
                     }
                     catch (const std::exception& ex)
@@ -9980,8 +10310,8 @@ namespace vmhook
                     std::this_thread::sleep_for(captured_interval);
                 }
             } };
-
         return watch_handle{ std::move(block) };
+#endif
     }
 
     /*
@@ -10059,38 +10389,40 @@ namespace vmhook
                     vmhook::register_class<detail::class_loader_wrapper>("java/lang/ClassLoader");
                 }
 
-                const bool installed{ vmhook::hook<detail::class_loader_wrapper>(
+                auto define_class_detour = [](
+                    vmhook::return_value& /*ret*/,
+                    const std::unique_ptr<detail::class_loader_wrapper>& /*self*/,
+                    const std::string& name,
+                    vmhook::oop_t /*bytes*/,
+                    std::int32_t /*offset*/,
+                    std::int32_t /*length*/,
+                    vmhook::oop_t /*protection_domain*/)
+                {
+                    std::vector<std::shared_ptr<detail::class_load_callback_t>> snapshot;
+                    {
+                        std::lock_guard<std::mutex> guard2{ detail::class_load_mutex };
+                        snapshot = detail::class_load_callbacks;
+                    }
+                    std::string internal_name{ name };
+                    std::replace(internal_name.begin(), internal_name.end(), '.', '/');
+                    for (auto& callback : snapshot)
+                    {
+                        if (!callback) { continue; }
+                        try
+                        {
+                            (*callback)(internal_name);
+                        }
+                        catch (const std::exception& ex)
+                        {
+                            VMHOOK_LOG("{} on_class_loaded callback: {}",
+                                       vmhook::error_tag, ex.what());
+                        }
+                    }
+                };
+                const bool installed = vmhook::hook<detail::class_loader_wrapper>(
                     "defineClass",
                     "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;",
-                    [](vmhook::return_value& /*ret*/,
-                       const std::unique_ptr<detail::class_loader_wrapper>& /*self*/,
-                       const std::string& name,
-                       vmhook::oop_t /*bytes*/,
-                       std::int32_t /*offset*/,
-                       std::int32_t /*length*/,
-                       vmhook::oop_t /*protection_domain*/)
-                    {
-                        std::vector<std::shared_ptr<detail::class_load_callback_t>> snapshot;
-                        {
-                            std::lock_guard<std::mutex> guard2{ detail::class_load_mutex };
-                            snapshot = detail::class_load_callbacks;
-                        }
-                        std::string internal_name{ name };
-                        std::replace(internal_name.begin(), internal_name.end(), '.', '/');
-                        for (auto& callback : snapshot)
-                        {
-                            if (!callback) { continue; }
-                            try
-                            {
-                                (*callback)(internal_name);
-                            }
-                            catch (const std::exception& ex)
-                            {
-                                VMHOOK_LOG("{} on_class_loaded callback: {}",
-                                           vmhook::error_tag, ex.what());
-                            }
-                        }
-                    }) };
+                    define_class_detour);
 
                 if (installed)
                 {
