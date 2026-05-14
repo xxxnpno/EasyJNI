@@ -256,6 +256,10 @@ jobs:
 
           if (-not $java.WaitForExit(60000)) {
             Stop-Process -Id $java.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "::warning::java.exe did not exit within 60 s; dumping diagnostics before failing"
+            if (Test-Path "java_stdout.txt") { Write-Host "--- java_stdout.txt ---"; Get-Content "java_stdout.txt" | ForEach-Object { Write-Host $_ } }
+            if (Test-Path "java_stderr.txt") { Write-Host "--- java_stderr.txt ---"; Get-Content "java_stderr.txt" | ForEach-Object { Write-Host "[stderr] $_" } }
+            if (Test-Path "test_results.txt") { Write-Host "--- test_results.txt (partial) ---"; Get-Content "test_results.txt" | ForEach-Object { Write-Host $_ } }
             Write-Error "java.exe did not exit within 60 s"
             exit 1
           }

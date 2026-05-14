@@ -97,10 +97,15 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void
         }
     }
 
-    constexpr std::size_t iterations{ 50'000 };
+    // Keep iteration counts conservative: this microbench runs on
+    // every CI matrix cell (six Java versions × four compilers ×
+    // three OSes) and we don't want to add tens of seconds of CPU
+    // time per cell.  10k iterations is enough to get a stable
+    // ns/call number once warmed up.
+    constexpr std::size_t iterations{ 10'000 };
+    constexpr std::size_t warmup_iters{ 256 };
 
-    // Warm-up so the interpreter and any cached lookups are settled.
-    for (std::size_t i{ 0 }; i < 1024; ++i)
+    for (std::size_t i{ 0 }; i < warmup_iters; ++i)
     {
         (void)method_opt->call(static_cast<std::int32_t>(i));
     }
@@ -136,7 +141,7 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void
         return;
     }
 
-    for (std::size_t i{ 0 }; i < 1024; ++i)
+    for (std::size_t i{ 0 }; i < warmup_iters; ++i)
     {
         (void)env->CallStaticIntMethod(cls, mid, static_cast<jint>(i));
     }
