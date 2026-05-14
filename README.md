@@ -195,8 +195,7 @@ vmhook::shutdown_hooks();
 ## Object Construction
 
 `vmhook::make_unique<T>(args...)` allocates a Java object for a registered
-wrapper type. If the wrapper exposes `construct(args...)`, vmhook calls it after
-allocation.
+wrapper type.
 
 ```cpp
 class chat_component_text : public vmhook::object<chat_component_text>
@@ -205,12 +204,6 @@ public:
     explicit chat_component_text(vmhook::oop_t instance) noexcept
         : vmhook::object<chat_component_text>{ instance }
     {
-    }
-
-    auto construct(const std::string& text) const
-        -> void
-    {
-        this->get_method("<init>", "(Ljava/lang/String;)V")->call(text);
     }
 };
 
