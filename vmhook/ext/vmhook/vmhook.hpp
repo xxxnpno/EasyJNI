@@ -44,10 +44,10 @@
         - class_loader_data_graph.find_klass(name): O(N*M) full graph walk.
 
     Exception safety:
-        - All public API functions catch vmhook::exception internally and log the
-          message via std::println before returning a safe default value (nullptr,
-          std::nullopt, false, or T{}). Callers never see uncaught exceptions
-          escaping the library boundary.
+        - All public API functions catch vmhook::exception internally and report
+          the message through VMHOOK_LOG before returning a safe default value
+          (nullptr, std::nullopt, false, or T{}). Release builds compile
+          VMHOOK_LOG to a no-op unless VMHOOK_DEBUG_LOGS is overridden.
         - Internal helpers (iterate_struct_entries, iterate_type_entries, etc.)
           are noexcept and return nullptr on failure.
         - midi2i_hook constructor may throw vmhook::exception on allocation failure;
@@ -90,13 +90,13 @@
 #if VMHOOK_DEBUG_LOGS
 #define VMHOOK_LOG(...) ::std::println(__VA_ARGS__)
 #else
-#define VMHOOK_LOG(...) do { if constexpr (false) { ::std::println(__VA_ARGS__); } } while (false)
+#define VMHOOK_LOG(...) do {} while (false)
 #endif
 
 namespace vmhook
 {
     /*
-        @brief Log-prefix tags used in all diagnostic messages printed by this library.
+        @brief Log-prefix tags used in diagnostic messages emitted by this library.
         @details  These are prepended to every VMHOOK_LOG() call so that output from
         VMHook can be filtered in the host process console.
     */
@@ -107,8 +107,8 @@ namespace vmhook
     /*
         @brief Exception type thrown internally by VMHook to report unrecoverable errors.
         @details  All public API functions catch vmhook::exception and log the message
-        via std::println before returning a safe default value, so callers never see
-        uncaught exceptions escaping the library boundary.
+        through VMHOOK_LOG before returning a safe default value, so callers never
+        see uncaught exceptions escaping the library boundary.
     */
     class exception final : public std::exception
     {
@@ -160,32 +160,34 @@ namespace vmhook
     {
     public:
         explicit return_value(vmhook::hotspot::return_slot* slot, vmhook::hotspot::frame* frame = nullptr) noexcept
-            : slot_{ slot }, frame_{ frame }
+            : return_slot{ slot }, stack_frame{ frame }
         {
 
         }
 
-        template<typename T>
-        auto set(const T value) noexcept -> void
+        template<typename value_type>
+        auto set(const value_type value) noexcept
+            -> void
         {
-            static_assert(sizeof(T) <= sizeof(std::int64_t), "return type too large for hook slot");
-            slot_->cancel = true;
-            slot_->retval = 0;
-            std::memcpy(&slot_->retval, &value, sizeof(T));
+            static_assert(sizeof(value_type) <= sizeof(std::int64_t), "return type too large for hook slot");
+            this->return_slot->cancel = true;
+            this->return_slot->retval = 0;
+            std::memcpy(&this->return_slot->retval, &value, sizeof(value_type));
         }
 
-        auto cancel() noexcept -> void
+        auto cancel() noexcept
+            -> void
         {
-            slot_->cancel = true;
+            this->return_slot->cancel = true;
         }
 
-        template<typename T>
-        auto set_arg(std::int32_t index, T&& value) noexcept
+        template<typename value_type>
+        auto set_arg(std::int32_t index, value_type&& value) noexcept
             -> bool;
 
     private:
-        vmhook::hotspot::return_slot* slot_{ nullptr };
-        vmhook::hotspot::frame* frame_{ nullptr };
+        vmhook::hotspot::return_slot* return_slot{ nullptr };
+        vmhook::hotspot::frame* stack_frame{ nullptr };
     };
 
     namespace hotspot
@@ -926,8 +928,8 @@ namespace vmhook
             /*
                 @brief Returns the from-compiled entry point.
                 @details The VMStruct field name changed across JDK versions:
-                         JDK ≤ 20  → "_from_compiled_code_entry_point"
-                         JDK 21+   → "_from_compiled_entry"
+                         JDK <= 20: "_from_compiled_code_entry_point"
+                         JDK 21+:   "_from_compiled_entry"
                          Both names are tried at first call; the result is cached.
             */
             auto get_from_compiled_entry() const noexcept
@@ -1134,7 +1136,7 @@ namespace vmhook
                 // HotSpot Array<T> layout on x64:
                 //   +0  int32_t _length   (4 bytes)
                 //   +4  int32_t _padding  (4 bytes alignment padding)
-                //   +8  T       _data[0]  ← first element starts here
+                //   +8  T       _data[0]   first element starts here
                 return reinterpret_cast<vmhook::hotspot::method**>(reinterpret_cast<std::uint8_t*>(array) + 8);
             }
 
@@ -1160,7 +1162,7 @@ namespace vmhook
                 /*
                     The type and indirection level of _java_mirror changed across JDK versions.
 
-                    JDK 8 – JDK 16:
+                    JDK 8 through JDK 16:
                       _java_mirror is a plain `oop` (a direct 64-bit pointer to the
                       java.lang.Class object). One read is enough.
                       VMStructs type_string: "oop"
@@ -1182,8 +1184,8 @@ namespace vmhook
                 if (is_oop_handle)
                 {
                     // JDK 17+: two-level indirection through OopStorage.
-                    //   klass + offset  →  OopHandle._obj  (oop* into OopStorage)
-                    //   *OopHandle._obj →  java.lang.Class oop  (full 64-bit, not compressed)
+                    //   klass + offset -> OopHandle._obj  (oop* into OopStorage)
+                    //   *OopHandle._obj -> java.lang.Class oop  (full 64-bit, not compressed)
                     const void* const oop_storage_slot{ vmhook::hotspot::safe_read_pointer(field_addr) };
                     if (!vmhook::hotspot::is_valid_pointer(oop_storage_slot))
                     {
@@ -1194,7 +1196,7 @@ namespace vmhook
                 }
                 else
                 {
-                    // JDK 8 – JDK 16: the field is a direct full-width oop pointer.
+                    // JDK 8 through JDK 16: the field is a direct full-width oop pointer.
                     // Read it as a 64-bit value; no further dereference needed.
                     const void* const mirror{ vmhook::hotspot::safe_read_pointer(field_addr) };
                     return vmhook::hotspot::is_valid_pointer(mirror) ? const_cast<void*>(mirror) : nullptr;
@@ -1265,7 +1267,7 @@ namespace vmhook
                 Name and signature are resolved from the class constant pool.
                 @note Searches only this class, not superclasses.  Walk the superclass
                       chain manually to locate inherited fields.
-                @note Covers JDK 8–21.  JDK 22+ uses a different FieldInfoStream encoding.
+                @note Covers JDK 8 through JDK 21. JDK 22+ uses a different FieldInfoStream encoding.
             */
             /*
                 @brief Decodes one UNSIGNED5 value from a byte stream (JDK 21+ FieldInfoStream).
@@ -1328,7 +1330,7 @@ namespace vmhook
 
                 // Array<u1> layout on x64 HotSpot:
                 //   +0  int32_t _length   (4 bytes)
-                //   +4  u1      _data[0]  ← data starts here (no padding: u1 has alignment 1)
+                //   +4  u1      _data[0]   data starts here (no padding: u1 has alignment 1)
                 // Note: Array<Method*> uses +8 because 8-byte pointers need 8-byte alignment,
                 // requiring 4 bytes of padding after _length.  u1 and u2 arrays do NOT need this.
                 const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(arr_ptr) };
@@ -1408,12 +1410,12 @@ namespace vmhook
                 Automatically selects the correct field storage format based on what
                 is exported in gHotSpotVMStructs for this JDK build:
 
-                JDK 8 – early JDK 21:
-                  InstanceKlass._fields  →  Array<u2>, 6 slots per field
+                JDK 8 through early JDK 21:
+                  InstanceKlass._fields -> Array<u2>, 6 slots per field
                   Byte offset = ((high_packed << 16) | low_packed) >> FIELDINFO_TAG_SIZE(2)
 
                 JDK 21.0.x+ and JDK 22+:
-                  InstanceKlass._fieldinfo_stream  →  Array<u1>, UNSIGNED5 compressed
+                  InstanceKlass._fieldinfo_stream -> Array<u1>, UNSIGNED5 compressed
                   Stream grammar: j(num_java) k(num_injected) Field[j+k] End(0)
                   Per field: name_idx sig_idx offset access_flags field_flags [optionals]
 
@@ -1452,7 +1454,7 @@ namespace vmhook
                     return vmhook::hotspot::klass::find_field_in_stream(name, constant_pool_base);
                 }
 
-                // -- JDK 8–17 path: Array<u2> with 6-slot FieldInfo records --
+                // -- JDK 8 through JDK 17 path: Array<u2> with 6-slot FieldInfo records --
                 if (!fields_entry)
                 {
                     return std::nullopt;
@@ -1480,11 +1482,11 @@ namespace vmhook
 
                 // Array<u2> layout on x64 HotSpot:
                 //   +0  int32_t _length   (4 bytes)
-                //   +4  u2      _data[0]  ← data starts here (u2 needs 2-byte alignment;
+                //   +4  u2      _data[0]   data starts here (u2 needs 2-byte alignment;
                 //                           offset 4 is already 2-byte aligned, no padding needed)
                 const std::uint16_t* const data{ reinterpret_cast<const std::uint16_t*>(reinterpret_cast<const std::uint8_t*>(fields_array) + 4) };
 
-                // FieldInfo::field_slots layout for each field record (JDK 8–20):
+                // FieldInfo::field_slots layout for each field record (JDK 8 through JDK 20):
                 //   slot 0  u16  access_flags   - JVM_ACC_* flags (static flag = bit 3 / 0x0008)
                 //   slot 1  u16  name_index     - constant-pool index of the field's name Symbol
                 //   slot 2  u16  signature_index- constant-pool index of the type descriptor Symbol
@@ -1656,7 +1658,7 @@ namespace vmhook
                 @brief Returns the number of hash buckets in this dictionary.
                 @details
                 BasicHashtable<mtInternal> layout (x64):
-                  +0  int32_t _table_size  - number of buckets  ← this offset
+                  +0  int32_t _table_size  - number of buckets at this offset
                   +4  (4 bytes alignment padding)
                   +8  HashtableBucket* _buckets
             */
@@ -1704,7 +1706,7 @@ namespace vmhook
                         // DictionaryEntry (extends HashtableEntry<InstanceKlass*, mtClass>) layout:
                         //   +0   void*       _next    (next entry in the chain)
                         //   +8   uint32_t    _hash    (pre-computed hash, 4 bytes + 4 padding)
-                        //   +16  Klass*      _literal ← the actual class pointer
+                        //   +16  Klass*      _literal, the actual class pointer
                         const void* const raw_klass{ vmhook::hotspot::safe_read_pointer(dict_entry + 16) };
                         const vmhook::hotspot::klass* const candidate_klass{ reinterpret_cast<const vmhook::hotspot::klass*>(vmhook::hotspot::untag_pointer(raw_klass)) };
 
@@ -2691,7 +2693,7 @@ namespace vmhook
             the actual Java bytecode. All method arguments are fully set up at this point.
             Also scans backwards to find and cache the locals_offset value.
             @note Two patterns are tried in order:
-                  1. Full pattern (JDK 8 – early JDK 21): 4×mov-spill + mov BYTE PTR [r15+??],??
+                  1. Full pattern (JDK 8 through early JDK 21): 4-mov-spill + mov BYTE PTR [r15+??],??
                      Hook injected at the thread-state-write instruction (last 8 bytes).
                   2. Fallback (JDK 21 release / JDK 22+): just mov BYTE PTR [r15+??],??
                      Hook injected at the start of that instruction directly.
@@ -2700,7 +2702,7 @@ namespace vmhook
             -> void*
         {
             /*
-                Primary pattern (JDK 8 – early JDK 21 builds):
+                Primary pattern (JDK 8 through early JDK 21 builds):
                   Four consecutive `mov [rsp+imm32], eax` instructions that spill the first
                   four Windows x64 integer arguments to the shadow area, followed by
                   `mov BYTE PTR [r15+imm32], imm8` which writes a thread-status byte.
@@ -2717,7 +2719,7 @@ namespace vmhook
 
             /*
                 Fallback pattern (JDK 21 release builds, JDK 22+):
-                  The 4×mov spill block is absent or different, but the
+                  The 4-mov spill block is absent or different, but the
                   `mov BYTE PTR [r15+imm32], imm8` thread-status write is always present.
                   0x41 0xC6 0x87 = REX.B MOV r/m8,imm8 with ModRM selecting [r15+disp32].
                   All four displacement bytes and the imm8 are wildcards.
@@ -2735,7 +2737,7 @@ namespace vmhook
             const std::uint8_t* const current{ reinterpret_cast<const std::uint8_t*>(i2i_entry) };
             const std::size_t scan_size{ vmhook::hotspot::find_stub_size(current) };
 
-            // Try the full 4×spill + thread-state-write pattern first (JDK 8 – early JDK 21).
+            // Try the full 4-spill + thread-state-write pattern first (JDK 8 through early JDK 21).
             // The injection point is at the START of the thread-state-write instruction,
             // which sits at the END of the full pattern (offset = sizeof - 8).
             std::uint8_t* injection_point{ nullptr };
@@ -2994,7 +2996,7 @@ namespace vmhook
                   rbp + 0   saved caller rbp
                   rbp - 8   return address (pushed by call instruction)
                   rbp - 16  last_sp / expression stack bottom
-                  rbp - 24  Method* pointer  ← this offset
+                  rbp - 24  Method* pointer at this offset
                 This corresponds to interpreter_frame_method_offset = -3 words = -24 bytes
                 as defined in frame_x86.hpp.
             */
@@ -3020,7 +3022,7 @@ namespace vmhook
                 /*
                     How the locals pointer is encoded in the frame differs by JDK era.
 
-                    JDK 8 – 20:
+                    JDK 8 through JDK 20:
                       The stub spills r14 (the locals register) directly into the frame
                       via `mov r14, QWORD PTR [rbp+locals_offset]; ret` in a helper.
                       So [rbp + locals_offset] IS the locals pointer - a valid stack
@@ -3040,8 +3042,8 @@ namespace vmhook
                     Otherwise treat it as a slot index (JDK 21+).
 
                     Proof from hs_err crash dump for JDK 21:
-                      RBP = 0x243f888  →  [rbp-56] = 3
-                      R14 = 0x243f8a0  →  rbp + 3*8 = 0x243f8a0  ✓
+                      RBP = 0x243f888    [rbp-56] = 3
+                      R14 = 0x243f8a0    rbp + 3*8 = 0x243f8a0
                 */
                 const void* const frame_slot_value{ *reinterpret_cast<void* const*>(reinterpret_cast<const std::uint8_t*>(this) + locals_offset) };
 
@@ -3585,7 +3587,7 @@ namespace vmhook
             c2i adapter, so compiled callers that miss their inline cache re-enter the
             interpreter and reach our patched i2i stub.
             AdapterHandlerEntry._c2i_entry is exported via gHotSpotVMStructs on all
-            supported JDK versions (8 – 26).
+            supported JDK versions (8 through 26).
         */
         static auto get_c2i_entry_from_adapter(void* const adapter) noexcept
             -> void*
@@ -3706,65 +3708,66 @@ namespace vmhook
     namespace detail
     {
         /*
-            Function trait helpers — extract the argument list from any callable so the
+            Function trait helpers extract the argument list from any callable so the
             typed hook() overload can deduce Java parameter types at compile time.
         */
-        template<typename F, typename = void>
+        template<typename function_type, typename = void>
         struct function_traits;
 
-        template<typename Ret, typename... Args>
-        struct function_traits<Ret(*)(Args...)>
+        template<typename return_type, typename... argument_types>
+        struct function_traits<return_type(*)(argument_types...)>
         {
-            using args_tuple = std::tuple<Args...>;
+            using args_tuple_t = std::tuple<argument_types...>;
         };
 
-        template<typename Ret, typename... Args>
-        struct function_traits<std::function<Ret(Args...)>>
+        template<typename return_type, typename... argument_types>
+        struct function_traits<std::function<return_type(argument_types...)>>
         {
-            using args_tuple = std::tuple<Args...>;
+            using args_tuple_t = std::tuple<argument_types...>;
         };
 
-        template<typename F>
-        struct function_traits<F, std::void_t<decltype(&F::operator())>>
-            : function_traits<decltype(&F::operator())> {
+        template<typename function_type>
+        struct function_traits<function_type, std::void_t<decltype(&function_type::operator())>>
+            : function_traits<decltype(&function_type::operator())>
+        {
         };
 
-        template<typename C, typename Ret, typename... Args>
-        struct function_traits<Ret(C::*)(Args...) const>
+        template<typename class_type, typename return_type, typename... argument_types>
+        struct function_traits<return_type(class_type::*)(argument_types...) const>
         {
-            using args_tuple = std::tuple<Args...>;
+            using args_tuple_t = std::tuple<argument_types...>;
         };
 
-        template<typename C, typename Ret, typename... Args>
-        struct function_traits<Ret(C::*)(Args...)>
+        template<typename class_type, typename return_type, typename... argument_types>
+        struct function_traits<return_type(class_type::*)(argument_types...)>
         {
-            using args_tuple = std::tuple<Args...>;
+            using args_tuple_t = std::tuple<argument_types...>;
         };
 
         // Drop the leading element (bool*) from a tuple type.
-        template<typename Tuple>
+        template<typename tuple_type>
         struct tuple_tail;
 
-        template<typename First, typename... Rest>
-        struct tuple_tail<std::tuple<First, Rest...>>
+        template<typename first_type, typename... remaining_types>
+        struct tuple_tail<std::tuple<first_type, remaining_types...>>
         {
-            using type = std::tuple<Rest...>;
+            using type_t = std::tuple<remaining_types...>;
         };
 
         /*
             Extract a single Java method argument from the interpreter frame, converting
-            the raw slot value to the requested C++ type T.
+            the raw slot value to the requested C++ type.
             Uses the public get_locals() path so it does not require friendship with frame.
-              - std::string              → decoded OOP fed into read_java_string()
-              - std::unique_ptr<U>       → decoded OOP fed into the registered factory for U
-              - pointer types            → decoded compressed OOP
-              - primitive / trivial types → raw slot bits via memcpy
+              - std::string               decoded OOP fed into read_java_string()
+              - std::unique_ptr<U>        decoded OOP fed into the registered factory for U
+              - pointer types             decoded compressed OOP
+              - primitive / trivial types  raw slot bits via memcpy
         */
-        template<typename T>
+        template<typename value_type>
         auto extract_frame_arg(vmhook::hotspot::frame* const frame, const std::int32_t index)
-            -> std::remove_cvref_t<T>
+            -> std::remove_cvref_t<value_type>
         {
-            using base_t = std::remove_cvref_t<T>;
+            using base_t = std::remove_cvref_t<value_type>;
 
             void** const locals{ frame->get_locals() };
             if (!locals)
@@ -3776,13 +3779,18 @@ namespace vmhook
             const std::uintptr_t raw_bits{ reinterpret_cast<std::uintptr_t>(raw_value) };
 
             // Decode a compressed OOP (32-bit narrow value) to a full 64-bit pointer.
-            auto decode_oop = [](void* rv) -> void*
+            auto decode_oop = [](void* raw_value)
+                -> void*
                 {
-                    if (!rv) return nullptr;
-                    const std::uintptr_t bits{ reinterpret_cast<std::uintptr_t>(rv) };
+                    if (!raw_value)
+                    {
+                        return nullptr;
+                    }
+
+                    const std::uintptr_t bits{ reinterpret_cast<std::uintptr_t>(raw_value) };
                     return (bits <= 0xFFFFFFFFull)
                         ? vmhook::hotspot::decode_oop_pointer(static_cast<std::uint32_t>(bits))
-                        : rv;
+                        : raw_value;
                 };
 
             if constexpr (std::is_same_v<base_t, std::string>)
@@ -3825,7 +3833,7 @@ namespace vmhook
             }
         }
 
-        template<typename T>
+        template<typename value_type>
         struct is_unique_object_ptr : std::false_type {};
 
         template<typename value_type, typename deleter_type>
@@ -3839,22 +3847,22 @@ namespace vmhook
             -> void*;
     } // namespace detail
 
-    template<typename T>
-    auto return_value::set_arg(const std::int32_t index, T&& value) noexcept
+    template<typename value_type>
+    auto return_value::set_arg(const std::int32_t index, value_type&& value) noexcept
         -> bool
     {
-        if (!this->frame_ || index < 0)
+        if (!this->stack_frame || index < 0)
         {
             return false;
         }
 
-        void** const locals{ this->frame_->get_locals() };
+        void** const locals{ this->stack_frame->get_locals() };
         if (!locals)
         {
             return false;
         }
 
-        using value_type = std::remove_cvref_t<T>;
+        using clean_value_type = std::remove_cvref_t<value_type>;
 
         auto store_oop = [&](void* const oop)
             -> bool
@@ -3879,17 +3887,17 @@ namespace vmhook
             return true;
         };
 
-        if constexpr (vmhook::detail::is_unique_object_ptr<value_type>::value)
+        if constexpr (vmhook::detail::is_unique_object_ptr<clean_value_type>::value)
         {
             return store_oop(value.get()
                 ? static_cast<const vmhook::object_base*>(value.get())->get_instance()
                 : nullptr);
         }
-        else if constexpr (std::is_base_of_v<vmhook::object_base, value_type>)
+        else if constexpr (std::is_base_of_v<vmhook::object_base, clean_value_type>)
         {
             return store_oop(value.get_instance());
         }
-        else if constexpr (std::is_same_v<value_type, std::string> || std::is_same_v<value_type, std::string_view>)
+        else if constexpr (std::is_same_v<clean_value_type, std::string> || std::is_same_v<clean_value_type, std::string_view>)
         {
             void* const string_handle{ vmhook::detail::jni_new_string_utf(value) };
             void* const string_oop{ string_handle
@@ -3902,7 +3910,7 @@ namespace vmhook
 
             return store_oop(string_oop);
         }
-        else if constexpr (std::is_same_v<value_type, const char*> || std::is_same_v<value_type, char*>)
+        else if constexpr (std::is_same_v<clean_value_type, const char*> || std::is_same_v<clean_value_type, char*>)
         {
             const std::string_view text{ value ? std::string_view{ value } : std::string_view{} };
             void* const string_handle{ vmhook::detail::jni_new_string_utf(text) };
@@ -3916,10 +3924,10 @@ namespace vmhook
 
             return store_oop(string_oop);
         }
-        else if constexpr (std::is_trivially_copyable_v<value_type> && sizeof(value_type) <= sizeof(void*))
+        else if constexpr (std::is_trivially_copyable_v<clean_value_type> && sizeof(clean_value_type) <= sizeof(void*))
         {
             void* raw{};
-            std::memcpy(&raw, &value, sizeof(value_type));
+            std::memcpy(&raw, &value, sizeof(clean_value_type));
             locals[-index] = raw;
             return true;
         }
@@ -3939,11 +3947,11 @@ namespace vmhook
         @param user_detour  A callable with signature:
                               void(vmhook::return_value& retval, T1 arg1, T2 arg2, ...)
                             where T1, T2, ... correspond to the Java method's explicit parameters:
-                              - int / boolean / byte / short / char / float  → std::int32_t / bool / ...
-                              - long                                         → std::int64_t
-                              - double                                       → double
-                              - String                                       → std::string (or const std::string&)
-                              - Object reference                             → std::unique_ptr<WrapperClass>
+                              - int / boolean / byte / short / char / float   std::int32_t / bool / ...
+                              - long                                          std::int64_t
+                              - double                                        double
+                              - String                                        std::string (or const std::string&)
+                              - Object reference                              std::unique_ptr<WrapperClass>
                                                                                (or const std::unique_ptr<...>&)
                             For instance methods the implicit Java 'this' occupies slot 0, so it must
                             appear as the first argument (typically std::unique_ptr<wrapper_type>).
@@ -3976,9 +3984,9 @@ namespace vmhook
     {
         try
         {
-            using traits = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
-            using all_args_tuple = typename traits::args_tuple;
-            using method_arg_tuple = typename vmhook::detail::tuple_tail<all_args_tuple>::type;
+            using traits_t = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
+            using all_args_tuple_t = typename traits_t::args_tuple_t;
+            using method_arg_tuple_t = typename vmhook::detail::tuple_tail<all_args_tuple_t>::type_t;
 
             const auto type_map_entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
             if (type_map_entry == vmhook::type_to_class_map.end())
@@ -4060,13 +4068,13 @@ namespace vmhook
                 {
                     vmhook::return_value retval{ slot, frame_pointer };
                     // Slots indexed from 0: instance methods have 'this' at slot 0.
-                    auto invoke = [&]<std::size_t... Is>(std::index_sequence<Is...>)
+                    auto invoke = [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
                     {
                         detour(retval,
-                            vmhook::detail::extract_frame_arg<std::tuple_element_t<Is, method_arg_tuple>>(
-                                frame_pointer, static_cast<std::int32_t>(Is))...);
+                            vmhook::detail::extract_frame_arg<std::tuple_element_t<indexes, method_arg_tuple_t>>(
+                                frame_pointer, static_cast<std::int32_t>(indexes))...);
                     };
-                    invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple>>{});
+                    invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple_t>>{});
                 };
 
             vmhook::hotspot::g_hooked_methods.push_back({ found_method, std::move(wrapper_detour), original_code, original_from_interpreted, original_from_compiled, was_compiled });
@@ -4115,11 +4123,11 @@ namespace vmhook
                 // 1. Redirect interpreted callers to the (now-patched) i2i stub.
                 found_method->set_from_interpreted_entry(i2i);
 
-                // 2. Redirect compiled callers through the c2i adapter → interpreter → i2i stub.
+                // 2. Redirect compiled callers through the c2i adapter  interpreter  i2i stub.
                 if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                 {
                     found_method->set_from_compiled_entry(c2i_entry);
-                    VMHOOK_LOG("{} hook():   _from_compiled_entry → c2i @ 0x{:016X}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
+                    VMHOOK_LOG("{} hook():   _from_compiled_entry -> c2i @ 0x{:016X}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
                 }
                 else
                 {
@@ -5435,8 +5443,8 @@ namespace vmhook
         */
         field_proxy(void* field_pointer, std::string sig, const bool is_static_flag) noexcept
             : field_pointer{ field_pointer }
-            , m_signature{ std::move(sig) }
-            , m_is_static{ is_static_flag }
+            , signature_text{ std::move(sig) }
+            , static_field{ is_static_flag }
         {
         }
 
@@ -5445,9 +5453,9 @@ namespace vmhook
             @details
             Dispatches on the JVM type descriptor to determine how many bytes to
             read and which variant alternative to populate:
-              "Z" → bool       "B" → int8_t    "S" → int16_t   "I" → int32_t
-              "J" → int64_t    "F" → float     "D" → double    "C" → uint16_t
-              "L…"/"[…" → uint32_t (compressed OOP)
+              "Z"  bool       "B"  int8_t    "S"  int16_t   "I"  int32_t
+              "J"  int64_t    "F"  float     "D"  double    "C"  uint16_t
+              "L"/"["  uint32_t (compressed OOP)
             The returned value is a copy - safe to store and return from methods.
         */
         auto get() const noexcept
@@ -5455,62 +5463,62 @@ namespace vmhook
         {
             if (!this->field_pointer)
             {
-                return value_t{ std::int32_t{}, this->m_signature };
+                return value_t{ std::int32_t{}, this->signature_text };
             }
 
-            if (this->m_signature == "Z")
+            if (this->signature_text == "Z")
             {
                 bool value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
-            if (this->m_signature == "B")
+            if (this->signature_text == "B")
             {
                 std::int8_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
-            if (this->m_signature == "S")
+            if (this->signature_text == "S")
             {
                 std::int16_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
-            if (this->m_signature == "I")
+            if (this->signature_text == "I")
             {
                 std::int32_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
-            if (this->m_signature == "J")
+            if (this->signature_text == "J")
             {
                 std::int64_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
-            if (this->m_signature == "F")
+            if (this->signature_text == "F")
             {
                 float value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
-            if (this->m_signature == "D")
+            if (this->signature_text == "D")
             {
                 double value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
-            if (this->m_signature == "C")
+            if (this->signature_text == "C")
             {
                 std::uint16_t value{};
                 std::memcpy(&value, this->field_pointer, sizeof(value));
-                return value_t{ value, this->m_signature };
+                return value_t{ value, this->signature_text };
             }
 
             // Reference or array type - store compressed OOP
             std::uint32_t value{};
             std::memcpy(&value, this->field_pointer, sizeof(value));
-            return value_t{ value, this->m_signature };
+            return value_t{ value, this->signature_text };
         }
 
         /*
@@ -5562,7 +5570,7 @@ namespace vmhook
             {
                 if (this->field_pointer)
                 {
-                    if (this->m_signature == "C" && sizeof(clean_value_type) == sizeof(char))
+                    if (this->signature_text == "C" && sizeof(clean_value_type) == sizeof(char))
                     {
                         const std::uint16_t wide_value{ static_cast<std::uint16_t>(static_cast<unsigned char>(value)) };
                         std::memcpy(this->field_pointer, &wide_value, sizeof(wide_value));
@@ -5581,13 +5589,13 @@ namespace vmhook
         auto signature() const noexcept
             -> std::string_view
         {
-            return this->m_signature;
+            return this->signature_text;
         }
 
         auto is_static() const noexcept
             -> bool
         {
-            return this->m_is_static;
+            return this->static_field;
         }
 
         /*
@@ -5608,8 +5616,8 @@ namespace vmhook
 
     private:
         void* field_pointer;
-        std::string m_signature;
-        bool        m_is_static;
+        std::string signature_text;
+        bool        static_field;
     };
 
     // --- detail helpers that depend on hotspot types -------------------------
@@ -5620,31 +5628,36 @@ namespace vmhook
         /*
             @brief Locates StubRoutines::_call_stub_entry via VMStructs.
 
-            HotSpot's official C++→Java call gate.  Creates a properly-typed
+            HotSpot's official C++-to-Java call gate. Creates a properly-typed
             "entry frame" so the GC, exception handler, and frame-walker all
-            recognise the native→Java boundary.  Unlike jumping directly to a
+            recognise the native-to-Java boundary. Unlike jumping directly to a
             c2i adapter, this prevents JVM fatal errors when the frame-walker
             encounters an unexpected native frame above the interpreter frame.
 
             Stub signature (Windows x64):
-              rcx  = link (−1 sentinel)
+              rcx  = link (1 sentinel)
               rdx  = intptr_t* result holder
-              r8   = BasicType (T_INT=10, T_VOID=14, …)
+              r8   = BasicType (T_INT=10, T_VOID=14, )
               r9   = Method*
               stk  = entry_point, parameters*, param_count, JavaThread*
         */
-        inline auto find_call_stub_entry() noexcept -> void*
+        inline auto find_call_stub_entry() noexcept
+            -> void*
         {
             static const vmhook::hotspot::vm_struct_entry_t* const entry{
                 vmhook::hotspot::iterate_struct_entries("StubRoutines", "_call_stub_entry") };
-            if (!entry || !entry->address) return nullptr;
+            if (!entry || !entry->address)
+            {
+                return nullptr;
+            }
+
             void* const stub{ *reinterpret_cast<void**>(entry->address) };
             return vmhook::hotspot::is_valid_pointer(stub) ? stub : nullptr;
         }
 
         /*
             @brief Maps a JVM type-descriptor character to a HotSpot BasicType int.
-            Values are stable across all JDK versions 8–24+.
+            Values are stable across all supported JDK versions.
         */
         inline auto sig_char_to_basic_type(const char c) noexcept -> int
         {
@@ -5740,8 +5753,8 @@ namespace vmhook
         method_proxy(void* owning_object, vmhook::hotspot::method* method_ptr, std::string sig) noexcept
             : object{ owning_object }
             , method{ method_ptr }
-            , m_signature{ std::move(sig) }
-            , m_is_static{ false }
+            , signature_text{ std::move(sig) }
+            , static_field{ false }
         {
         }
 
@@ -5759,18 +5772,18 @@ namespace vmhook
             void* const klass{ vmhook::detail::jni_get_object_class(object_handle) };
             if (!klass)
             {
-                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetObjectClass failed.", vmhook::error_tag, this->name(), this->m_signature);
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetObjectClass failed.", vmhook::error_tag, this->name(), this->signature_text);
                 return value_t{ std::monostate{} };
             }
 
-            void* const method_id{ vmhook::detail::jni_get_method_id(klass, this->name(), this->m_signature) };
+            void* const method_id{ vmhook::detail::jni_get_method_id(klass, this->name(), this->signature_text) };
             if (!method_id)
             {
                 vmhook::detail::jni_exception_clear();
 
                 if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
                 {
-                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->m_signature);
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->signature_text);
                     return value_t{ std::monostate{} };
                 }
             }
@@ -5779,8 +5792,8 @@ namespace vmhook
             std::vector<void*> object_handles{};
             std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, std::forward<args_t>(args)...) };
 
-            const std::size_t rparen{ this->m_signature.rfind(')') };
-            const std::string_view return_signature{ rparen != std::string::npos ? std::string_view{ this->m_signature }.substr(rparen + 1) : std::string_view{ "V" } };
+            const std::size_t rparen{ this->signature_text.rfind(')') };
+            const std::string_view return_signature{ rparen != std::string::npos ? std::string_view{ this->signature_text }.substr(rparen + 1) : std::string_view{ "V" } };
 
             if (return_signature == "Ljava/lang/String;")
             {
@@ -5788,7 +5801,7 @@ namespace vmhook
                 call_object_method_a_t const call_object_method_a{ vmhook::detail::jni_function<36, call_object_method_a_t>(vmhook::hotspot::current_jni_env) };
                 if (!call_object_method_a)
                 {
-                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallObjectMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallObjectMethodA unavailable.", vmhook::error_tag, this->name(), this->signature_text);
                     return value_t{ std::monostate{} };
                 }
 
@@ -5800,7 +5813,7 @@ namespace vmhook
             call_void_method_a_t const call_void_method_a{ vmhook::detail::jni_function<63, call_void_method_a_t>(vmhook::hotspot::current_jni_env) };
             if (!call_void_method_a)
             {
-                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallVoidMethodA unavailable.", vmhook::error_tag, this->name(), this->m_signature);
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): CallVoidMethodA unavailable.", vmhook::error_tag, this->name(), this->signature_text);
                 return value_t{ std::monostate{} };
             }
 
@@ -5848,7 +5861,7 @@ namespace vmhook
             }
 
             vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
-            const std::string selected_signature{ selected_method ? selected_method->get_signature() : this->m_signature };
+            const std::string selected_signature{ selected_method ? selected_method->get_signature() : this->signature_text };
 
             if (!vmhook::hotspot::ensure_current_java_thread())
             {
@@ -5863,7 +5876,7 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            // Locate HotSpot's C++→Java call gate via VMStructs.
+            // Locate HotSpot's C++-to-Java call gate via VMStructs.
             // StubRoutines::_call_stub_entry was removed from the VMStruct
             // export table in some JDK releases; check availability at runtime.
             void* const call_stub{ vmhook::detail::find_call_stub_entry() };
@@ -5879,28 +5892,31 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            // ── Return type ───────────────────────────────────────────────────
+            //  Return type
             const std::string_view sig{ selected_signature };
             const std::size_t rparen{ sig.rfind(')') };
             const char ret_char{
                 rparen != std::string_view::npos ? sig[rparen + 1] : 'V' };
             const int result_type{ vmhook::detail::sig_char_to_basic_type(ret_char) };
 
-            // ── Parameter slot array ──────────────────────────────────────────
+            //  Parameter slot array
             // The call_stub passes parameters[] to the interpreter as locals[].
             // Each slot is an intptr_t: primitives are zero-extended, object
             // references are uncompressed decoded OOP pointers.
             std::intptr_t params[8]{};
             std::size_t   param_idx{ 0 };
 
-            if (this->object && !this->m_is_static)
+            if (this->object && !this->static_field)
             {
                 params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
             }
 
             auto pack = [&](auto&& a) noexcept
                 {
-                    if (param_idx >= 8) return;
+                    if (param_idx >= 8)
+                    {
+                        return;
+                    }
                     using clean_t = std::remove_cvref_t<decltype(a)>;
                     if constexpr (std::is_same_v<clean_t, std::string>)
                     {
@@ -5951,8 +5967,8 @@ namespace vmhook
                 };
             (pack(std::forward<args_t>(args)), ...);
 
-            // ── Call the stub ─────────────────────────────────────────────────
-            // Windows x64 calling convention — 8 arguments:
+            //  Call the stub
+            // Windows x64 calling convention  8 arguments:
             //   rcx = link  (return address for stub frame, -1 sentinel)
             //   rdx = result* (where the Java return value is written)
             //   r8  = result_type (BasicType enum)
@@ -5984,7 +6000,7 @@ namespace vmhook
                 reinterpret_cast<void*>(thread)
                 );
 
-            // ── Decode result ─────────────────────────────────────────────────
+            //  Decode result
             thread->set_thread_state(previous_state);
 
             switch (ret_char)
@@ -6032,13 +6048,13 @@ namespace vmhook
         auto signature() const noexcept
             -> std::string_view
         {
-            return this->m_signature;
+            return this->signature_text;
         }
 
         auto is_static() const noexcept
             -> bool
         {
-            return this->m_is_static;
+            return this->static_field;
         }
 
         auto get_compressed_oop() const noexcept
@@ -6200,7 +6216,7 @@ namespace vmhook
         auto resolve_compatible_method() const noexcept
             -> vmhook::hotspot::method*
         {
-            if (signature_matches_arguments<args_t...>(this->m_signature))
+            if (signature_matches_arguments<args_t...>(this->signature_text))
             {
                 return this->method;
             }
@@ -6242,8 +6258,8 @@ namespace vmhook
 
         void* object;
         vmhook::hotspot::method* method;
-        std::string m_signature;
-        bool        m_is_static;
+        std::string signature_text;
+        bool        static_field;
     };
 
     // --- Object base class ----------------------------------------------------
@@ -6263,7 +6279,7 @@ namespace vmhook
     /*
         @brief Base class for C++ wrappers around live Java objects.
         @details
-        Derive from this class to create a typed façade for a Java class.
+        Derive from this class to create a typed faade for a Java class.
         get_field() handles both instance and static fields automatically -
         the library reads JVM_ACC_STATIC from the InstanceKlass._fields array
         so there is no separate static-field accessor.
@@ -6645,7 +6661,7 @@ namespace vmhook
         using object_base::object_base;
 
         /*
-            @brief Instance get_field / get_method — C++23 deducing-this overloads.
+            @brief Instance get_field / get_method  C++23 deducing-this overloads.
 
             A deducing-this function requires an explicit object to be called.
             MSVC (and all conformant compilers) correctly exclude it from the
@@ -6683,7 +6699,7 @@ namespace vmhook
         }
 
         /*
-            @brief Static get_field / get_method — for static Java fields called
+            @brief Static get_field / get_method  for static Java fields called
             from static C++ methods.
 
             From a static C++ method the deducing-this overloads above are not
@@ -6957,7 +6973,7 @@ namespace vmhook
 
             Reads the ArrayList backing array directly from the JVM heap.
             Null Java elements become nullptr entries in the returned vector.
-            Works on all Java versions supported by vmhook (8–24+).
+            Works on all Java versions supported by vmhook (824+).
 
             For non-ArrayList implementations the method falls back to calling
             the Java get(int) method for each index.
@@ -6972,7 +6988,7 @@ namespace vmhook
                 return result;
             }
 
-            // ── ArrayList fast path ─────────────────────────────────────────
+            //  ArrayList fast path
             // ArrayList stores its live element count in a field named "size"
             // and its backing Object[] in a field named "elementData".
             const auto size_opt{ get_field_by_oop_klass("size") };
@@ -7017,7 +7033,7 @@ namespace vmhook
                 }
             }
 
-            // ── Generic fallback: call Java List.get(int) ───────────────────
+            //  Generic fallback: call Java List.get(int)
             const std::int32_t n{ size() };
             if (n <= 0)
             {
