@@ -100,7 +100,24 @@ Two test suites ship with the project:
 2. **JVM integration tests**  the injector loads the example DLL into a
    running JVM and the DLL asserts every field/method/hook scenario before
    asking the JVM to exit.  Results land in `test_results.txt`; CI fails if
-   any line starts with `[FAIL]`.
+   any line starts with `[FAIL]`.  The integration suite covers:
+   - Every primitive type (bool, byte, short, int, long, float, double, char)
+     at regular and boundary values (MIN/MAX, NaN, +/- infinity, negatives).
+   - String fields (regular, empty, unicode, long, interned, null).
+   - 1-D arrays of every primitive and of String (regular, empty, large).
+   - Object reference fields, including `final` and `volatile`.
+   - Inheritance: own + inherited (protected) fields and methods.
+   - Enums (`Color.RED/GREEN/BLUE` with constructor params and instance methods).
+   - Interfaces: static methods on the interface (Animal.kingdomCount), method
+     overrides on concrete implementations (Dog.speak overriding Animal).
+   - Nested classes (static nested + non-static inner with synthetic outer
+     reference).
+   - Overloaded methods (same name, three signatures).
+   - Each primitive return type plus void / null-returning methods.
+   - Methods that throw exceptions.
+   - Hooks: installation, force-return, cancel, arg mutation (int + string),
+     method calling from inside the detour, `make_unique` allocating
+     wrappers from a hook.
 
 ## Debug And Release Logging
 

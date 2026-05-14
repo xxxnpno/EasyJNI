@@ -20,9 +20,19 @@ public class Main
 
         System.out.println("Waiting for vmhook.dll injection...");
 
-        // to make sure Example class exists in the JVM
+        // Eagerly load every probe class so vmhook's klass walker sees
+        // them.  HotSpot lazy-loads classes; without these explicit
+        // Class.forName calls the C++ side would see "class not found"
+        // until something Java-side actually instantiated them.
         Class.forName("vmhook.Example");
+        Class.forName("vmhook.A");
         Class.forName("vmhook.B");
+        Class.forName("vmhook.Color");
+        Class.forName("vmhook.Animal");
+        Class.forName("vmhook.Dog");
+        Class.forName("vmhook.NestedHost");
+        Class.forName("vmhook.NestedHost$StaticNested");
+        Class.forName("vmhook.NestedHost$Inner");
 
         // we let vmhook.dll do its things in the jvm
         // vmhook has to get_field("stopJVM")->set(true) to stop the JVM
@@ -63,9 +73,9 @@ public class Main
             runProbe(() -> Example.polyProbeRequested && !Example.polyProbeDone,
                 () ->
                 {
-                    Example.polyProbeInheritedField = (Example.instance.bInstance.protectedInt == 1337);
+                    Example.polyProbeInheritedField  = (Example.instance.bInstance.protectedInt == 1337);
                     Example.polyProbeInheritedMethod = (Example.instance.bInstance.protectedAdd(3) == 1340);
-                    Example.polyProbeOwnField = (Example.instance.bInstance.bInt == 42);
+                    Example.polyProbeOwnField        = (Example.instance.bInstance.bInt == 42);
                 },
                 () -> Example.polyProbeDone = true);
 
@@ -80,6 +90,109 @@ public class Main
             runProbe(() -> Example.stringArgMutationProbeRequested && !Example.stringArgMutationProbeDone,
                 () -> Example.instance.nonStaticStringArgMutationMe("before"),
                 () -> Example.stringArgMutationProbeDone = true);
+
+            // ── New probes ──────────────────────────────────────────────────
+
+            // Enum probe: call brightness() on the favorite-color singleton
+            // so the C++ side can verify that vmhook resolves enum
+            // instance methods.
+            runProbe(() -> Example.enumProbeRequested && !Example.enumProbeDone,
+                () -> Example.enumProbeBrightness = Example.instance.favoriteColor.brightness(),
+                () -> Example.enumProbeDone = true);
+
+            // Interface probe: call the static method on the Animal
+            // interface and the default greet() method on the Dog
+            // implementation, so the C++ side can verify both lookup paths.
+            runProbe(() -> Example.interfaceProbeRequested && !Example.interfaceProbeDone,
+                () ->
+                {
+                    Example.interfaceProbeKingdoms = Animal.kingdomCount();
+                    // Just exercise the default method so vmhook can find it
+                    // via the interface superclass walk on the Dog wrapper.
+                    Example.instance.animal.greet();
+                },
+                () -> Example.interfaceProbeDone = true);
+
+            // Nested-class probe: read a field through the synthetic outer
+            // reference of an Inner instance.
+            runProbe(() -> Example.nestedProbeRequested && !Example.nestedProbeDone,
+                () -> Example.nestedProbeValue = Example.instance.innerInst.outerPlusInner(),
+                () -> Example.nestedProbeDone = true);
+
+            // Throwing-method probe: call the throwing method with a
+            // negative input; observe that the IllegalStateException is
+            // raised and caught here.  The C++ side hooks the method and
+            // verifies it can read the parameters.
+            runProbe(() -> Example.throwProbeRequested && !Example.throwProbeDone,
+                () ->
+                {
+                    try
+                    {
+                        Example.instance.throwsCheckedException(-1);
+                    }
+                    catch (final IllegalStateException ex)
+                    {
+                        Example.throwProbeExceptionSeen = true;
+                    }
+                },
+                () -> Example.throwProbeDone = true);
+
+            // Overload probe: call each of the three overload(...) variants.
+            runProbe(() -> Example.overloadProbeRequested && !Example.overloadProbeDone,
+                () ->
+                {
+                    Example.overloadProbeIntResult  = Example.instance.overload(13);
+                    Example.overloadProbeStrResult  = Example.instance.overload("foo");
+                    Example.overloadProbeDualResult = Example.instance.overload(2, 3);
+                },
+                () -> Example.overloadProbeDone = true);
+
+            // Return-types probe: exercise every primitive return type so
+            // the C++ side can verify method_proxy::call() handles each.
+            runProbe(() -> Example.returnTypesProbeRequested && !Example.returnTypesProbeDone,
+                () ->
+                {
+                    int accum = 0;
+                    accum += Example.instance.returnsBool()  ? 1 : 0;
+                    accum += Example.instance.returnsByte();
+                    accum += Example.instance.returnsShort();
+                    accum += Example.instance.returnsInt() >>> 24;
+                    accum += (int)(Example.instance.returnsLong() >>> 56);
+                    accum += (int) Example.instance.returnsFloat();
+                    accum += (int) Example.instance.returnsDouble();
+                    accum += Example.instance.returnsChar();
+                    if (Example.instance.returnsNull() == null)
+                    {
+                        accum += 999;
+                    }
+                    Example.returnTypesProbeAccum = accum;
+                },
+                () -> Example.returnTypesProbeDone = true);
+
+            // Edge-value probe: confirm the boundary primitive fields are
+            // still readable through Java itself (sanity check that nothing
+            // upstream corrupted them).  The C++ side ALSO reads them and
+            // compares directly.
+            runProbe(() -> Example.edgeProbeRequested && !Example.edgeProbeDone,
+                () ->
+                {
+                    boolean all =
+                           Example.intMinValue  == Integer.MIN_VALUE
+                        && Example.intMaxValue  == Integer.MAX_VALUE
+                        && Example.longMinValue == Long.MIN_VALUE
+                        && Example.longMaxValue == Long.MAX_VALUE
+                        && Float.isNaN(Example.floatNaN)
+                        && Example.floatPosInf  == Float.POSITIVE_INFINITY
+                        && Example.floatNegInf  == Float.NEGATIVE_INFINITY
+                        && Double.isNaN(Example.doubleNaN)
+                        && Example.doublePosInf == Double.POSITIVE_INFINITY
+                        && Example.doubleNegInf == Double.NEGATIVE_INFINITY
+                        && Example.nullString   == null
+                        && Example.emptyString.isEmpty()
+                        && Example.finalInt     == 0xC0FFEE;
+                    Example.edgeProbeAllSeen = all;
+                },
+                () -> Example.edgeProbeDone = true);
 
             Thread.sleep(1);
         }
