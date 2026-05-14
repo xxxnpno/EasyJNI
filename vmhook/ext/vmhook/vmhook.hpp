@@ -133,6 +133,20 @@ namespace vmhook
     {
         struct frame;
 
+        /*
+            @brief Shared memory slot written by the hook trampoline and read by the callback.
+            @details
+            The trampoline allocates one return_slot on the native stack before invoking
+            the user callback.  If the callback calls return_value::set() or
+            return_value::cancel(), cancel is set to true and retval holds the raw
+            bit-pattern of the value to return.  The trampoline checks cancel after the
+            callback returns and either restores normal execution or short-circuits to
+            the stored retval.
+
+            Complexity: O(1) — plain struct with brace-initialised fields.
+            Exception safety: noexcept — no dynamic allocation.
+            Thread safety: not thread-safe; owned by a single trampoline invocation.
+        */
         struct return_slot
         {
             bool         cancel{ false };
@@ -181,6 +195,24 @@ namespace vmhook
             this->return_slot->cancel = true;
         }
 
+        /*
+            @brief Mutates a Java method argument in-place on the interpreter stack.
+            @details
+            Writes value directly into the local-variable slot at the given index within
+            the intercepted frame.  index 0 is 'this' for instance methods; index 0 is
+            the first argument for static methods.  The frame pointer must be valid
+            (i.e. the callback was registered via vmhook::hook with frame support enabled).
+
+            Complexity: O(1).
+            Exception safety: noexcept — writes to pre-allocated stack memory.
+            Thread safety: not thread-safe; must only be called from the hook callback.
+
+            @param index  Zero-based index of the local-variable slot to overwrite.
+            @param value  New value to store; must be trivially copyable and fit in a
+                          Java local-variable slot (up to 8 bytes).
+            @return true if the write succeeded, false if frame is nullptr or index is
+                    out of range.
+        */
         template<typename value_type>
         auto set_arg(std::int32_t index, value_type&& value) noexcept
             -> bool;
@@ -189,6 +221,8 @@ namespace vmhook
         vmhook::hotspot::return_slot* return_slot{ nullptr };
         vmhook::hotspot::frame* stack_frame{ nullptr };
     };
+
+    // --- Forward declarations ------------------------------------------------
 
     namespace hotspot
     {
@@ -209,12 +243,43 @@ namespace vmhook
         struct i2i_hook_data;
         struct field_entry_t;
 
+        /*
+            @brief Decodes a compressed 32-bit OOP into a full 64-bit heap pointer.
+            @details
+            HotSpot stores object references as 32-bit values when UseCompressedOops
+            is enabled.  This function reverses that encoding.
+            Defined later in the file after the OOP-compression constants are resolved.
+
+            Complexity: O(1).
+            Exception safety: noexcept.
+        */
         static auto decode_oop_pointer(std::uint32_t compressed) noexcept
             -> void*;
 
+        /*
+            @brief Encodes a full 64-bit heap pointer as a compressed 32-bit OOP.
+            @details
+            Inverse of decode_oop_pointer.  Used when writing object references back
+            into Java fields that store compressed OOPs.
+            Defined later in the file after the OOP-compression constants are resolved.
+
+            Complexity: O(1).
+            Exception safety: noexcept.
+        */
         static auto encode_oop_pointer(void* decoded) noexcept
             -> std::uint32_t;
 
+        /*
+            @brief Attaches the calling native thread to the JVM as a Java thread if needed.
+            @details
+            Checks whether the current OS thread is already registered in HotSpot's
+            thread list.  If not, performs the attach dance so that JNI calls and heap
+            allocations from C++ code are legal.
+            Defined later in the file after java_thread is fully declared.
+
+            Complexity: O(N) where N = number of active Java threads (thread-list walk).
+            Exception safety: noexcept — returns false on failure.
+        */
         static auto ensure_current_java_thread() noexcept
             -> bool;
     }
@@ -286,8 +351,20 @@ namespace vmhook
     inline auto set_prim_array(const field_proxy& field, const std::vector<element_type>& values) noexcept
         -> void;
 
+    // --- Compile-time type traits --------------------------------------------
+
     namespace detail
     {
+        /*
+            @brief Type trait that detects whether a type is a specialisation of std::vector.
+            @details
+            Primary template inherits from std::false_type.  The partial specialisation for
+            std::vector<value_type, allocator_type> inherits from std::true_type and
+            exposes the element type as value_type_t.  cv-ref qualifiers are stripped via
+            std::remove_cvref_t before the check is applied (see is_vector_v).
+
+            Exception safety: noexcept — compile-time trait, no runtime cost.
+        */
         template<typename type>
         struct is_vector : std::false_type {};
 
@@ -297,9 +374,25 @@ namespace vmhook
             using value_type_t = value_type;
         };
 
+        /*
+            @brief Convenience bool constant for vmhook::detail::is_vector<T>.
+            @details
+            Strips cv-ref qualifiers from type before testing so that
+            is_vector_v<const std::vector<int>&> == true.
+        */
         template<typename type>
         inline constexpr bool is_vector_v{ is_vector<std::remove_cvref_t<type>>::value };
 
+        /*
+            @brief Type trait that detects whether a type is a specialisation of std::unique_ptr.
+            @details
+            Primary template inherits from std::false_type.  The partial specialisation for
+            std::unique_ptr<value_type, deleter_type> inherits from std::true_type and
+            exposes the pointed-to type as value_type_t.  Used by hook argument dispatch
+            to identify wrapper objects passed by unique_ptr and unwrap the raw OOP.
+
+            Exception safety: noexcept — compile-time trait, no runtime cost.
+        */
         template<typename type>
         struct is_unique_ptr : std::false_type {};
 
@@ -309,6 +402,12 @@ namespace vmhook
             using value_type_t = value_type;
         };
 
+        /*
+            @brief Convenience bool constant for vmhook::detail::is_unique_ptr<T>.
+            @details
+            Strips cv-ref qualifiers from type before testing so that
+            is_unique_ptr_v<const std::unique_ptr<Foo>&> == true.
+        */
         template<typename type>
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
 
@@ -896,6 +995,20 @@ namespace vmhook
                 return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
             }
 
+            /*
+                @brief Overwrites the _code (nmethod) pointer for this method.
+                @details
+                Setting code to nullptr forces HotSpot to treat the method as
+                interpreted even if a compiled version exists, without invalidating
+                the nmethod.  Used during hook installation to suppress the
+                compiled entry so that all calls route through the interpreter stub
+                that we have already patched.
+
+                Complexity: O(1).
+                Exception safety: noexcept — writes a single pointer through a cached offset.
+
+                @param code  New nmethod pointer, or nullptr to deoptimise.
+            */
             auto set_code(void* const code) noexcept
                 -> void
             {
@@ -1220,6 +1333,21 @@ namespace vmhook
                 return vmhook::hotspot::is_valid_pointer(super) ? super : nullptr;
             }
 
+            /*
+                @brief Returns the size in bytes of one instance of this class.
+                @details
+                Reads Klass._layout_helper, which encodes instance layout information.
+                For normal instance classes the layout helper is a positive integer
+                whose value (with the low tag bit masked off) is the instance size in
+                bytes.  A value of zero or negative indicates an array klass or an
+                abstract / interface class that cannot be instantiated directly.
+
+                Complexity: O(1) after the VMStruct offset is cached on first call.
+                Exception safety: noexcept — returns 0 on any failure.
+
+                @return Size in bytes of one heap-allocated instance, or 0 if the klass
+                        is not a normal instance class.
+            */
             auto get_instance_size() const noexcept
                 -> std::size_t
             {
@@ -1236,9 +1364,24 @@ namespace vmhook
                     return 0;
                 }
 
+                // Bit 0 of _layout_helper is a tag; mask it off to get the raw byte size.
                 return static_cast<std::size_t>(layout_helper & ~1);
             }
 
+            /*
+                @brief Returns the mark-word prototype stored in this klass.
+                @details
+                Klass._prototype_header holds the template mark-word that HotSpot stamps
+                into every freshly-allocated instance.  It encodes the default biased-locking
+                epoch and the klass identity hash pattern before any actual locking occurs.
+                Used during object allocation to initialise the mark word without
+                a separate heap lookup.
+
+                Complexity: O(1) after the VMStruct offset is cached on first call.
+                Exception safety: noexcept — returns 1 (neutral mark word) on any failure.
+
+                @return The prototype mark-word value, or 1 on failure.
+            */
             auto get_prototype_header() const noexcept
                 -> std::uintptr_t
             {
@@ -1951,6 +2094,19 @@ namespace vmhook
                 }
             }
 
+            /*
+                @brief Returns the next thread in HotSpot's global thread linked list.
+                @details
+                HotSpot maintains all JavaThread instances in an intrusive singly-linked list.
+                The field was _next on JavaThread in older JDKs and moved to Thread in later
+                JDKs.  This function probes both locations and uses whichever is present so
+                that the code remains version-agnostic.
+
+                Complexity: O(1) after the VMStruct offset is cached on first call.
+                Exception safety: noexcept — returns nullptr on any failure.
+
+                @return Pointer to the next JavaThread, or nullptr if this is the last entry.
+            */
             auto get_next() const noexcept
                 -> vmhook::hotspot::java_thread*
             {
@@ -1977,6 +2133,18 @@ namespace vmhook
                 return vmhook::hotspot::is_valid_pointer(next_thread) ? next_thread : nullptr;
             }
 
+            /*
+                @brief Returns the Windows OS thread ID of this JavaThread.
+                @details
+                Walks JavaThread (or Thread) -> OSThread -> _thread_id.
+                _osthread is probed on both JavaThread and Thread for JDK version
+                compatibility.
+
+                Complexity: O(1) after VMStruct offsets are cached on first call.
+                Exception safety: noexcept — returns 0 on any failure.
+
+                @return The DWORD OS thread ID, or 0 if the field cannot be located.
+            */
             auto get_os_thread_id() const noexcept
                 -> DWORD
             {
@@ -2012,6 +2180,26 @@ namespace vmhook
                 return *reinterpret_cast<const DWORD*>(reinterpret_cast<const std::uint8_t*>(os_thread) + thread_id_entry->offset);
             }
 
+            /*
+                @brief Bump-allocates byte_size bytes from this thread's TLAB.
+                @details
+                A Thread-Local Allocation Buffer (TLAB) is a private region of the Java heap
+                assigned to each thread.  Allocating from the TLAB is a simple pointer bump:
+                advance _top by byte_size and return the old _top.  No locking is required.
+                If the TLAB has insufficient space this function returns nullptr and the caller
+                must fall back to a slower global allocation path.
+
+                The _tlab field is probed on both JavaThread and Thread for JDK version
+                compatibility.
+
+                Complexity: O(1).
+                Exception safety: noexcept — returns nullptr on any failure or if the TLAB
+                                  has insufficient space.
+
+                @param byte_size  Number of bytes to allocate; must be > 0 and aligned
+                                  to the JVM object alignment (typically 8 bytes).
+                @return Pointer to the allocated region, or nullptr if allocation failed.
+            */
             auto allocate_tlab(const std::size_t byte_size) const noexcept
                 -> void*
             {
@@ -2058,10 +2246,48 @@ namespace vmhook
             }
         };
 
+        // --- Thread management -----------------------------------------------
+
+        /*
+            @brief Cached JavaThread* for the calling OS thread.
+            @details
+            Set by ensure_current_java_thread() when the thread is first identified in the
+            HotSpot thread list.  Thread-local so that each OS thread maintains its own
+            cached pointer without synchronisation.
+        */
         inline thread_local vmhook::hotspot::java_thread* current_java_thread{ nullptr };
+
+        /*
+            @brief Cached JNIEnv* for the calling OS thread.
+            @details
+            Set by attach_current_native_thread() after a successful
+            AttachCurrentThread / AttachCurrentThreadAsDaemon call.  Thread-local for
+            the same reason as current_java_thread.
+        */
         inline thread_local void* current_jni_env{ nullptr };
+
+        /*
+            @brief The most recently observed JavaThread* across all OS threads.
+            @details
+            Updated atomically (memory_order_relaxed) by ensure_current_java_thread()
+            and find_allocation_thread().  Used as a fast fallback by
+            find_allocation_thread() when no thread-local cached pointer is available,
+            avoiding a full thread-list walk in the common case.
+        */
         inline std::atomic<vmhook::hotspot::java_thread*> last_java_thread{ nullptr };
 
+        /*
+            @brief Returns the first JavaThread in HotSpot's global thread list.
+            @details
+            Reads the head pointer from Threads._thread_list, which is a static field
+            exported through gHotSpotVMStructs.  This is the entry point for walking
+            the intrusive linked list of all live Java threads.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr if the list is empty or not found.
+
+            @return Pointer to the head JavaThread, or nullptr on failure.
+        */
         static auto find_any_java_thread() noexcept
             -> vmhook::hotspot::java_thread*
         {
@@ -2077,6 +2303,19 @@ namespace vmhook
             return vmhook::hotspot::is_valid_pointer(head) ? head : nullptr;
         }
 
+        /*
+            @brief Finds the JavaThread whose OS thread ID matches os_thread_id.
+            @details
+            First walks the classic _thread_list linked list (up to 4 096 entries).
+            If the thread is not found there, falls back to ThreadsSMRSupport._java_thread_list
+            which is the Safe Memory Reclamation (SMR) snapshot used by JDK 10+.
+
+            Complexity: O(N) where N = number of live Java threads.
+            Exception safety: noexcept — returns nullptr if not found.
+
+            @param os_thread_id  Windows OS thread ID returned by GetCurrentThreadId().
+            @return Matching JavaThread*, or nullptr if not found.
+        */
         static auto find_java_thread_by_os_thread_id(const DWORD os_thread_id) noexcept
             -> vmhook::hotspot::java_thread*
         {
@@ -2138,6 +2377,20 @@ namespace vmhook
             return nullptr;
         }
 
+        /*
+            @brief Attaches the calling native (non-Java) thread to the JVM.
+            @details
+            Calls JNI_GetCreatedJavaVMs to locate the running JavaVM, then tries in order:
+              1. GetEnv   — the thread is already attached; just record the JNIEnv.
+              2. AttachCurrentThreadAsDaemon — preferred for injected native threads.
+              3. AttachCurrentThread         — fallback.
+            Stores the resulting JNIEnv* in current_jni_env on success.
+
+            Complexity: O(1) — JNI vtable dispatches.
+            Exception safety: noexcept — returns false on any failure.
+
+            @return true if a JNIEnv was obtained, false otherwise.
+        */
         static auto attach_current_native_thread() noexcept
             -> bool
         {
@@ -2207,6 +2460,21 @@ namespace vmhook
             return false;
         }
 
+        /*
+            @brief Ensures the calling thread has a valid JavaThread* and JNIEnv*.
+            @details
+            Resolution order:
+              1. Thread-local current_java_thread is already set — fast return.
+              2. Search the HotSpot thread list for the current OS thread ID.
+              3. Attach the thread via JNI (attach_current_native_thread) and retry
+                 up to 64 times with thread yields while HotSpot registers it.
+
+            Complexity: O(N) worst case on first call, where N = number of live Java threads.
+            Exception safety: noexcept — returns false on failure.
+            Thread safety: safe to call from any OS thread; state is stored thread-locally.
+
+            @return true if current_java_thread is valid after the call, false otherwise.
+        */
         static auto ensure_current_java_thread() noexcept
             -> bool
         {
@@ -2252,6 +2520,21 @@ namespace vmhook
             return false;
         }
 
+        /*
+            @brief Returns a JavaThread suitable for TLAB allocation without ensure_current_java_thread.
+            @details
+            Faster than ensure_current_java_thread because it never attaches the thread.
+            Resolution order:
+              1. Thread-local current_java_thread — zero overhead.
+              2. last_java_thread atomic — one relaxed load, suitable from injected threads.
+              3. find_any_java_thread  — walks the thread list once.
+
+            Complexity: O(1) in cases 1 and 2, O(N) in case 3.
+            Exception safety: noexcept — returns nullptr if no thread can be found.
+            Thread safety: safe for concurrent reads; writes to last_java_thread are relaxed.
+
+            @return A valid JavaThread*, or nullptr if none is available.
+        */
         static auto find_allocation_thread() noexcept
             -> vmhook::hotspot::java_thread*
         {
@@ -2275,6 +2558,20 @@ namespace vmhook
             return discovered_thread;
         }
 
+        /*
+            @brief Allocates byte_size bytes from any thread's TLAB by scanning the SMR thread list.
+            @details
+            Used as a fallback when find_allocation_thread() returns nullptr.  Iterates
+            ThreadsSMRSupport._java_thread_list and calls java_thread::allocate_tlab() on
+            each entry until one succeeds.  Updates last_java_thread to the thread that
+            provided the allocation so that future calls hit the fast path.
+
+            Complexity: O(N) where N = number of live Java threads.
+            Exception safety: noexcept — returns nullptr if no TLAB has sufficient space.
+
+            @param byte_size  Number of bytes requested; must be > 0.
+            @return Pointer to the allocated memory, or nullptr on failure.
+        */
         static auto allocate_from_threads_list(const std::size_t byte_size) noexcept
             -> void*
         {
@@ -2326,6 +2623,8 @@ namespace vmhook
 
             return nullptr;
         }
+
+        // --- OOP and Klass pointer encoding / decoding -----------------------
 
         /*
             @brief Decodes a compressed OOP to a real 64-bit pointer.
@@ -2553,6 +2852,20 @@ namespace vmhook
             return reinterpret_cast<void*>(base + (static_cast<std::uint64_t>(compressed) << shift));
         }
 
+        /*
+            @brief Compresses a decoded Klass pointer back into HotSpot's narrow Klass form.
+            @details
+            Inverse of decode_klass_pointer().  The formula is:
+              compressed = (decoded_address - narrow_klass_base) >> narrow_klass_shift
+            Used when writing class-pointer fields (e.g. the mark-word klass field in an
+            object header) back into JVM structures.
+
+            Complexity: O(1) after VMStruct entries are cached on first call.
+            Exception safety: noexcept — returns 0 on failure or if decoded is null.
+
+            @param decoded  Full 64-bit Klass pointer to compress.
+            @return 32-bit compressed Klass pointer, or 0 on failure.
+        */
         static auto encode_klass_pointer(void* const decoded) noexcept
             -> std::uint32_t
         {
@@ -2915,6 +3228,17 @@ namespace vmhook
             return nullptr;
         }
 
+        /*
+            @brief Raw function pointer type for the low-level hook trampoline.
+            @details
+            Every hook trampoline generated by midi2i_hook calls through a pointer of this
+            type.  The three arguments are passed in the System V / Microsoft x64 calling
+            convention by the trampoline assembly:
+              frame*        - rbp of the intercepted interpreter frame.
+              java_thread*  - current JavaThread* (from r15 on HotSpot x64).
+              return_slot*  - pre-allocated slot for the callback to record cancellation
+                              and the return value.
+        */
         using detour_function_t = void(*)(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*);
 
         /*
@@ -2925,6 +3249,14 @@ namespace vmhook
         */
         struct method_args
         {
+            /*
+                @brief One decoded argument from an intercepted Java method call.
+                @details
+                decoded_oop holds the full 64-bit heap pointer after OOP decompression,
+                or zero for primitive arguments that do not have an OOP representation.
+                class_name holds the internal JVM class name (slash-separated), used by
+                method_args::as<T>() to construct the correct C++ wrapper type.
+            */
             struct argument_entry
             {
                 void* decoded_oop;
@@ -2967,6 +3299,14 @@ namespace vmhook
                 return new wrapper_type{ raw };
             }
 
+            /*
+                @brief Returns the number of arguments in this container.
+                @details
+                Includes both reference-type (object) and primitive arguments.
+
+                Complexity: O(1).
+                Exception safety: noexcept.
+            */
             auto size() const noexcept
                 -> std::size_t
             {
@@ -3608,6 +3948,22 @@ namespace vmhook
 
     namespace detail
     {
+        /*
+            @brief Finds a klass via JNI::FindClass using the context class loader.
+            @details
+            Fallback used by find_class() when the ClassLoaderDataGraph walk fails (e.g.
+            when the class is loaded by a non-bootstrap class loader that is not yet
+            reachable through the graph).  Calls JNIEnv::FindClass which uses the calling
+            thread's context class loader, then resolves the returned jclass handle to the
+            underlying Klass* via jni_klass_from_class_mirror.
+            Defined after the JNI helper section.
+
+            Complexity: O(lookup in the JVM class loader hierarchy).
+            Exception safety: noexcept — returns nullptr on any failure.
+
+            @param class_name  Internal JVM class name with '/' separators.
+            @return The matching klass*, or nullptr if not found.
+        */
         inline auto jni_find_class_with_context_loader(const std::string_view class_name) noexcept
             -> vmhook::hotspot::klass*;
     }
@@ -3708,8 +4064,19 @@ namespace vmhook
     namespace detail
     {
         /*
-            Function trait helpers extract the argument list from any callable so the
-            typed hook() overload can deduce Java parameter types at compile time.
+            @brief Type trait that extracts the argument-types tuple from any callable type.
+            @details
+            Specialisations cover the four common callable forms:
+              - Plain function pointers: return_type(*)(args...)
+              - std::function instances: std::function<return_type(args...)>
+              - Lambdas and functors:    operator() const member pointer
+              - Non-const member functions: return_type(class::*)(args...)
+            The associated member type args_tuple_t is a std::tuple of the raw argument
+            types.  Used by the typed hook<T>() overload to enumerate the Java parameter
+            descriptors at compile time so that the interpreter-frame read is fully
+            type-safe.
+
+            Exception safety: noexcept — compile-time trait, no runtime cost.
         */
         template<typename function_type, typename = void>
         struct function_traits;
@@ -3744,7 +4111,15 @@ namespace vmhook
             using args_tuple_t = std::tuple<argument_types...>;
         };
 
-        // Drop the leading element (bool*) from a tuple type.
+        /*
+            @brief Removes the first element from a std::tuple type.
+            @details
+            Used to strip the leading vmhook::return_value& argument from the hook
+            callback's args_tuple_t so that only the Java-visible parameters remain.
+            The resulting member type_t is the truncated tuple.
+
+            Exception safety: noexcept — compile-time trait, no runtime cost.
+        */
         template<typename tuple_type>
         struct tuple_tail;
 
@@ -3755,13 +4130,25 @@ namespace vmhook
         };
 
         /*
-            Extract a single Java method argument from the interpreter frame, converting
-            the raw slot value to the requested C++ type.
-            Uses the public get_locals() path so it does not require friendship with frame.
+            @brief Extracts a single Java method argument from the interpreter frame as value_type.
+            @details
+            Reads the local-variable slot at position index (negated relative to the locals
+            pointer) and converts the raw slot bits to the requested C++ type using a
+            compile-time if-constexpr dispatch:
               - std::string               decoded OOP fed into read_java_string()
               - std::unique_ptr<U>        decoded OOP fed into the registered factory for U
               - pointer types             decoded compressed OOP
-              - primitive / trivial types  raw slot bits via memcpy
+              - primitive / trivial types raw slot bits via memcpy
+
+            Uses the public get_locals() path so it does not require friendship with frame.
+
+            Complexity: O(1) for primitives; O(S) for strings where S = string length.
+            Exception safety: noexcept-boundary — underlying helpers may throw internally
+                              but the function returns base_t{} on any error path.
+
+            @param frame  Interpreter frame whose locals to read.
+            @param index  Zero-based argument index (0 = this / first parameter).
+            @return The decoded argument value, or base_t{} on failure.
         */
         template<typename value_type>
         auto extract_frame_arg(vmhook::hotspot::frame* const frame, const std::int32_t index)
@@ -3833,6 +4220,15 @@ namespace vmhook
             }
         }
 
+        /*
+            @brief Type trait that detects std::unique_ptr<T> where T derives from vmhook::object_base.
+            @details
+            Used in return_value::set_arg() to identify arguments that are managed C++
+            wrappers around Java objects.  The primary template inherits from std::false_type;
+            the partial specialisation inherits from std::bool_constant<is_base_of<object_base, T>>.
+
+            Exception safety: noexcept — compile-time trait, no runtime cost.
+        */
         template<typename value_type>
         struct is_unique_object_ptr : std::false_type {};
 
@@ -3840,9 +4236,31 @@ namespace vmhook
         struct is_unique_object_ptr<std::unique_ptr<value_type, deleter_type>>
             : std::bool_constant<std::is_base_of_v<vmhook::object_base, value_type>> {};
 
+        /*
+            @brief Decodes a JNI local reference to a raw heap OOP pointer.
+            @details
+            JNI object references (jobject, jclass, jstring, etc.) are handles stored in
+            the current thread's JNI handle block, not direct heap pointers.  This function
+            dereferences the handle to obtain the underlying OOP.
+            Defined after the JNI helper section below.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr on failure.
+        */
         inline auto jni_decode_object(void* object_handle) noexcept
             -> void*;
 
+        /*
+            @brief Creates a new Java String from a UTF-8 string_view using JNI.
+            @details
+            Calls JNIEnv::NewStringUTF via the cached current_jni_env.  Returns a JNI
+            local reference (jobject handle), not a raw OOP.  Use jni_decode_object() to
+            obtain the OOP if raw heap access is needed.
+            Defined after the JNI helper section below.
+
+            Complexity: O(N) where N = length of value.
+            Exception safety: noexcept — returns nullptr if JNIEnv is unavailable or allocation fails.
+        */
         inline auto jni_new_string_utf(std::string_view value) noexcept
             -> void*;
     } // namespace detail
@@ -4200,8 +4618,21 @@ namespace vmhook
         vmhook::hotspot::g_hooked_i2i_entries.clear();
     }
 
+    // --- JNI helper layer --------------------------------------------------------
+    // Low-level wrappers around the JNIEnv function table.  All functions are
+    // noexcept and return nullptr / empty on failure so callers never need to
+    // catch JNI exceptions explicitly (they call jni_exception_clear() instead).
+
     namespace detail
     {
+        /*
+            @brief Tagged union matching the layout of JNI's jvalue type.
+            @details
+            Used when building argument arrays for CallObjectMethodA and related JNI
+            varargs-A variants.  Each field corresponds to a JNI primitive type:
+              z = jboolean, b = jbyte, c = jchar, s = jshort,
+              i = jint, j = jlong, f = jfloat, d = jdouble, l = jobject.
+        */
         union jni_value
         {
             bool z;
@@ -4215,6 +4646,22 @@ namespace vmhook
             void* l;
         };
 
+        /*
+            @brief Retrieves a JNI function pointer from the JNIEnv function table by index.
+            @details
+            A JNIEnv* is a pointer to a pointer to an array of function pointers (the
+            JNI function table).  Given the zero-based JNI table index (as defined by
+            the JNI specification) and the target function_type, this returns a callable
+            function pointer cast to function_type, or nullptr if env is invalid.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr if env is null.
+
+            @tparam index          Zero-based index into the JNIEnv function table.
+            @tparam function_type  The expected function pointer type for this slot.
+            @param env  The JNIEnv* (current_jni_env).
+            @return     Callable function pointer, or nullptr on failure.
+        */
         template<std::size_t index, typename function_type>
         inline auto jni_function(void* const env) noexcept
             -> function_type
@@ -4233,6 +4680,19 @@ namespace vmhook
             return reinterpret_cast<function_type>(table[index]);
         }
 
+        /*
+            @brief Dereferences a JNI local reference handle to obtain the underlying heap OOP.
+            @details
+            JNI local references are pointers into the current thread's JNI handle block.
+            Dereferencing the handle pointer yields the raw Java heap OOP.  The result is
+            validated with is_valid_pointer before being returned.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr if handle is null or OOP is invalid.
+
+            @param object_handle  A JNI local reference (jobject, jclass, jstring, etc.).
+            @return  Raw heap OOP, or nullptr on failure.
+        */
         inline auto jni_decode_object(void* const object_handle) noexcept
             -> void*
         {
@@ -4245,6 +4705,21 @@ namespace vmhook
             return vmhook::hotspot::is_valid_pointer(oop) ? oop : nullptr;
         }
 
+        /*
+            @brief Constructs a synthetic JNI handle for a raw heap OOP without a JNI frame.
+            @details
+            Stores oop into handle_storage and returns a pointer to handle_storage.
+            This creates a stack-allocated "fake" JNI handle that the JNI function table
+            will dereference as a normal local reference.  The caller must keep
+            handle_storage alive for the duration of any JNI calls that use the handle.
+
+            Complexity: O(1).
+            Exception safety: noexcept — plain pointer assignment.
+
+            @param oop             Raw heap OOP to wrap.
+            @param handle_storage  Caller-provided storage for the OOP value.
+            @return  Pointer to handle_storage, suitable for passing as a JNI jobject.
+        */
         inline auto jni_oop_handle(void* const oop, void*& handle_storage) noexcept
             -> void*
         {
@@ -4252,6 +4727,20 @@ namespace vmhook
             return &handle_storage;
         }
 
+        /*
+            @brief Calls JNIEnv::FindClass to locate a class by its internal name.
+            @details
+            Uses JNI table slot 6 (FindClass) with current_jni_env.  The name must use
+            '/' separators (e.g. "java/lang/String").  Returns a JNI local reference
+            (jclass handle), not a Klass*.  Use jni_klass_from_class_mirror() to get
+            the HotSpot Klass* from the returned handle.
+
+            Complexity: O(lookup in the bootstrap class loader).
+            Exception safety: noexcept — returns nullptr on any failure.
+
+            @param class_name  Internal JVM class name with '/' separators.
+            @return  jclass local reference, or nullptr if not found or JNI is unavailable.
+        */
         inline auto jni_find_class(const std::string_view class_name) noexcept
             -> void*
         {
@@ -4271,6 +4760,17 @@ namespace vmhook
             return find_class(vmhook::hotspot::current_jni_env, name.c_str());
         }
 
+        /*
+            @brief Clears any pending JNI exception on the current thread.
+            @details
+            Calls JNIEnv::ExceptionCheck (slot 228) to test for a pending exception, then
+            JNIEnv::ExceptionClear (slot 17) to dismiss it.  Should be called after any
+            JNI call that may have thrown (e.g. FindClass, GetMethodID) to prevent the
+            pending exception from poisoning subsequent JNI operations.
+
+            Complexity: O(1).
+            Exception safety: noexcept — JNI vtable dispatches only.
+        */
         inline auto jni_exception_clear() noexcept
             -> void
         {
@@ -4284,6 +4784,17 @@ namespace vmhook
             }
         }
 
+        /*
+            @brief Calls JNIEnv::GetObjectClass to retrieve the jclass of a JNI object handle.
+            @details
+            Uses JNI table slot 31 (GetObjectClass).  Returns a jclass local reference.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr if env or handle is null.
+
+            @param object_handle  A JNI local reference to a Java object.
+            @return  jclass handle for the object's runtime class, or nullptr on failure.
+        */
         inline auto jni_get_object_class(void* const object_handle) noexcept
             -> void*
         {
@@ -4292,6 +4803,21 @@ namespace vmhook
             return get_object_class ? get_object_class(vmhook::hotspot::current_jni_env, object_handle) : nullptr;
         }
 
+        /*
+            @brief Calls JNIEnv::GetMethodID to look up an instance method by name and descriptor.
+            @details
+            Uses JNI table slot 33 (GetMethodID).  Clears any pending exception before the
+            call and again after if the lookup fails, so callers do not need to handle
+            pending exceptions from failed lookups.
+
+            Complexity: O(method count in the class hierarchy).
+            Exception safety: noexcept — returns nullptr and clears the exception on failure.
+
+            @param klass      jclass handle for the class to search.
+            @param name       Java method name (e.g. "getScore").
+            @param signature  JNI descriptor string (e.g. "()I").
+            @return  jmethodID, or nullptr if not found.
+        */
         inline auto jni_get_method_id(void* const klass, const std::string& name, const std::string& signature) noexcept
             -> void*
         {
@@ -4309,6 +4835,20 @@ namespace vmhook
         inline auto jni_new_string_utf(const std::string_view value) noexcept
             -> void*;
 
+        /*
+            @brief Calls JNIEnv::GetStaticMethodID to look up a static method by name and descriptor.
+            @details
+            Uses JNI table slot 113 (GetStaticMethodID).  The return value is a jmethodID
+            suitable for jni_call_static_object_method().
+
+            Complexity: O(method count in the class).
+            Exception safety: noexcept — returns nullptr on failure.
+
+            @param klass      jclass handle.
+            @param name       Java method name.
+            @param signature  JNI descriptor string.
+            @return  jmethodID, or nullptr if not found.
+        */
         inline auto jni_get_static_method_id(void* const klass, const std::string& name, const std::string& signature) noexcept
             -> void*
         {
@@ -4317,6 +4857,20 @@ namespace vmhook
             return get_static_method_id ? get_static_method_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
         }
 
+        /*
+            @brief Calls JNIEnv::GetStaticFieldID to look up a static field by name and descriptor.
+            @details
+            Uses JNI table slot 144 (GetStaticFieldID).  The return value is a jfieldID
+            suitable for jni_get_static_object_field().
+
+            Complexity: O(field count in the class).
+            Exception safety: noexcept — returns nullptr on failure.
+
+            @param klass      jclass handle.
+            @param name       Java field name (e.g. "classLoader").
+            @param signature  JNI type descriptor (e.g. "Ljava/lang/ClassLoader;").
+            @return  jfieldID, or nullptr if not found.
+        */
         inline auto jni_get_static_field_id(void* const klass, const std::string& name, const std::string& signature) noexcept
             -> void*
         {
@@ -4325,6 +4879,19 @@ namespace vmhook
             return get_static_field_id ? get_static_field_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
         }
 
+        /*
+            @brief Calls JNIEnv::GetStaticObjectField to read a static object-typed field.
+            @details
+            Uses JNI table slot 145 (GetStaticObjectField).  Returns a JNI local reference
+            (jobject) to the field value.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr on failure.
+
+            @param klass     jclass handle.
+            @param field_id  jfieldID from jni_get_static_field_id().
+            @return  jobject local reference, or nullptr on failure.
+        */
         inline auto jni_get_static_object_field(void* const klass, void* const field_id) noexcept
             -> void*
         {
@@ -4333,6 +4900,20 @@ namespace vmhook
             return get_static_object_field ? get_static_object_field(vmhook::hotspot::current_jni_env, klass, field_id) : nullptr;
         }
 
+        /*
+            @brief Calls JNIEnv::CallObjectMethodA to invoke an instance method.
+            @details
+            Uses JNI table slot 36 (CallObjectMethodA).  args may be nullptr for
+            zero-argument methods.  Returns a JNI local reference to the result object.
+
+            Complexity: O(method execution time).
+            Exception safety: noexcept — returns nullptr on JNI failure.
+
+            @param object     JNI local reference to the receiver object.
+            @param method_id  jmethodID from jni_get_method_id().
+            @param args       Array of jvalue arguments, or nullptr for no arguments.
+            @return  jobject local reference for the return value, or nullptr on failure.
+        */
         inline auto jni_call_object_method(void* const object, void* const method_id, const vmhook::detail::jni_value* const args = nullptr) noexcept
             -> void*
         {
@@ -4341,6 +4922,20 @@ namespace vmhook
             return call_object_method_a ? call_object_method_a(vmhook::hotspot::current_jni_env, object, method_id, args) : nullptr;
         }
 
+        /*
+            @brief Calls JNIEnv::CallStaticObjectMethodA to invoke a static method.
+            @details
+            Uses JNI table slot 116 (CallStaticObjectMethodA).  args may be nullptr.
+            Returns a JNI local reference to the result object.
+
+            Complexity: O(method execution time).
+            Exception safety: noexcept — returns nullptr on JNI failure.
+
+            @param klass      jclass handle for the class that declares the method.
+            @param method_id  jmethodID from jni_get_static_method_id().
+            @param args       Array of jvalue arguments, or nullptr for no arguments.
+            @return  jobject local reference for the return value, or nullptr on failure.
+        */
         inline auto jni_call_static_object_method(void* const klass, void* const method_id, const vmhook::detail::jni_value* const args = nullptr) noexcept
             -> void*
         {
@@ -4349,6 +4944,20 @@ namespace vmhook
             return call_static_object_method_a ? call_static_object_method_a(vmhook::hotspot::current_jni_env, klass, method_id, args) : nullptr;
         }
 
+        /*
+            @brief Extracts the HotSpot Klass* from a java.lang.Class JNI handle.
+            @details
+            A java.lang.Class object (the class mirror) stores a back-pointer to its Klass
+            at a fixed offset defined by java_lang_Class._klass_offset, which is exported
+            through gHotSpotVMStructs.  This function decodes the JNI handle to a raw OOP,
+            reads the klass field, and strips GC tag bits via untag_pointer().
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr on any failure.
+
+            @param class_handle  jclass local reference (e.g. from jni_find_class()).
+            @return  The underlying Klass*, or nullptr on failure.
+        */
         inline auto jni_klass_from_class_mirror(void* const class_handle) noexcept
             -> vmhook::hotspot::klass*
         {
@@ -4464,6 +5073,19 @@ namespace vmhook
             return nullptr;
         }
 
+        /*
+            @brief Calls JNIEnv::NewStringUTF to create a Java String from a UTF-8 C string.
+            @details
+            Uses JNI table slot 167 (NewStringUTF).  Returns a JNI local reference
+            (jstring handle), not a raw heap OOP.  Use jni_decode_object() to obtain
+            the underlying OOP if needed.
+
+            Complexity: O(N) where N = length of value.
+            Exception safety: noexcept — returns nullptr if JNIEnv is unavailable.
+
+            @param value  UTF-8 text to encode as a Java String.
+            @return  jstring local reference, or nullptr on failure.
+        */
         inline auto jni_new_string_utf(const std::string_view value) noexcept
             -> void*
         {
@@ -4478,6 +5100,19 @@ namespace vmhook
             return new_string_utf(vmhook::hotspot::current_jni_env, text.c_str());
         }
 
+        /*
+            @brief Reads a Java String's content as a std::string via JNI.
+            @details
+            Calls JNIEnv::GetStringUTFChars (slot 169) to obtain a UTF-8 C string,
+            copies it into a std::string, then calls ReleaseStringUTFChars (slot 170)
+            to free the buffer.
+
+            Complexity: O(N) where N = string length.
+            Exception safety: noexcept — returns empty string on failure.
+
+            @param string_handle  jstring local reference.
+            @return  The string contents, or an empty string on failure.
+        */
         inline auto jni_get_string_utf(void* const string_handle) noexcept
             -> std::string
         {
@@ -4510,6 +5145,26 @@ namespace vmhook
             return result;
         }
 
+        /*
+            @brief Returns the JNI type descriptor character(s) for a C++ argument type.
+            @details
+            Maps C++ types to their JNI descriptor string at compile time:
+              std::string / string_view / const char* -> "Ljava/lang/String;"
+              bool        -> "Z"
+              int8/uint8  -> "B"
+              int16       -> "S"
+              uint16      -> "C"
+              int64/uint64-> "J"
+              float       -> "F"
+              double      -> "D"
+              other       -> "I" (treated as int)
+            Used by method_proxy::call_jni() to build the JNI method descriptor string.
+
+            Exception safety: noexcept — compile-time dispatch only.
+
+            @tparam arg_type  The C++ argument type.
+            @return  JNI type descriptor string.
+        */
         template<typename arg_type>
         inline auto jni_signature_for_arg() noexcept
             -> std::string
@@ -4554,6 +5209,28 @@ namespace vmhook
             }
         }
 
+        /*
+            @brief Converts a single C++ argument to a jni_value and appends it to values.
+            @details
+            Handles the full range of argument types by compile-time dispatch:
+              - std::string / string_view / const char* -> jni_new_string_utf + .l slot
+              - unique_ptr<T extends object_base>       -> stores raw OOP in object_handles; .l slot
+              - object_base derived by value            -> stores raw OOP in object_handles; .l slot
+              - bool                                    -> .z slot
+              - integral (<=4 bytes)                    -> .i slot
+              - integral (8 bytes)                      -> .j slot
+              - float                                   -> .f slot
+              - double                                  -> .d slot
+            Object handles are stored in the caller-provided object_handles vector to keep
+            the OOP alive for the duration of the JNI call.
+
+            Complexity: O(1) for primitives; O(N) for strings.
+            Exception safety: noexcept — failures silently append a zero-initialised value.
+
+            @param values          Output jni_value array being built.
+            @param object_handles  Storage for OOP pointers wrapped as fake JNI handles.
+            @param arg             The C++ argument to convert.
+        */
         template<typename arg_type>
         inline auto append_jni_arg(std::vector<vmhook::detail::jni_value>& values, std::vector<void*>& object_handles, arg_type&& arg) noexcept
             -> void
@@ -4611,6 +5288,20 @@ namespace vmhook
             values.push_back(value);
         }
 
+        /*
+            @brief Builds a jni_value argument array from a variadic C++ argument pack.
+            @details
+            Calls append_jni_arg() for each argument in the pack using a fold expression.
+            object_handles is pre-reserved to sizeof...(args_t) to avoid reallocations
+            that would invalidate the pointers stored in the .l slots.
+
+            Complexity: O(N) where N = number of arguments.
+            Exception safety: noexcept — delegates to append_jni_arg which is noexcept.
+
+            @param object_handles  Caller-owned storage for OOP handle pointers.
+            @param args            C++ arguments to convert.
+            @return  Vector of jni_value ready to pass to CallXMethodA.
+        */
         template<typename... args_t>
         inline auto make_jni_args(std::vector<void*>& object_handles, args_t&&... args) noexcept
             -> std::vector<vmhook::detail::jni_value>
@@ -4622,6 +5313,27 @@ namespace vmhook
             return values;
         }
 
+        /*
+            @brief Constructs a Java object via JNI and wraps it in a std::unique_ptr<wrapper_type>.
+            @details
+            Finds the HotSpot klass for class_name, obtains its java.lang.Class mirror,
+            builds the JNI argument array, locates the matching constructor via
+            jni_get_method_id("<init>", ...), then calls CallObjectMethodA to instantiate
+            the object.  The resulting JNI handle is decoded to a raw OOP and passed to
+            the wrapper_type constructor.
+
+            This is the JNI-backed implementation of vmhook::make_unique<>(); it is used
+            when the TLAB allocation path is unavailable.
+
+            Complexity: O(constructor lookup + constructor execution time).
+            Exception safety: noexcept — returns nullptr on any failure; logs via VMHOOK_LOG.
+
+            @tparam wrapper_type  C++ wrapper type deriving from vmhook::object_base.
+            @tparam args_t        Constructor argument types.
+            @param class_name     Internal JVM class name with '/' separators.
+            @param args           Constructor arguments.
+            @return  Newly created Java object wrapped in unique_ptr, or nullptr on failure.
+        */
         template<typename wrapper_type, typename... args_t>
         inline auto jni_make_unique(const std::string& class_name, args_t&&... args) noexcept
             -> std::unique_ptr<wrapper_type>
@@ -4970,6 +5682,30 @@ namespace vmhook
         }
     }
 
+    // --- Java object / array / string allocation helpers ---------------------
+
+    /*
+        @brief Allocates a raw Java object of the given klass directly from a thread TLAB.
+        @details
+        Performs a zero-initialised TLAB allocation and stamps the HotSpot object header:
+          - oopDesc._mark / _markWord  <- klass->get_prototype_header()
+          - oopDesc._metadata._compressed_klass (or _klass) <- encoded klass pointer
+        Does not call any Java constructor; the resulting object is zeroed beyond the header.
+        Used as the low-level allocation primitive by make_java_string() and make_java_array().
+
+        Allocation strategy (in order):
+          1. Thread-local current_java_thread TLAB.
+          2. Walk up to 256 threads from find_any_java_thread().
+          3. allocate_from_threads_list() (SMR list).
+        Falls back through all three before returning nullptr.
+
+        Complexity: O(1) on the fast path; O(N) on the fallback walk.
+        Exception safety: noexcept — returns nullptr on any failure.
+
+        @param klass           HotSpot klass to stamp into the object header.
+        @param requested_size  Minimum allocation size in bytes; rounded up to 8-byte alignment.
+        @return  Pointer to zeroed, header-stamped object memory, or nullptr on failure.
+    */
     inline auto make_java_object(vmhook::hotspot::klass* const klass, const std::size_t requested_size) noexcept
         -> void*
     {
@@ -5053,6 +5789,24 @@ namespace vmhook
         return object_pointer;
     }
 
+    /*
+        @brief Allocates a raw Java array of the given element type and length.
+        @details
+        Finds the array klass by class_name (e.g. "[B" for byte[], "[C" for char[]),
+        allocates `array_header_size + length * element_size` bytes via make_java_object(),
+        and writes the Java array length into the 32-bit slot at byte offset 12 (the standard
+        HotSpot arrayOop _length field layout on 64-bit VMs with UseCompressedOops).
+
+        The caller is responsible for filling in the element data after this call.
+
+        Complexity: O(1) on the fast TLAB path; O(N) on the fallback.
+        Exception safety: noexcept — returns nullptr on any failure.
+
+        @param class_name    Internal JVM array type descriptor (e.g. "[B", "[C", "[Ljava/lang/Object;").
+        @param length        Number of elements; must be >= 0.
+        @param element_size  Size in bytes of each array element.
+        @return  Pointer to the raw array OOP with header and length initialised, or nullptr on failure.
+    */
     inline auto make_java_array(const std::string_view class_name, const std::int32_t length, const std::size_t element_size) noexcept
         -> void*
     {
@@ -5078,6 +5832,23 @@ namespace vmhook
         return array_oop;
     }
 
+    /*
+        @brief Allocates a new java.lang.String OOP from a UTF-8 string_view.
+        @details
+        Allocates a java.lang.String instance via make_java_object(), then detects at
+        runtime whether the JVM uses compact strings (JDK 9+, "coder" field present) or
+        classic char[] strings (JDK 8):
+          - Compact:  allocates a byte[] ("[B"), copies UTF-8 bytes directly, sets coder=0 (LATIN1).
+          - Classic:  allocates a char[] ("[C"), widens each byte to uint16.
+        Sets the "value" field of the String to the encoded OOP of the backing array.
+        Capped at 4096 characters to avoid oversized allocations.
+
+        Complexity: O(N) where N = length of value.
+        Exception safety: noexcept — returns nullptr on any allocation failure.
+
+        @param value  UTF-8 text to encode as a Java String (capped at 4096 chars).
+        @return  Raw java.lang.String OOP, or nullptr on failure.
+    */
     inline auto make_java_string(const std::string_view value) noexcept
         -> void*
     {
@@ -5287,12 +6058,24 @@ namespace vmhook
             > data;
             std::string signature{};
 
+            /*
+                @brief Appends one boolean element from a Java boolean[] to result.
+                @details
+                Reads the element as uint8_t and converts non-zero to true.
+                Complexity: O(1). Exception safety: noexcept.
+            */
             static auto append_array_value(std::vector<bool>& result, void* const array_oop, const std::int32_t index, std::string_view) noexcept
                 -> void
             {
                 result.push_back(vmhook::get_array_element<std::uint8_t>(array_oop, index) != 0);
             }
 
+            /*
+                @brief Appends one Java String element from a String[] to result.
+                @details
+                Reads the compressed OOP at index, decodes it, then calls read_java_string().
+                Complexity: O(S) where S = string length. Exception safety: noexcept.
+            */
             static auto append_array_value(std::vector<std::string>& result, void* const array_oop, const std::int32_t index, std::string_view) noexcept
                 -> void
             {
@@ -5300,6 +6083,13 @@ namespace vmhook
                 result.push_back(vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(element_compressed)));
             }
 
+            /*
+                @brief Appends one element from a Java char[] or byte[] to a std::vector<char>.
+                @details
+                For "[C" arrays reads a uint16 and narrows to char; for all other arrays
+                reads directly as char.
+                Complexity: O(1). Exception safety: noexcept.
+            */
             static auto append_array_value(std::vector<char>& result, void* const array_oop, const std::int32_t index, const std::string_view signature) noexcept
                 -> void
             {
@@ -5313,6 +6103,13 @@ namespace vmhook
                 }
             }
 
+            /*
+                @brief Generic overload: appends one element_type element from a Java array to result.
+                @details
+                Used for numeric types (int, float, double, etc.) and any other trivially
+                copyable element_type.
+                Complexity: O(1). Exception safety: noexcept.
+            */
             template<typename element_type>
             static auto append_array_value(std::vector<element_type>& result, void* const array_oop, const std::int32_t index, std::string_view) noexcept
                 -> void
@@ -5321,10 +6118,20 @@ namespace vmhook
             }
 
             /*
-               @brief Converts the stored value to target_type via static_cast.
-               Works for any combination of the nine stored types and any
-               numeric or bool target type.
-           */
+                @brief Decodes a compressed array OOP and reads all elements into a std::vector<target_type>.
+                @details
+                Decodes compressed (the compressed array OOP) via decode_array_oop(), reads
+                the Java array length, reserves the result vector, then calls append_array_value()
+                for each element.  The correct append_array_value overload is selected based on
+                target_type's element type at compile time.
+
+                Complexity: O(N) where N = array length.
+                Exception safety: noexcept — returns an empty vector on any failure.
+
+                @param compressed  Compressed OOP of the Java array.
+                @param signature   JVM array type descriptor (e.g. "[I", "[Ljava/lang/String;").
+                @return  Vector containing all decoded elements, or an empty vector on failure.
+            */
             template<typename target_type>
             static auto read_array_value(const std::uint32_t compressed, const std::string_view signature) noexcept
                 -> target_type
@@ -5351,6 +6158,25 @@ namespace vmhook
                 return result;
             }
 
+            /*
+                @brief Converts a variant alternative source_type to target_type with semantic dispatch.
+                @details
+                Called by operator target_type() via std::visit.  Applies the correct
+                conversion strategy based on the target:
+                  - std::string          <- decodes compressed OOP via read_java_string()
+                  - std::vector<T>       <- decodes array OOP and reads all elements
+                  - std::unique_ptr<T>   <- decodes compressed OOP and constructs wrapper
+                  - void*                <- decodes compressed OOP to raw pointer
+                  - numeric / bool types <- static_cast from the variant alternative
+
+                Complexity: O(1) for scalars; O(N) for strings/arrays.
+                Exception safety: noexcept — returns a default-constructed target_type on failure.
+
+                @tparam target_type  Desired output type.
+                @tparam source_type  The variant alternative actually stored.
+                @param value         The stored alternative value.
+                @return              Converted value, or default-constructed target_type on failure.
+            */
             template<typename target_type, typename source_type>
             auto cast_for_variant(source_type value) const noexcept
                 -> target_type
@@ -5419,6 +6245,20 @@ namespace vmhook
                 }
             }
 
+            /*
+                @brief Implicit conversion operator from value_t to any supported target type.
+                @details
+                Delegates to std::visit + cast_for_variant<target_type> so any assignment
+                or contextual conversion triggers the correct semantic:
+                  bool b  = proxy->get();
+                  int  i  = proxy->get();
+                  auto s  = static_cast<std::string>(proxy->get());
+
+                Complexity: O(1) for scalars; O(N) for strings/arrays.
+                Exception safety: noexcept.
+
+                @tparam target_type  The type the value is being converted to.
+            */
             template<typename target_type>
             operator target_type() const noexcept
             {
@@ -5429,6 +6269,15 @@ namespace vmhook
                     }, data);
             }
 
+            /*
+                @brief Converts a reference-type field into a vector of unique_ptr wrappers.
+                @details
+                Interprets the stored compressed OOP as a Java object array, decodes each
+                element, and constructs a std::unique_ptr<element_type> wrapper for each.
+                Defined out-of-line after array helpers are available.
+
+                Complexity: O(N) where N = array length.
+            */
             template<typename element_type>
             auto to_vector() const
                 -> std::vector<std::unique_ptr<element_type>>;
@@ -5592,6 +6441,15 @@ namespace vmhook
             return this->signature_text;
         }
 
+        /*
+            @brief Returns true if this field has JVM_ACC_STATIC set.
+            @details
+            Static fields are read from / written to the java.lang.Class mirror
+            of the declaring class rather than from an object instance.
+
+            Complexity: O(1).
+            Exception safety: noexcept.
+        */
         auto is_static() const noexcept
             -> bool
         {
@@ -5758,6 +6616,21 @@ namespace vmhook
         {
         }
 
+        /*
+            @brief Invokes the Java method via JNI as a fallback when the call stub is unavailable.
+            @details
+            Builds a jni_value argument array from args, resolves the jmethodID via
+            JNIEnv::GetMethodID, then dispatches to either CallObjectMethodA (for methods
+            returning java.lang.String) or CallVoidMethodA (for all other return types).
+            Used when detail::find_call_stub_entry() returns nullptr (call stub not yet
+            resolved or JDK version incompatibility).
+
+            Complexity: O(method lookup + method execution time).
+            Exception safety: noexcept — returns monostate value_t on any failure.
+
+            @param args  C++ arguments to pass; converted via make_jni_args().
+            @return  value_t containing the result, or monostate for void/failure.
+        */
         template<typename... args_t>
         auto call_jni(args_t&&... args) const noexcept
             -> value_t
@@ -6051,12 +6924,30 @@ namespace vmhook
             return this->signature_text;
         }
 
+        /*
+            @brief Returns true if this method is a static Java method.
+            @details
+            Static methods do not receive a 'this' pointer as the first argument.
+            The object field of this proxy is null when the method is static.
+
+            Complexity: O(1).
+            Exception safety: noexcept.
+        */
         auto is_static() const noexcept
             -> bool
         {
             return this->static_field;
         }
 
+        /*
+            @brief Returns the compressed OOP of the receiver object.
+            @details
+            Reads the first 4 bytes of the object pointer as a compressed OOP.
+            Used internally when the proxy needs to pass the receiver to call().
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns 0 if object is null.
+        */
         auto get_compressed_oop() const noexcept
             -> std::uint32_t
         {
@@ -6070,6 +6961,19 @@ namespace vmhook
         }
 
     private:
+        /*
+            @brief Reads the compressed Klass* from byte offset 8 of a HotSpot OOP header.
+            @details
+            On 64-bit HotSpot with UseCompressedClassPointers, oopDesc._metadata._compressed_klass
+            is stored at a fixed offset of 8 bytes from the object start.  This function reads
+            that slot and decodes it with decode_klass_pointer().
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns nullptr on failure.
+
+            @param oop  Decoded (full 64-bit) heap pointer to the Java object.
+            @return  klass* for the runtime type of oop, or nullptr on failure.
+        */
         static auto klass_from_object_header(void* const oop) noexcept
             -> vmhook::hotspot::klass*
         {
@@ -6089,6 +6993,31 @@ namespace vmhook
             return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
         }
 
+        /*
+            @brief Tests whether a C++ argument type is compatible with a JVM parameter descriptor.
+            @details
+            Compile-time dispatch based on argument_type:
+              - string types         -> descriptor == "Ljava/lang/String;"
+              - unique_ptr<T extends object_base> -> 'L' class descriptor matching T's registered name
+              - object_base derived  -> same as unique_ptr case
+              - bool                 -> "Z"
+              - integral 1-byte      -> "B" or "Z"
+              - integral 2-byte      -> "S" or "C"
+              - integral 4-byte      -> "I"
+              - integral 8-byte      -> "J"
+              - float                -> "F"
+              - double               -> "D"
+              - other                -> false
+
+            Used by signature_matches_arguments() to select the correct overloaded method.
+
+            Complexity: O(1) — compile-time trait dispatch.
+            Exception safety: noexcept.
+
+            @tparam argument_type  The C++ argument type to test.
+            @param descriptor      One JVM type descriptor token from a method signature.
+            @return  true if argument_type is compatible with descriptor.
+        */
         template<typename argument_type>
         static auto argument_matches_descriptor(const std::string_view descriptor) noexcept
             -> bool
@@ -6157,6 +7086,23 @@ namespace vmhook
             }
         }
 
+        /*
+            @brief Extracts the next descriptor token from a JVM method signature.
+            @details
+            Advances position past any leading array brackets, then past the full
+            type descriptor (a single letter for primitives, or 'L...;' for objects).
+            Returns the full descriptor including leading '[' array dimensions.
+            Returns an empty string_view when the parse is complete or position reaches
+            close_paren.
+
+            Complexity: O(D) where D = descriptor token length.
+            Exception safety: noexcept.
+
+            @param signature    Full JVM method signature (e.g. "(ILjava/lang/String;)V").
+            @param position     Current parse position; advanced in-place past the token.
+            @param close_paren  Index of the closing ')' character.
+            @return  The next descriptor token, or empty on end-of-parameters.
+        */
         static auto next_argument_descriptor(const std::string_view signature, std::size_t& position, const std::size_t close_paren) noexcept
             -> std::string_view
         {
@@ -6186,6 +7132,21 @@ namespace vmhook
             return signature.substr(start, position - start);
         }
 
+        /*
+            @brief Returns true if the parameter list of signature is compatible with args_t.
+            @details
+            Parses the JVM method signature from the opening '(' to the closing ')',
+            calling next_argument_descriptor() + argument_matches_descriptor<arg>() for
+            each argument in the pack.  Returns true only if all arguments match and there
+            are no leftover descriptor tokens.
+
+            Complexity: O(P) where P = number of parameters.
+            Exception safety: noexcept.
+
+            @tparam args_t  C++ argument types to test against the signature.
+            @param signature  Full JVM method signature.
+            @return  true if args_t are all compatible with signature's parameter list.
+        */
         template<typename... args_t>
         static auto signature_matches_arguments(const std::string_view signature) noexcept
             -> bool
@@ -6212,6 +7173,25 @@ namespace vmhook
             return matches && position == close_paren;
         }
 
+        /*
+            @brief Finds the Method* whose signature best matches the given C++ argument types.
+            @details
+            First tests whether this->signature_text already matches args_t using
+            signature_matches_arguments().  If so, returns this->method directly.
+            Otherwise walks the runtime klass hierarchy (obtained from the object header),
+            and checks every method with the same name for a matching signature.  Returns
+            the first match, or this->method as a fallback if nothing better is found.
+
+            This allows a single get_method("foo") result to handle overloaded Java methods
+            when the call site provides typed arguments.
+
+            Complexity: O(N * M) where N = number of methods in the class hierarchy,
+                        M = signature parse cost per method.
+            Exception safety: noexcept — returns this->method on any failure.
+
+            @tparam args_t  C++ argument types from the call<>() invocation.
+            @return  The best-matching Method*, or this->method as fallback.
+        */
         template<typename... args_t>
         auto resolve_compatible_method() const noexcept
             -> vmhook::hotspot::method*
@@ -6274,6 +7254,14 @@ namespace vmhook
         created and the pointer remains valid only for the duration of the hook.
     */
     using oop_type_t = void*;
+
+    /*
+        @brief Short alias for oop_type_t; both names refer to a decoded Java heap pointer.
+        @details
+        Provided for brevity in user code:
+            vmhook::hook<my_class>("tick",
+                [](vmhook::return_value& ret, const std::unique_ptr<my_class>& self, vmhook::oop_t other) { ... });
+    */
     using oop_t = oop_type_t;
 
     /*
@@ -6334,10 +7322,26 @@ namespace vmhook
 
         virtual ~object_base() = default;
 
+        /*
+            @brief Copy constructor — copies the raw OOP pointer.
+            @details
+            Both the source and the copy point to the same Java object.
+            The pointer is not a GC handle so no reference counting occurs.
+        */
         object_base(const object_base&) = default;
+
+        /*
+            @brief Copy assignment — copies the raw OOP pointer.
+        */
         auto operator=(const object_base&)
             -> object_base & = default;
 
+        /*
+            @brief Move constructor — transfers the OOP pointer and nulls the source.
+            @details
+            After the move, the source instance is set to nullptr so that
+            the moved-from object is safely destructible.
+        */
         object_base(object_base&& other) noexcept
             : instance{ other.instance }
         {
@@ -6421,6 +7425,21 @@ namespace vmhook
             return vmhook::field_proxy{ field_pointer, entry->signature, false };
         }
 
+        /*
+            @brief Returns a field proxy for a static field identified by wrapper_type and name.
+            @details
+            Unlike the instance overload, this variant does not need a live OOP because
+            static fields live on the java.lang.Class mirror rather than on an object.
+            Fails with nullopt if the field is not static (caller should use the instance
+            overload in that case).
+
+            Complexity: O(F) on first call; O(1) after caching.
+            Exception safety: may throw vmhook::exception internally but returns nullopt on failure.
+
+            @param wrapper_type  std::type_index of the registered C++ wrapper class.
+            @param name          Exact Java field name.
+            @return  Optional field_proxy, or nullopt on failure.
+        */
         static auto get_field(const std::type_index wrapper_type, const std::string_view name)
             -> std::optional<vmhook::field_proxy>
         {
@@ -6501,6 +7520,20 @@ namespace vmhook
             return std::nullopt;
         }
 
+        /*
+            @brief Returns a method proxy for a method that matches both name and JVM signature.
+            @details
+            Walks the class hierarchy searching for a method whose name equals method_name
+            and whose JVM descriptor equals method_signature.  Use this overload when the
+            class has overloaded Java methods with the same name but different signatures.
+
+            Complexity: O(N * M) where N = methods in the hierarchy, M = name comparison cost.
+            Exception safety: does not throw; returns nullopt on failure.
+
+            @param method_name       Exact Java method name.
+            @param method_signature  JVM descriptor, e.g. "(I)Ljava/lang/String;".
+            @return  Optional method_proxy, or nullopt if not found.
+        */
         auto get_method(const std::string_view method_name, const std::string_view method_signature) const
             -> std::optional<vmhook::method_proxy>
         {
@@ -6540,6 +7573,19 @@ namespace vmhook
             return std::nullopt;
         }
 
+        /*
+            @brief Returns a method proxy for a static method identified by wrapper_type and name.
+            @details
+            Like the static get_field() overload but for methods.  The returned proxy has
+            a null object pointer so it cannot be used to call instance methods.
+
+            Complexity: O(N * M) where N = methods in the hierarchy, M = name comparison cost.
+            Exception safety: does not throw; returns nullopt on failure.
+
+            @param wrapper_type  std::type_index of the registered C++ wrapper class.
+            @param method_name   Exact Java method name.
+            @return  Optional method_proxy, or nullopt if not found.
+        */
         static auto get_method(const std::type_index wrapper_type, const std::string_view method_name)
             -> std::optional<vmhook::method_proxy>
         {
@@ -6574,6 +7620,21 @@ namespace vmhook
             return std::nullopt;
         }
 
+        /*
+            @brief Returns a method proxy for a static method matching both name and JVM signature.
+            @details
+            Combines the type_index-based lookup from the static name-only overload with the
+            signature-matching logic from the instance name+signature overload.  Use when the
+            Java class has overloaded static methods.
+
+            Complexity: O(N * M).
+            Exception safety: does not throw; returns nullopt on failure.
+
+            @param wrapper_type      std::type_index of the registered C++ wrapper class.
+            @param method_name       Exact Java method name.
+            @param method_signature  JVM descriptor, e.g. "(I)V".
+            @return  Optional method_proxy, or nullopt if not found.
+        */
         static auto get_method(const std::type_index wrapper_type, const std::string_view method_name, const std::string_view method_signature)
             -> std::optional<vmhook::method_proxy>
         {
@@ -6634,6 +7695,20 @@ namespace vmhook
             return resolve_klass(std::type_index{ typeid(*this) });
         }
 
+        /*
+            @brief Resolves the HotSpot klass for an arbitrary registered C++ wrapper type.
+            @details
+            Looks up wrapper_type in type_to_class_map and delegates to vmhook::find_class()
+            which searches the ClassLoaderDataGraph (cached after the first call).
+            Used by the static overloads of get_field() and get_method() that cannot use
+            typeid(*this) because there is no object instance.
+
+            Complexity: O(1) after the first call per type (cached in klass_lookup_cache).
+            Exception safety: does not throw; returns nullptr and logs on failure.
+
+            @param wrapper_type  std::type_index of the C++ wrapper class.
+            @return  klass*, or nullptr if the type is not registered or the class is not found.
+        */
         static auto resolve_klass(const std::type_index wrapper_type)
             -> vmhook::hotspot::klass*
         {
@@ -6654,6 +7729,28 @@ namespace vmhook
         }
     };
 
+    /*
+        @brief CRTP base class that adds deducing-this overloads for instance vs. static dispatch.
+        @details
+        Derive from vmhook::object<YourClass> (not object_base directly) so that the
+        deducing-this get_field() / get_method() overloads are available.  They allow
+        the compiler to distinguish:
+          - instance call site (has 'this') -> deducing-this overloads -> object_base instance overloads
+          - static call site (no 'this')    -> static overloads -> object_base static overloads
+
+        Without this CRTP layer, a static call to get_field("name") in a static C++ method
+        would incorrectly match the non-static overload at compile time.
+
+        Usage:
+            class my_entity : public vmhook::object<my_entity>
+            {
+            public:
+                explicit my_entity(vmhook::oop_t oop) : vmhook::object<my_entity>{ oop } {}
+
+                auto get_health() -> int { return get_field("health")->get(); }
+                static auto get_count() -> int { return get_field("entityCount")->get(); }
+            };
+    */
     template<typename derived>
     class object : public object_base
     {
@@ -6775,6 +7872,16 @@ namespace vmhook
     class collection : public vmhook::object_base
     {
     public:
+        /*
+            @brief Wraps a decoded OOP that refers to any java.util.Collection implementation.
+            @details
+            The oop must be a fully decoded 64-bit heap pointer (not a compressed OOP).
+            The constructor does not validate the pointer; pass nullptr for a null-safe
+            collection that returns empty/zero for all operations.
+
+            Exception safety: noexcept.
+            @param oop  Decoded OOP of the Java Collection object, or nullptr.
+        */
         explicit collection(vmhook::oop_t oop) noexcept
             : vmhook::object_base{ oop }
         {
@@ -6866,11 +7973,33 @@ namespace vmhook
             return proxy->call();
         }
 
+        /*
+            @brief Returns true if the collection contains no elements.
+            @details
+            Delegates to size(); returns true when size() == 0.
+
+            Complexity: O(1) if size() is O(1) for the underlying implementation.
+            Exception safety: noexcept.
+        */
         auto is_empty() const noexcept -> bool
         {
             return size() == 0;
         }
 
+        /*
+            @brief Converts this java.util.Collection to a std::vector<std::unique_ptr<element_type>>.
+            @details
+            Attempts the ArrayList fast path first: reads the "size" and "elementData" fields
+            directly from heap memory and decodes each compressed OOP element.
+            Falls back to calling the Java get(int) method for other implementations.
+            Null Java elements become nullptr entries in the returned vector.
+
+            Complexity: O(N) where N = collection size.
+            Exception safety: does not throw; returns an empty vector on any failure.
+
+            @tparam element_type  C++ wrapper whose constructor accepts vmhook::oop_t.
+            @return  Vector of unique_ptr<element_type>; nullptr slots for null elements.
+        */
         template<typename element_type>
         auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
         {
@@ -6961,6 +8090,15 @@ namespace vmhook
     class list : public vmhook::collection
     {
     public:
+        /*
+            @brief Wraps a decoded OOP that refers to a java.util.List implementation.
+            @details
+            Inherits the collection(oop) constructor.  Adds a List-specific to_vector<T>()
+            that uses the ArrayList backing array fast path when available.
+
+            Exception safety: noexcept.
+            @param oop  Decoded OOP of the Java List object, or nullptr.
+        */
         explicit list(vmhook::oop_t oop) noexcept
             : vmhook::collection{ oop }
         {
@@ -7065,6 +8203,20 @@ namespace vmhook
         }
     };
 
+    /*
+        @brief Out-of-line definition of field_proxy::value_t::to_vector<element_type>().
+        @details
+        Reads the stored compressed OOP, decodes it with decode_oop_pointer(), wraps the
+        result in a vmhook::collection, and delegates to collection::to_vector<element_type>().
+        Defined here (after collection is complete) because collection is an incomplete type
+        at the point where value_t is declared.
+
+        Complexity: O(N) where N = collection size.
+        Exception safety: does not throw; returns an empty vector on failure.
+
+        @tparam element_type  C++ wrapper whose constructor accepts vmhook::oop_t.
+        @return  Vector of unique_ptr<element_type>.
+    */
     template<typename element_type>
     auto field_proxy::value_t::to_vector() const
         -> std::vector<std::unique_ptr<element_type>>
@@ -7156,12 +8308,42 @@ namespace vmhook
         return result;
     }
 
+    /*
+        @brief Returns the decoded array or object OOP from a field_proxy.
+        @details
+        Reads the compressed OOP stored in field via get_compressed_oop() and decodes
+        it using decode_array_oop().  Convenience wrapper used by set_str_field(),
+        set_bool_array(), set_prim_array(), and set_str_array().
+
+        Complexity: O(1).
+        Exception safety: noexcept — returns nullptr if the field OOP is null or invalid.
+
+        @param field  A field_proxy whose underlying field holds a reference or array OOP.
+        @return  Decoded 64-bit heap pointer to the array/object, or nullptr on failure.
+    */
     inline auto field_oop(const vmhook::field_proxy& field) noexcept
         -> void*
     {
         return vmhook::decode_array_oop(field.get_compressed_oop());
     }
 
+    /*
+        @brief Overwrites the contents of an existing java.lang.String in-place.
+        @details
+        Reads the backing array OOP from the String's "value" field, then writes
+        value's bytes into the backing array element-by-element:
+          - char[] (JDK 8):  writes uint16 per character (narrow to 0x00FF).
+          - byte[] (JDK 9+): writes uint8 per character (LATIN1 coder assumed).
+        Writes only up to min(existing_length, value.length()) characters.
+        Does NOT change the array length; value is silently truncated if longer
+        than the existing backing array.
+
+        Complexity: O(N) where N = written character count.
+        Exception safety: noexcept — returns on any failure.
+
+        @param string_oop  Decoded OOP of a live java.lang.String instance.
+        @param value       New content to write; truncated to the existing array length.
+    */
     inline auto write_java_string(void* const string_oop, const std::string_view value) noexcept
         -> void
     {
@@ -7213,12 +8395,38 @@ namespace vmhook
         }
     }
 
+    /*
+        @brief Overwrites a String field's backing array content in-place.
+        @details
+        Decodes the field's OOP to obtain the backing java.lang.String object, then
+        delegates to write_java_string().  Convenience wrapper for the common pattern
+        of mutating a String-typed instance field without replacing the String reference.
+
+        Complexity: O(N) where N = written character count.
+        Exception safety: noexcept — returns silently on failure.
+
+        @param field  A field_proxy whose underlying field is a java.lang.String reference.
+        @param value  New string content; truncated to the existing array length.
+    */
     inline auto set_str_field(const vmhook::field_proxy& field, const std::string_view value) noexcept
         -> void
     {
         vmhook::write_java_string(vmhook::field_oop(field), value);
     }
 
+    /*
+        @brief Writes a std::vector<bool> into a Java boolean[] field.
+        @details
+        Decodes the field's array OOP via field_oop(), then writes each element
+        as uint8 (0 = false, 1 = true) into the backing boolean[] array.
+        Writes only min(array_length, values.size()) elements.
+
+        Complexity: O(N) where N = written element count.
+        Exception safety: noexcept — returns silently if the OOP is null.
+
+        @param field   A field_proxy whose field holds a boolean[] reference.
+        @param values  Boolean values to write into the array.
+    */
     inline auto set_bool_array(const vmhook::field_proxy& field, const std::vector<bool>& values) noexcept
         -> void
     {
@@ -7235,6 +8443,21 @@ namespace vmhook
         }
     }
 
+    /*
+        @brief Writes a std::vector<element_type> into a Java primitive array field.
+        @details
+        Decodes the field's array OOP, then writes each element into the backing Java
+        primitive array.  Special-cases char/uint16 conversion for "[C" (Java char[])
+        fields: narrows each char to uint16 to avoid sign-extension issues.
+        Writes only min(array_length, values.size()) elements.
+
+        Complexity: O(N) where N = written element count.
+        Exception safety: noexcept — returns silently if the OOP is null.
+
+        @tparam element_type  Trivially copyable C++ element type (int, float, etc.).
+        @param field   A field_proxy whose field holds a primitive array reference.
+        @param values  Values to write into the array.
+    */
     template<typename element_type>
     inline auto set_prim_array(const vmhook::field_proxy& field, const std::vector<element_type>& values) noexcept
         -> void
@@ -7267,6 +8490,21 @@ namespace vmhook
         }
     }
 
+    /*
+        @brief Writes a std::vector<std::string> into a Java String[] field in-place.
+        @details
+        Decodes the field's array OOP, then for each slot reads the existing compressed
+        OOP (the java.lang.String* in the array), decodes it, and overwrites the backing
+        char[]/byte[] via write_java_string().  Does NOT replace the String references in
+        the array; it mutates the content of each pre-existing String object.
+        Writes only min(array_length, values.size()) elements.
+
+        Complexity: O(N * S) where N = element count, S = average string length.
+        Exception safety: noexcept — returns silently if the OOP is null.
+
+        @param field   A field_proxy whose field holds a String[] reference.
+        @param values  New string contents for each slot.
+    */
     inline auto set_str_array(const vmhook::field_proxy& field, const std::vector<std::string>& values) noexcept
         -> void
     {
