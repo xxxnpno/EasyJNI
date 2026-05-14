@@ -117,12 +117,16 @@ namespace vmhook
 
     namespace hotspot
     {
+        struct frame;
+
         struct return_slot
         {
             bool         cancel{ false };
             std::int64_t retval{ 0 };
         };
     }
+
+    class object_base;
 
     /*
         @brief Handle passed as the first argument to every hook callback.
@@ -141,8 +145,8 @@ namespace vmhook
     class return_value
     {
     public:
-        explicit return_value(vmhook::hotspot::return_slot* slot) noexcept
-            : slot_{ slot }
+        explicit return_value(vmhook::hotspot::return_slot* slot, vmhook::hotspot::frame* frame = nullptr) noexcept
+            : slot_{ slot }, frame_{ frame }
         {
 
         }
@@ -161,8 +165,13 @@ namespace vmhook
             slot_->cancel = true;
         }
 
+        template<typename T>
+        auto set_arg(std::int32_t index, T&& value) noexcept
+            -> bool;
+
     private:
         vmhook::hotspot::return_slot* slot_{ nullptr };
+        vmhook::hotspot::frame* frame_{ nullptr };
     };
 
     namespace hotspot
@@ -3801,7 +3810,97 @@ namespace vmhook
                 return base_t{};
             }
         }
+
+        template<typename T>
+        struct is_unique_object_ptr : std::false_type {};
+
+        template<typename value_type, typename deleter_type>
+        struct is_unique_object_ptr<std::unique_ptr<value_type, deleter_type>>
+            : std::bool_constant<std::is_base_of_v<vmhook::object_base, value_type>> {};
     } // namespace detail
+
+    template<typename T>
+    auto return_value::set_arg(const std::int32_t index, T&& value) noexcept
+        -> bool
+    {
+        if (!this->frame_ || index < 0)
+        {
+            return false;
+        }
+
+        void** const locals{ this->frame_->get_locals() };
+        if (!locals)
+        {
+            return false;
+        }
+
+        using value_type = std::remove_cvref_t<T>;
+
+        auto store_oop = [&](void* const oop)
+            -> bool
+        {
+            void* const previous_value{ locals[-index] };
+            const std::uintptr_t previous_bits{ reinterpret_cast<std::uintptr_t>(previous_value) };
+
+            if (!oop)
+            {
+                locals[-index] = nullptr;
+                return true;
+            }
+
+            if (previous_bits > 0xFFFFFFFFull)
+            {
+                locals[-index] = oop;
+                return true;
+            }
+
+            const std::uint32_t compressed{ vmhook::hotspot::encode_oop_pointer(oop) };
+            locals[-index] = reinterpret_cast<void*>(static_cast<std::uintptr_t>(compressed));
+            return true;
+        };
+
+        if constexpr (vmhook::detail::is_unique_object_ptr<value_type>::value)
+        {
+            return store_oop(value.get()
+                ? static_cast<const vmhook::object_base*>(value.get())->get_instance()
+                : nullptr);
+        }
+        else if constexpr (std::is_base_of_v<vmhook::object_base, value_type>)
+        {
+            return store_oop(value.get_instance());
+        }
+        else if constexpr (std::is_same_v<value_type, std::string> || std::is_same_v<value_type, std::string_view>)
+        {
+            void* const string_oop{ vmhook::make_java_string(value) };
+            if (!string_oop)
+            {
+                return false;
+            }
+
+            return store_oop(string_oop);
+        }
+        else if constexpr (std::is_same_v<value_type, const char*> || std::is_same_v<value_type, char*>)
+        {
+            void* const string_oop{ vmhook::make_java_string(value ? std::string_view{ value } : std::string_view{}) };
+            if (!string_oop)
+            {
+                return false;
+            }
+
+            return store_oop(string_oop);
+        }
+        else if constexpr (std::is_trivially_copyable_v<value_type> && sizeof(value_type) <= sizeof(void*))
+        {
+            void* raw{};
+            std::memcpy(&raw, &value, sizeof(value_type));
+            locals[-index] = raw;
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
 
     // --- Hooking --------------------------------------------------------------
 
@@ -3932,7 +4031,7 @@ namespace vmhook
             auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour)]
             (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot* const slot)
                 {
-                    vmhook::return_value retval{ slot };
+                    vmhook::return_value retval{ slot, frame_pointer };
                     // Slots indexed from 0: instance methods have 'this' at slot 0.
                     auto invoke = [&]<std::size_t... Is>(std::index_sequence<Is...>)
                     {
@@ -4161,9 +4260,15 @@ namespace vmhook
         inline auto jni_get_method_id(void* const klass, const std::string& name, const std::string& signature) noexcept
             -> void*
         {
+            vmhook::detail::jni_exception_clear();
             using get_method_id_t = void* (*)(void*, void*, const char*, const char*);
             get_method_id_t const get_method_id{ vmhook::detail::jni_function<33, get_method_id_t>(vmhook::hotspot::current_jni_env) };
-            return get_method_id ? get_method_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr;
+            void* const method_id{ get_method_id ? get_method_id(vmhook::hotspot::current_jni_env, klass, name.c_str(), signature.c_str()) : nullptr };
+            if (!method_id)
+            {
+                vmhook::detail::jni_exception_clear();
+            }
+            return method_id;
         }
 
         inline auto jni_new_string_utf(const std::string_view value) noexcept
@@ -5634,9 +5739,15 @@ namespace vmhook
             void* const method_id{ vmhook::detail::jni_get_method_id(klass, this->name(), this->m_signature) };
             if (!method_id)
             {
-                std::println("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->m_signature);
-                return value_t{ std::monostate{} };
+                vmhook::detail::jni_exception_clear();
+
+                if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
+                {
+                    std::println("{} method_proxy::call_jni('{}{}'): GetMethodID failed.", vmhook::error_tag, this->name(), this->m_signature);
+                    return value_t{ std::monostate{} };
+                }
             }
+            void* const resolved_method_id{ method_id ? method_id : reinterpret_cast<void*>(this->method) };
 
             std::vector<void*> object_handles{};
             std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, std::forward<args_t>(args)...) };
@@ -5654,7 +5765,7 @@ namespace vmhook
                     return value_t{ std::monostate{} };
                 }
 
-                void* const result_handle{ call_object_method_a(vmhook::hotspot::current_jni_env, object_handle, method_id, values.data()) };
+                void* const result_handle{ call_object_method_a(vmhook::hotspot::current_jni_env, object_handle, resolved_method_id, values.data()) };
                 return value_t{ vmhook::detail::jni_get_string_utf(result_handle) };
             }
 
@@ -5666,7 +5777,7 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            call_void_method_a(vmhook::hotspot::current_jni_env, object_handle, method_id, values.data());
+            call_void_method_a(vmhook::hotspot::current_jni_env, object_handle, resolved_method_id, values.data());
             return value_t{ std::monostate{} };
         }
 
