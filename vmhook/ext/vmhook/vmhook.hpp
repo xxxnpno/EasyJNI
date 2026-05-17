@@ -346,7 +346,11 @@ namespace vmhook::detail
 #if VMHOOK_DEBUG_LOGS
     #define VMHOOK_LOG(...) ::vmhook::detail::emit_log_line(::vmhook::detail::format_log(__VA_ARGS__))
 #else
-    #define VMHOOK_LOG(...) do {} while (false)
+    // No-op form: use sizeof on an unevaluated call so the arguments are
+    // ODR-used as far as the compiler is concerned (suppresses C4101 on
+    // catch-bound exception objects that are only referenced inside VMHOOK_LOG)
+    // without emitting any runtime code.
+    #define VMHOOK_LOG(...) ((void)sizeof(::vmhook::detail::format_log(__VA_ARGS__)))
 #endif
 
 namespace vmhook
