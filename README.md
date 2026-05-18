@@ -569,6 +569,51 @@ brought to a safepoint, so:
 The scan is O(heap-size) — typically 0.5–2 s on a 4 GiB heap.
 `max_visits` short-circuits as soon as you have enough.
 
+## Catching already-inlined callers of a hook
+
+`vmhook::hook<T>(...)` patches the hooked method's interpreter entry.
+That patch only fires while the method is dispatched through the
+interpreter.  If HotSpot has already JIT-compiled a *caller* of the
+hooked method and inlined the callee's body directly into the caller's
+nmethod, the dispatch is compiled away — calls reaching the hooked
+method through that inlined call site bypass the hook entirely.
+
+vmhook's per-hook install already deoptimises the hooked method itself,
+which catches direct callers, but it can't reach inlined call sites
+that were JIT-compiled before the hook went in.  Two helpers close that
+gap:
+
+```cpp
+// After installing whichever hooks you need:
+vmhook::deoptimize_all_jit_compiled_methods();
+```
+
+Throws away every nmethod in the JVM and lets HotSpot recompile from
+scratch.  Because each hooked method is marked `_dont_inline` at install
+time, the re-compiled callers no longer inline the hooked body —
+every dispatch routes through the patched interpreter entry.  Heavy:
+expect a brief CPU spike right after the call while HotSpot warms back
+up.  Typically called once after installing all hooks at startup.
+
+For a narrower sweep, pass a predicate:
+
+```cpp
+// Catch already-inlined Minecraft callers of any chat hook,
+// without touching JIT'd JDK / library code:
+vmhook::deoptimize_methods_if(
+    [](const std::string& class_name, vmhook::hotspot::method*)
+    {
+        return class_name.starts_with("net/minecraft/");
+    });
+```
+
+Both helpers use the same atomic Method-side deopt dance as the
+per-hook install (set entry points to interpreter, then clear `_code`),
+so they have the same race properties as `vmhook::hook<T>(...)` —
+exercised continuously in production.  Methods whose c2i adapter
+cannot be recovered are skipped rather than left in an inconsistent
+state.
+
 ## Enumerating Java threads
 
 `vmhook::for_each_thread(visitor)` walks HotSpot's live thread list

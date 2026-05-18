@@ -5684,6 +5684,147 @@ namespace vmhook
     }
 
     /*
+        @brief Forces every currently JIT-compiled Java method for which
+               `predicate(class_name, method)` returns true to fall back to
+               interpreted execution.
+        @details
+        Why this exists:  vmhook patches a method's interpreter entry
+        (`_i2i_entry`).  That patch is only reached while the method runs
+        interpreted.  Once HotSpot JIT-compiles either the callee OR any
+        caller that inlines the callee, the compiled code bypasses the
+        interpreter — and bypasses the hook.  vmhook's per-method install
+        already deoptimises the hooked callee, but it does NOT invalidate
+        callers that have already inlined the callee's body into their own
+        nmethod, so calls reaching the hooked method through an
+        already-inlined call site still bypass the hook.
+
+        This helper closes that gap by applying the same Method-side
+        deopt dance (set entry points to interpreter, clear _code) to
+        every method `predicate` selects, regardless of whether the
+        method was hooked or not.  HotSpot subsequently re-JITs hot
+        methods, and because vmhook marks each hooked method with
+        `_dont_inline`, the re-compiled callers no longer inline the
+        hooked body — every dispatch now goes through the patched
+        interpreter entry.
+
+        Trade-off:  every selected method that was JIT-compiled is
+        thrown away.  HotSpot has to recompile them as they warm up
+        again, which produces a brief CPU spike right after the call.
+        For hook installation (typically a one-time, startup-time
+        operation), this cost is acceptable.
+
+        Safety:  uses the same atomic single-pointer writes as
+        `vmhook::hook<T>(...)`, with the same race-versus-running-Java
+        properties (already exercised in production).  Skips any method
+        whose c2i adapter cannot be recovered — leaving such a method
+        JIT-compiled is safer than crashing the JVM with a
+        null-code/stale-entry combination at the next safepoint.
+
+        @tparam predicate_type   Callable invoked as
+                                 `bool(const std::string& class_name,
+                                       vmhook::hotspot::method* m)`.
+        @return  Number of methods successfully deoptimised.
+
+        Example:
+        @code
+            // Catch already-inlined Minecraft callers of any chat hook:
+            vmhook::deoptimize_methods_if([](const std::string& name,
+                                             vmhook::hotspot::method*)
+            {
+                return name.starts_with("net/minecraft/");
+            });
+        @endcode
+    */
+    template<typename predicate_type>
+    inline auto deoptimize_methods_if(predicate_type&& predicate) noexcept
+        -> std::size_t
+    {
+        std::size_t deoptimized{ 0 };
+        std::size_t skipped_no_c2i{ 0 };
+        vmhook::for_each_loaded_class(
+            [&](const std::string& class_name, vmhook::hotspot::klass* const k)
+            {
+                if (!k)
+                {
+                    return;
+                }
+                const std::int32_t method_count{ k->get_methods_count() };
+                vmhook::hotspot::method** const methods{ k->get_methods_ptr() };
+                if (!methods || method_count <= 0)
+                {
+                    return;
+                }
+                for (std::int32_t i{ 0 }; i < method_count; ++i)
+                {
+                    vmhook::hotspot::method* const m{ methods[i] };
+                    if (!m || !vmhook::hotspot::is_valid_pointer(m))
+                    {
+                        continue;
+                    }
+                    void* const code{ m->get_code() };
+                    if (!code || !vmhook::hotspot::is_valid_pointer(code))
+                    {
+                        continue;  // Not JIT-compiled — nothing to do.
+                    }
+                    if (!predicate(class_name, m))
+                    {
+                        continue;
+                    }
+
+                    void* const i2i{ m->get_i2i_entry() };
+                    void* const adapter{ m->get_adapter() };
+                    void* const c2i{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+
+                    if (!i2i
+                        || !c2i
+                        || !vmhook::hotspot::is_valid_pointer(c2i))
+                    {
+                        ++skipped_no_c2i;
+                        continue;
+                    }
+
+                    // Same ordering as the per-hook install path:
+                    //   1. Redirect interpreted callers to the i2i stub.
+                    //   2. Redirect compiled callers through the c2i adapter.
+                    //   3. Clear _code last so the entry-point writes are
+                    //      visible before HotSpot's safepoint check sees
+                    //      _code == nullptr.
+                    m->set_from_interpreted_entry(i2i);
+                    m->set_from_compiled_entry(c2i);
+                    m->set_code(nullptr);
+                    ++deoptimized;
+                }
+            });
+        VMHOOK_LOG("{} deoptimize_methods_if: {} deoptimised, {} skipped (no recoverable c2i adapter).",
+                   vmhook::info_tag, deoptimized, skipped_no_c2i);
+        return deoptimized;
+    }
+
+    /*
+        @brief Convenience wrapper that deoptimises every JIT-compiled
+               method in the JVM.
+        @details
+        Equivalent to `deoptimize_methods_if([](auto&, auto*) { return true; })`.
+        Heavy: causes HotSpot to throw away every nmethod and recompile
+        from scratch.  Use after installing all hooks you want to catch
+        already-inlined callers for.  Returns the number of methods
+        deoptimised.
+
+        Recommended usage:
+        @code
+            auto h1 = vmhook::scoped_hook<my_class>("foo", cb1);
+            auto h2 = vmhook::scoped_hook<my_class>("bar", cb2);
+            vmhook::deoptimize_all_jit_compiled_methods();
+        @endcode
+    */
+    inline auto deoptimize_all_jit_compiled_methods() noexcept
+        -> std::size_t
+    {
+        return vmhook::deoptimize_methods_if(
+            [](const std::string&, vmhook::hotspot::method*) noexcept { return true; });
+    }
+
+    /*
         @brief Snapshot of one HotSpot JavaThread, suitable for passing
                to the for_each_thread visitor.
         @details
