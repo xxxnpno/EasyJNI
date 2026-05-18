@@ -9,6 +9,7 @@
 extern "C" auto run_vmhook_vs_jni_speedtest() -> void;
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
