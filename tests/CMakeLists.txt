@@ -55,3 +55,19 @@ vmhook_add_test(api_surface_no_jvm SOURCES test_api_surface.cpp)
 #    static context; the file is guarded by VMHOOK_HAS_DEDUCING_THIS so older
 #    Clang / GCC compile a reduced subset.
 vmhook_add_test(unified_call_syntax SOURCES test_unified_call_syntax.cpp)
+
+# 7) Helper functions — version macros, decode_u5 (UNSIGNED5), pointer
+#    filters / untag, JVM sig -> BasicType, memory_protection enum mapping,
+#    build_dr7 (Windows-only), array_length/get_array_element/set_array_element
+#    on a fake buffer, and format_log fallback.  Pure-logic checks, no JVM.
+vmhook_add_test(helpers SOURCES test_helpers.cpp)
+target_compile_definitions("vmhook_test_helpers" PRIVATE
+    VMHOOK_CMAKE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    VMHOOK_CMAKE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    VMHOOK_CMAKE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
+
+# 8) Tighter coverage of vmhook::os: non-page-aligned protect, page-crossing
+#    protect, safe_read against a PROT_NONE page, allocation_granularity vs
+#    page_size relationship, query_region attributes on a freshly allocated
+#    RWX block.  Pure OS-layer checks, no JVM required.
+vmhook_add_test(os_protect_interaction SOURCES test_os_protect_interaction.cpp)
