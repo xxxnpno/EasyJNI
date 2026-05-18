@@ -1875,6 +1875,30 @@ namespace vmhook
             }
         };
 
+        struct method;
+
+        /*
+            @brief Heuristic recovery of Method::_adapter on JDKs where the
+                   field is no longer exported via gHotSpotVMStructs.
+            @details
+            JDK 9 dropped _adapter from the VMStructs export (the
+            serviceability agent stopped needing it).  This helper scans
+            candidate 8-byte-aligned slots inside the given probe Method,
+            dereferences each one, and treats the target as an
+            AdapterHandlerEntry candidate.  Each candidate is validated
+            by reading the AHE's exported _c2i_entry / _i2c_entry slots
+            and verifying both point into executable memory (the code
+            cache).  Returns the byte offset within Method where _adapter
+            lives, or 0 on failure.
+
+            Defined out-of-line below the method struct so it can call
+            into the method's own getters.
+
+            Exception safety: noexcept.
+        */
+        inline auto detect_adapter_offset_from_method(method* probe) noexcept
+            -> std::size_t;
+
         /*
             @brief Represents a HotSpot internal Method object.
             @details
@@ -2205,17 +2229,49 @@ namespace vmhook
                 @brief Returns the AdapterHandlerEntry* (_adapter field).
                 @details Stores the calling-convention adapters (i2c / c2i) for this method.
                          Used to obtain the c2i entry when deoptimising a compiled method.
+
+                JDK 8 exports Method::_adapter via gHotSpotVMStructs and the
+                first branch returns immediately.  JDK 9+ dropped the field
+                from VMStructs (SA stopped needing it), so the second
+                branch falls back to a heuristic offset detection that
+                scans candidate slots in this Method, dereferences each,
+                and accepts the first one whose target looks like an
+                AdapterHandlerEntry (validated by reading the AHE's
+                exported _c2i_entry / _i2c_entry and checking they point
+                to executable memory).  The detected offset is cached
+                process-wide on first success.
             */
             auto get_adapter() const noexcept
                 -> void*
             {
-                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("Method", "_adapter") };
-                if (!entry)
+                // Fast path: VMStructs export (JDK 8).
+                static const vmhook::hotspot::vm_struct_entry_t* const exported_entry{
+                    vmhook::hotspot::iterate_struct_entries("Method", "_adapter") };
+                if (exported_entry)
+                {
+                    return *reinterpret_cast<void**>(
+                        reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this))
+                        + exported_entry->offset);
+                }
+
+                // Slow path: JDK 9+ — heuristic detection cached after first success.
+                // 0 means "not yet detected"; SIZE_MAX means "detection failed".
+                static std::atomic<std::size_t> cached_offset{ 0 };
+                std::size_t offset{ cached_offset.load(std::memory_order_acquire) };
+                if (offset == 0)
+                {
+                    offset = vmhook::hotspot::detect_adapter_offset_from_method(
+                        const_cast<vmhook::hotspot::method*>(this));
+                    cached_offset.store(offset == 0 ? static_cast<std::size_t>(-1) : offset,
+                                        std::memory_order_release);
+                }
+                if (offset == 0 || offset == static_cast<std::size_t>(-1))
                 {
                     return nullptr;
                 }
-
-                return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this)) + entry->offset);
+                return *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(const_cast<vmhook::hotspot::method*>(this))
+                    + offset);
             }
         };
 
@@ -5342,6 +5398,159 @@ namespace vmhook
 
             return *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(adapter) + entry->offset);
         }
+
+        /*
+            @brief Validates that a candidate pointer looks like an AdapterHandlerEntry.
+            @details
+            Reads two slots inside the candidate at offsets known from
+            VMStructs (_i2c_entry at offset 0 of every AHE layout we've
+            seen, plus _c2i_entry at the exported offset) and confirms
+            both point into executable memory.  Real AHE instances always
+            satisfy this because their entries live in HotSpot's code
+            cache, while random non-AHE pointers fail it with very high
+            probability (a stray pointer that points at three consecutive
+            executable-region pointers is astronomically unlikely).
+
+            @param candidate            Pointer treated as a possible AdapterHandlerEntry*.
+            @param c2i_offset_in_ahe    Byte offset of _c2i_entry within the AHE.
+        */
+        inline auto validate_adapter_handler_entry(void* const candidate, const std::size_t c2i_offset_in_ahe) noexcept
+            -> bool
+        {
+            if (!candidate || !vmhook::hotspot::is_readable_pointer(candidate))
+            {
+                return false;
+            }
+            // _i2c_entry lives at offset 0 of AdapterHandlerEntry across every
+            // JDK we support (the field is the first non-inherited member).
+            void* i2c{};
+            std::memcpy(&i2c, candidate, sizeof(i2c));
+            if (!i2c || !vmhook::hotspot::is_readable_pointer(i2c))
+            {
+                return false;
+            }
+            void* c2i{};
+            std::memcpy(&c2i, reinterpret_cast<const std::uint8_t*>(candidate) + c2i_offset_in_ahe, sizeof(c2i));
+            if (!c2i || !vmhook::hotspot::is_readable_pointer(c2i))
+            {
+                return false;
+            }
+            // Both entries must point into executable memory (the code
+            // cache).  query_region returns the page protection flags;
+            // we require X to be set on both pages.
+            const vmhook::os::region_info i2c_region{ vmhook::os::query_region(i2c) };
+            const vmhook::os::region_info c2i_region{ vmhook::os::query_region(c2i) };
+            return i2c_region.committed && i2c_region.executable
+                && c2i_region.committed && c2i_region.executable;
+        }
+
+        /*
+            @brief Out-of-line definition of detect_adapter_offset_from_method.
+            @details
+            Tries the slot immediately preceding _from_compiled_entry first
+            (the layout that HotSpot has used since JDK 17 keeps _adapter
+            adjacent to _from_compiled_entry).  If that doesn't validate,
+            falls back to a full scan over Method bytes, skipping the slots
+            corresponding to other known Method fields so we don't
+            mistakenly pick e.g. _constMethod or _code.
+        */
+        inline auto detect_adapter_offset_from_method(method* const probe) noexcept
+            -> std::size_t
+        {
+            if (!probe || !vmhook::hotspot::is_valid_pointer(probe))
+            {
+                return 0;
+            }
+            static const vmhook::hotspot::vm_struct_entry_t* const c2i_field{
+                vmhook::hotspot::iterate_struct_entries("AdapterHandlerEntry", "_c2i_entry") };
+            if (!c2i_field)
+            {
+                return 0;  // Cannot validate without _c2i_entry offset.
+            }
+            const std::size_t c2i_offset{ static_cast<std::size_t>(c2i_field->offset) };
+
+            std::uint8_t* const probe_bytes{ reinterpret_cast<std::uint8_t*>(probe) };
+
+            auto try_offset = [&](const std::size_t offset) noexcept -> bool
+                {
+                    void* candidate{};
+                    std::memcpy(&candidate, probe_bytes + offset, sizeof(candidate));
+                    return validate_adapter_handler_entry(candidate, c2i_offset);
+                };
+
+            // Build the skip set of well-known Method field offsets so the
+            // scan doesn't dereference _constMethod / _code / etc. as if
+            // they were adapter pointers.
+            std::array<std::size_t, 8> skip_offsets{};
+            std::size_t skip_count{ 0 };
+            auto add_skip = [&](const char* const field_name) noexcept
+                {
+                    if (skip_count >= skip_offsets.size()) return;
+                    if (const auto* const entry{ vmhook::hotspot::iterate_struct_entries("Method", field_name) })
+                    {
+                        skip_offsets[skip_count++] = static_cast<std::size_t>(entry->offset);
+                    }
+                };
+            add_skip("_constMethod");
+            add_skip("_method_data");
+            add_skip("_method_counters");
+            add_skip("_code");
+            add_skip("_i2i_entry");
+            add_skip("_from_interpreted_entry");
+
+            // Preferred guess: the slot just before _from_compiled_entry
+            // (or its JDK 21+ alias _from_compiled_code_entry_point).
+            // Validate it before committing.
+            const auto* fce_entry{ vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_code_entry_point") };
+            if (!fce_entry)
+            {
+                fce_entry = vmhook::hotspot::iterate_struct_entries("Method", "_from_compiled_entry");
+            }
+            if (fce_entry && fce_entry->offset >= sizeof(void*))
+            {
+                const std::size_t guess{ static_cast<std::size_t>(fce_entry->offset) - sizeof(void*) };
+                if (try_offset(guess))
+                {
+                    return guess;
+                }
+            }
+
+            // Method object size — used as an upper bound for the scan.
+            // VMTypes carries the size for every exported type; if Method
+            // itself isn't in VMTypes (rare), cap at 512 bytes which is
+            // generous for every JDK we've seen.
+            std::size_t method_size{ 512 };
+            if (const auto* const type{ vmhook::hotspot::iterate_type_entries("Method") })
+            {
+                if (type->size > 0 && type->size < 4096)
+                {
+                    method_size = static_cast<std::size_t>(type->size);
+                }
+            }
+
+            for (std::size_t offset{ 0 }; offset + sizeof(void*) <= method_size; offset += sizeof(void*))
+            {
+                bool skip{ false };
+                for (std::size_t i{ 0 }; i < skip_count; ++i)
+                {
+                    if (offset == skip_offsets[i])
+                    {
+                        skip = true;
+                        break;
+                    }
+                }
+                if (skip)
+                {
+                    continue;
+                }
+                if (try_offset(offset))
+                {
+                    return offset;
+                }
+            }
+
+            return 0;
+        }
     }
 
     namespace detail
@@ -6660,30 +6869,45 @@ namespace vmhook
             // Limitation: compiled callers with stale monomorphic inline caches still call
             //             the old nmethod directly.  Those caches will be repaired the next
             //             time HotSpot reaches a safe point and re-evaluates the IC.
+            //
+            // c2i adapter recovery: JDK 8 exports Method::_adapter via
+            // VMStructs; JDK 9+ removed it.  Method::get_adapter() now
+            // falls back to a heuristic scan that recovers the same
+            // pointer on JDK 17/21/24/25 (see detect_adapter_offset_from_method).
+            // If that scan ALSO fails (no JDK has been observed in this
+            // state, but we handle it conservatively), we skip the
+            // deoptimisation entirely rather than leave the JVM in an
+            // inconsistent state where _code == nullptr but
+            // _from_compiled_entry still points into the (now stale)
+            // nmethod — that combination crashes at the next safepoint.
             if (was_compiled)
             {
                 void* const adapter{ found_method->get_adapter() };
                 void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
-                // 1. Redirect interpreted callers to the (now-patched) i2i stub.
-                found_method->set_from_interpreted_entry(i2i);
 
-                // 2. Redirect compiled callers through the c2i adapter  interpreter  i2i stub.
                 if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                 {
+                    // 1. Redirect interpreted callers to the (now-patched) i2i stub.
+                    found_method->set_from_interpreted_entry(i2i);
+                    // 2. Redirect compiled callers through the c2i adapter -> interpreter -> i2i stub.
                     found_method->set_from_compiled_entry(c2i_entry);
-                    VMHOOK_LOG("{} hook():   _from_compiled_entry -> c2i @ 0x{:016X}", vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
+                    // 3. Clear _code last so the above entry-point writes are visible first.
+                    found_method->set_code(nullptr);
+                    VMHOOK_LOG("{} hook():   deopt complete - _from_compiled_entry -> c2i @ 0x{:016X}, _code cleared.",
+                               vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
                 }
                 else
                 {
-                    // Do not point compiled callers directly at i2i: the compiled-call ABI
-                    // expects a c2i adapter. Leaving this entry unchanged is safer; once
-                    // _code is cleared, normal interpreted dispatch reaches the hook.
-                    VMHOOK_LOG("{} hook():   c2i adapter unavailable; leaving _from_compiled_entry unchanged.", vmhook::info_tag);
+                    // No adapter pointer recoverable — refuse to deopt rather than
+                    // crash the JVM at the next safepoint.  The hook is still
+                    // installed on the i2i stub, so calls made through the
+                    // interpreter will hit it; calls dispatched by the existing
+                    // nmethod (and any nmethod that inlined this method) will
+                    // bypass the hook until they're naturally invalidated.
+                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; leaving method JIT-compiled. "
+                               "Calls that reach the interpreter will still hit the hook; calls dispatched "
+                               "by the existing nmethod will bypass it.", vmhook::error_tag, method_name);
                 }
-
-                // 3. Clear _code last so the above entry-point writes are visible first.
-                found_method->set_code(nullptr);
-                VMHOOK_LOG("{} hook():   _code cleared - method running via interpreter.", vmhook::info_tag);
             }
 
             return true;
@@ -6702,8 +6926,19 @@ namespace vmhook
         Phase 2: Clears _dont_inline and NO_COMPILE flags.
         Phase 3: For methods that were JIT-compiled at hook-install time, restores the original
                  entry points and re-links _code so the nmethod is active again.
-        Order within phase 3:  entry points first, then _code - this ensures callers have a valid
-        destination before the JVM re-enables compiled dispatch.
+
+        Order within phase 3 matters because another Java thread may
+        observe a partially-restored Method at any safepoint:
+
+          1.  set_code(original_code)            re-link the nmethod first
+          2.  set_from_compiled_entry(original)  compiled callers now reach the nmethod
+          3.  set_from_interpreted_entry(orig)   interpreted callers reach the i2c adapter
+
+        The previous order (entries then _code) opened a window in which
+        _code was still nullptr while _from_compiled_entry already pointed
+        at the old nmethod's verified-entry — the JVM's internal sanity
+        check (nmethod-pointer vs entry-point consistency) trips that
+        window with EXCEPTION_ACCESS_VIOLATION at the next safepoint.
     */
     static auto shutdown_hooks() noexcept
         -> void
@@ -6725,17 +6960,27 @@ namespace vmhook
 
             if (hooked_method_entry.was_compiled)
             {
+                // 1. Re-link the nmethod first so _code is consistent with
+                //    whatever _from_compiled_entry was at install time.
+                if (hooked_method_entry.original_code)
+                {
+                    hooked_method_entry.method->set_code(hooked_method_entry.original_code);
+                }
+                // 2. Restore the compiled-side entry so compiled callers
+                //    that were re-routed through the c2i adapter at install
+                //    now hit the original nmethod entry again.
                 if (hooked_method_entry.original_from_compiled_entry)
                 {
                     hooked_method_entry.method->set_from_compiled_entry(hooked_method_entry.original_from_compiled_entry);
                 }
+                // 3. Restore the interpreted-side entry last; until this
+                //    write completes, interpreted callers still reach our
+                //    patched i2i, which is correct because the trampoline
+                //    has been freed above (any pending in-flight calls
+                //    finish on the old, already-restored bytes).
                 if (hooked_method_entry.original_from_interpreted_entry)
                 {
                     hooked_method_entry.method->set_from_interpreted_entry(hooked_method_entry.original_from_interpreted_entry);
-                }
-                if (hooked_method_entry.original_code)
-                {
-                    hooked_method_entry.method->set_code(hooked_method_entry.original_code);
                 }
             }
         }
@@ -6779,6 +7024,15 @@ namespace vmhook
             }
             if (entry_it->was_compiled)
             {
+                // Same ordering as shutdown_hooks: re-link _code first so
+                // the JVM never observes a window with _code == nullptr
+                // and a stale _from_compiled_entry pointing into the
+                // (still-resident) nmethod — that combo trips the internal
+                // sanity check at the next safepoint.
+                if (entry_it->original_code)
+                {
+                    entry_it->method->set_code(entry_it->original_code);
+                }
                 if (entry_it->original_from_compiled_entry)
                 {
                     entry_it->method->set_from_compiled_entry(entry_it->original_from_compiled_entry);
@@ -6786,10 +7040,6 @@ namespace vmhook
                 if (entry_it->original_from_interpreted_entry)
                 {
                     entry_it->method->set_from_interpreted_entry(entry_it->original_from_interpreted_entry);
-                }
-                if (entry_it->original_code)
-                {
-                    entry_it->method->set_code(entry_it->original_code);
                 }
             }
 
