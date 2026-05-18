@@ -81,6 +81,7 @@
     VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_MINOR) "."        \
     VMHOOK_VERSION_STRING_HELPER(VMHOOK_VERSION_PATCH)
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
