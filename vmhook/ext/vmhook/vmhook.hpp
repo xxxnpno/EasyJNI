@@ -8653,45 +8653,6 @@ namespace vmhook
               "L"/"["  uint32_t (compressed OOP)
             The returned value is a copy - safe to store and return from methods.
         */
-        /*
-            @brief Typed read: returns the field as the requested target type.
-            @details
-            Convenience overload of get() that routes through value_t's implicit
-            conversion operator.  Lets callers write a concrete C++ type at the
-            call site instead of going through `value_t -> target` deduction
-            via implicit conversion:
-
-                auto raw  = proxy->get();                          // value_t
-                auto i    = proxy->get<std::int32_t>();            // typed
-                auto wrap = proxy->get<std::unique_ptr<my_t>>();   // wrapped OOP
-
-            For `std::unique_ptr<wrapper>` targets the underlying OOP is decoded
-            and a new wrapper instance is constructed — this is how vmhook::list,
-            vmhook::map, etc. are obtained from a field without going through
-            register_class<>() for the container itself.
-
-            Returns a value-initialised target_type when the field pointer is
-            null or the conversion cannot succeed.
-        */
-        template<typename target_type>
-        auto get() const noexcept
-            -> target_type
-        {
-            // Copy-init through a named local so every supported compiler
-            // resolves the templated conversion operator on value_t the
-            // same way:
-            //   * static_cast<T>(value_t) is rejected by MSVC for move-only T
-            //     because it does not consider templated user-defined
-            //     conversion operators in static_cast contexts.
-            //   * .template operator T() is rejected by Clang in dependent
-            //     contexts (it treats `operator T` as a non-template-name).
-            //   * Copy-init from a value_t to a named T (and then a return)
-            //     goes through the standard implicit-conversion path that
-            //     all three accept.
-            target_type result = this->get();
-            return result;
-        }
-
         auto get() const noexcept
             -> value_t
         {
@@ -10539,6 +10500,23 @@ namespace vmhook
         return reinterpret_cast<vmhook::hotspot::klass*>(decoded);
     }
 
+    // Forward declarations of the templated walk helpers used by
+    // collection::to_vector below.  The bodies live further down in this
+    // header (after the wrapper classes) so they can be reused by every
+    // wrapper that inherits from collection.  Declaring them up here lets
+    // GCC's first-phase lookup find the qualified names inside the
+    // templated collection::to_vector body.
+    template<typename element_type, typename out_t>
+    inline auto linked_list_walk_items(void* list_oop, std::int32_t size, out_t& out) -> void;
+    template<typename key_type, typename value_type, typename out_t>
+    inline auto hash_map_walk_entries(void* map_oop, out_t& out) -> void;
+    template<typename element_type, typename out_t>
+    inline auto hash_map_walk_keys(void* map_oop, out_t& out) -> void;
+    template<typename key_type, typename value_type, typename out_t>
+    inline auto tree_map_walk_entries(void* map_oop, out_t& out) -> void;
+    template<typename element_type, typename out_t>
+    inline auto tree_map_walk_keys(void* map_oop, out_t& out) -> void;
+
     /*
         @brief C++ wrapper for java.util.Collection objects.
 
@@ -10672,9 +10650,22 @@ namespace vmhook
         /*
             @brief Converts this java.util.Collection to a std::vector<std::unique_ptr<element_type>>.
             @details
-            Attempts the ArrayList fast path first: reads the "size" and "elementData" fields
-            directly from heap memory and decodes each compressed OOP element.
-            Falls back to calling the Java get(int) method for other implementations.
+            Picks the right fast path by probing the live OOP for the field
+            shape of each known container, in order of specificity:
+
+              1. ArrayList     ("elementData" + "size")  → direct array walk
+              2. LinkedList    ("first" + "size")        → Node first->next chain
+              3. HashSet       ("map")                   → walk backing HashMap.table keys
+              4. TreeSet       ("m")                     → walk backing TreeMap.root keys
+              5. Generic       (size() + get(int))       → only valid for List impls
+
+            The cascade is field-presence based, so it picks the right path
+            from the runtime klass without needing the caller to know which
+            wrapper type (collection / list / linked_list / set) to construct.
+            That means `field_proxy::get().to_vector<T>()` does the right
+            thing for ArrayList, LinkedList, HashSet, LinkedHashSet, TreeSet,
+            and any other Collection whose layout matches one of these.
+
             Null Java elements become nullptr entries in the returned vector.
 
             Complexity: O(N) where N = collection size.
@@ -10693,6 +10684,7 @@ namespace vmhook
                 return result;
             }
 
+            //  ArrayList fast path
             const auto size_opt{ get_field_by_oop_klass("size") };
             const auto data_opt{ get_field_by_oop_klass("elementData") };
 
@@ -10726,6 +10718,45 @@ namespace vmhook
                 }
             }
 
+            //  LinkedList fast path — walks the first->next Node chain.
+            const auto first_opt{ get_field_by_oop_klass("first") };
+            if (first_opt && size_opt)
+            {
+                const std::int32_t n{ size_opt->get() };
+                if (n > 0)
+                {
+                    vmhook::linked_list_walk_items<element_type>(this->instance, n, result);
+                }
+                return result;
+            }
+
+            //  HashSet / LinkedHashSet fast path — elements live as keys in
+            //  the backing HashMap held in field "map".
+            if (const auto map_field{ get_field_by_oop_klass("map") })
+            {
+                const std::uint32_t map_compressed{ static_cast<std::uint32_t>(map_field->get()) };
+                void* const map_oop{ vmhook::hotspot::decode_oop_pointer(map_compressed) };
+                if (map_oop && vmhook::hotspot::is_valid_pointer(map_oop))
+                {
+                    vmhook::hash_map_walk_keys<element_type>(map_oop, result);
+                }
+                return result;
+            }
+
+            //  TreeSet fast path — elements live as keys in the backing
+            //  NavigableMap (TreeMap) held in field "m".
+            if (const auto tree_field{ get_field_by_oop_klass("m") })
+            {
+                const std::uint32_t tree_compressed{ static_cast<std::uint32_t>(tree_field->get()) };
+                void* const tree_oop{ vmhook::hotspot::decode_oop_pointer(tree_compressed) };
+                if (tree_oop && vmhook::hotspot::is_valid_pointer(tree_oop))
+                {
+                    vmhook::tree_map_walk_keys<element_type>(tree_oop, result);
+                }
+                return result;
+            }
+
+            //  Generic fallback — only valid for List impls (Set has no get(int)).
             const std::int32_t n{ size() };
             if (n <= 0)
             {
@@ -10760,328 +10791,66 @@ namespace vmhook
     /*
         @brief C++ wrapper for java.util.List objects.
 
-        Provides to_vector<T>() which reads an ArrayList's backing array
-        directly from the JVM heap and returns a std::vector of unique_ptr<T>.
+        Type-tag for fields you know are Lists.  All container dispatch
+        already happens inside collection::to_vector<T>() (ArrayList,
+        LinkedList, HashSet, TreeSet fast paths plus the get(int)
+        fallback), so this class only exists so callers can express
+        intent — e.g. taking `const std::unique_ptr<vmhook::list>&` as a
+        hook detour parameter.
 
         Usage:
-
             // Java: public List<A> listOfAs;
-            auto vec = get_field("listOfAs")->get<std::unique_ptr<vmhook::list>>()
-                           ->to_vector<a_class>();
+            auto vec = get_field("listOfAs")->get().to_vector<a_class>();
             // vec is std::vector<std::unique_ptr<a_class>>
     */
     class list : public vmhook::collection
     {
     public:
-        /*
-            @brief Wraps a decoded OOP that refers to a java.util.List implementation.
-            @details
-            Inherits the collection(oop) constructor.  Adds a List-specific to_vector<T>()
-            that uses the ArrayList backing array fast path when available.
-
-            Exception safety: noexcept.
-            @param oop  Decoded OOP of the Java List object, or nullptr.
-        */
         explicit list(vmhook::oop_t oop) noexcept
             : vmhook::collection{ oop }
         {
         }
-
-        /*
-            @brief Converts this Java List to a std::vector<std::unique_ptr<T>>.
-            @tparam element_type  C++ wrapper class whose constructor accepts a
-                                  vmhook::oop_t (decoded Java object pointer).
-
-            Reads the ArrayList backing array directly from the JVM heap.
-            Null Java elements become nullptr entries in the returned vector.
-            Works on all Java versions supported by vmhook (824+).
-
-            For non-ArrayList implementations the method falls back to calling
-            the Java get(int) method for each index.
-        */
-        template<typename element_type>
-        auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
-        {
-            std::vector<std::unique_ptr<element_type>> result;
-
-            if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
-            {
-                return result;
-            }
-
-            //  ArrayList fast path
-            // ArrayList stores its live element count in a field named "size"
-            // and its backing Object[] in a field named "elementData".
-            const auto size_opt{ get_field_by_oop_klass("size") };
-            const auto data_opt{ get_field_by_oop_klass("elementData") };
-
-            if (size_opt && data_opt)
-            {
-                const std::int32_t n{ size_opt->get() };
-                if (n > 0)
-                {
-                    // elementData is stored as a compressed OOP (uint32_t)
-                    const std::uint32_t compressed_array{
-                        static_cast<std::uint32_t>(data_opt->get()) };
-                    void* const array_oop{ vmhook::decode_array_oop(compressed_array) };
-
-                    if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
-                    {
-                        result.reserve(static_cast<std::size_t>(n));
-                        for (std::int32_t i{ 0 }; i < n; ++i)
-                        {
-                            const std::uint32_t compressed_elem{
-                                vmhook::get_array_element<std::uint32_t>(array_oop, i) };
-                            void* const elem_oop{
-                                vmhook::hotspot::decode_oop_pointer(compressed_elem) };
-
-                            if (elem_oop && vmhook::hotspot::is_valid_pointer(elem_oop))
-                            {
-                                result.push_back(std::make_unique<element_type>(
-                                    static_cast<vmhook::oop_t>(elem_oop)));
-                            }
-                            else
-                            {
-                                result.push_back(nullptr);
-                            }
-                        }
-                        return result;
-                    }
-                }
-                else
-                {
-                    return result;  // empty list
-                }
-            }
-
-            //  Generic fallback: call Java List.get(int)
-            const std::int32_t n{ size() };
-            if (n <= 0)
-            {
-                return result;
-            }
-            result.reserve(static_cast<std::size_t>(n));
-
-            const auto get_method_opt{ get_method_by_oop_klass("get") };
-            if (!get_method_opt)
-            {
-                return result;
-            }
-
-            for (std::int32_t i{ 0 }; i < n; ++i)
-            {
-                const auto elem_val{ get_method_opt->call<std::uint32_t>(i) };
-                void* const elem_oop{ vmhook::hotspot::decode_oop_pointer(elem_val) };
-                if (elem_oop && vmhook::hotspot::is_valid_pointer(elem_oop))
-                {
-                    result.push_back(std::make_unique<element_type>(
-                        static_cast<vmhook::oop_t>(elem_oop)));
-                }
-                else
-                {
-                    result.push_back(nullptr);
-                }
-            }
-            return result;
-        }
     };
-
-    // Forward declarations for the templated walk helpers used inside
-    // set::to_vector and map::to_entries.  Bodies are defined a few hundred
-    // lines below, after both wrapper classes are complete; the forward
-    // decls let GCC's first-phase lookup find the qualified names.
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto hash_map_walk_entries(void* map_oop, out_t& out) -> void;
-    template<typename element_type, typename out_t>
-    inline auto hash_map_walk_keys(void* map_oop, out_t& out) -> void;
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto tree_map_walk_entries(void* map_oop, out_t& out) -> void;
-    template<typename element_type, typename out_t>
-    inline auto tree_map_walk_keys(void* map_oop, out_t& out) -> void;
 
     /*
         @brief C++ wrapper for java.util.Set objects.
 
-        Adds a HashSet/LinkedHashSet/TreeSet fast path on top of the
-        collection base.  Java's HashSet stores its elements as keys of an
-        internal HashMap held in a field named "map"; TreeSet uses a
-        NavigableMap held in a field named "m".  We walk that backing map
-        directly to extract elements without invoking Java iterators.
+        Type-tag, same role as vmhook::list.  HashSet / LinkedHashSet /
+        TreeSet fast paths are already part of collection::to_vector, so
+        a Set field reached through `field_proxy::get().to_vector<T>()`
+        already takes the right path.
 
         Usage:
             // Java: public Set<A> setOfAs;
-            auto vec = get_field("setOfAs")->get<std::unique_ptr<vmhook::set>>()
-                           ->to_vector<a_class>();
+            auto vec = get_field("setOfAs")->get().to_vector<a_class>();
     */
     class set : public vmhook::collection
     {
     public:
-        /*
-            @brief Wraps a decoded OOP that refers to a java.util.Set implementation.
-            @param oop  Decoded OOP of the Java Set object, or nullptr.
-        */
         explicit set(vmhook::oop_t oop) noexcept
             : vmhook::collection{ oop }
         {
-        }
-
-        /*
-            @brief Converts this Java Set to a std::vector<std::unique_ptr<T>>.
-            @details
-            Tries the HashSet fast path first: reads the internal HashMap from
-            the "map" field, then walks its "table" Node[] bucket-chain and
-            extracts each Node's "key" (Set elements are stored as HashMap
-            keys).  Also handles TreeSet via the "m" field (NavigableMap),
-            walking its red-black "root" in-order.
-
-            Falls back to vmhook::collection::to_vector<T>() for unrecognised
-            implementations.  The base fallback uses Java get(int), which
-            does not exist on Set — so non-Hash/Tree set types return an
-            empty vector.
-
-            Null Java elements become nullptr entries in the returned vector.
-
-            @tparam element_type  C++ wrapper whose constructor accepts vmhook::oop_t.
-        */
-        template<typename element_type>
-        auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
-        {
-            std::vector<std::unique_ptr<element_type>> result;
-            if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
-            {
-                return result;
-            }
-
-            //  HashSet/LinkedHashSet fast path
-            // Backing storage lives in HashSet.map (a HashMap<E, Object>).
-            // Set elements are the keys of that map.
-            if (const auto map_field{ get_field_by_oop_klass("map") })
-            {
-                const std::uint32_t map_compressed{ static_cast<std::uint32_t>(map_field->get()) };
-                void* const map_oop{ vmhook::hotspot::decode_oop_pointer(map_compressed) };
-                if (map_oop && vmhook::hotspot::is_valid_pointer(map_oop))
-                {
-                    vmhook::hash_map_walk_keys<element_type>(map_oop, result);
-                    return result;
-                }
-            }
-
-            //  TreeSet fast path
-            // Backing storage lives in TreeSet.m (a NavigableMap, typically TreeMap).
-            if (const auto tree_field{ get_field_by_oop_klass("m") })
-            {
-                const std::uint32_t tree_compressed{ static_cast<std::uint32_t>(tree_field->get()) };
-                void* const tree_oop{ vmhook::hotspot::decode_oop_pointer(tree_compressed) };
-                if (tree_oop && vmhook::hotspot::is_valid_pointer(tree_oop))
-                {
-                    vmhook::tree_map_walk_keys<element_type>(tree_oop, result);
-                    return result;
-                }
-            }
-
-            // Fall back to the generic collection path (only useful for impls
-            // whose entries are reachable through get(int) — rare for Set).
-            return vmhook::collection::to_vector<element_type>();
         }
     };
 
     /*
         @brief C++ wrapper for java.util.LinkedList objects.
 
-        Adds a Node-chain fast path on top of vmhook::list so to_vector<T>()
-        runs in O(N) instead of the O(N²) get(int) fallback that the list
-        base would otherwise use for LinkedList (LinkedList.get(int) walks
-        from the nearest end on every call).
+        Type-tag, same role as vmhook::list.  The Node first->next walk
+        lives in collection::to_vector, so `get().to_vector<T>()` runs
+        in O(N) regardless of which wrapper the field signature happens
+        to bind to.
 
         Usage:
             // Java: public LinkedList<A> chainOfAs;
-            auto vec = get_field("chainOfAs")->get<std::unique_ptr<vmhook::linked_list>>()
-                           ->to_vector<a_class>();
+            auto vec = get_field("chainOfAs")->get().to_vector<a_class>();
     */
     class linked_list : public vmhook::list
     {
     public:
-        /*
-            @brief Wraps a decoded OOP that refers to a java.util.LinkedList.
-            @param oop  Decoded OOP of the Java LinkedList object, or nullptr.
-        */
         explicit linked_list(vmhook::oop_t oop) noexcept
             : vmhook::list{ oop }
         {
-        }
-
-        /*
-            @brief Converts this Java LinkedList to a std::vector<std::unique_ptr<T>>.
-            @details
-            Reads LinkedList.first (head Node<E>) and walks the "next" chain,
-            extracting each Node's "item".  Falls back to vmhook::list::to_vector<T>()
-            if the field layout is unrecognised (e.g. a wrapped CopyOnWriteArrayList
-            slipped past type checks).
-
-            Null Java elements become nullptr entries in the returned vector.
-        */
-        template<typename element_type>
-        auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
-        {
-            std::vector<std::unique_ptr<element_type>> result;
-            if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
-            {
-                return result;
-            }
-
-            const auto first_field{ get_field_by_oop_klass("first") };
-            const auto size_field { get_field_by_oop_klass("size") };
-            if (!first_field || !size_field)
-            {
-                return vmhook::list::to_vector<element_type>();
-            }
-
-            const std::int32_t n{ size_field->get() };
-            if (n <= 0)
-            {
-                return result;
-            }
-            result.reserve(static_cast<std::size_t>(n));
-
-            const std::uint32_t first_compressed{ static_cast<std::uint32_t>(first_field->get()) };
-            void* node_oop{ vmhook::hotspot::decode_oop_pointer(first_compressed) };
-
-            // Safety cap: never walk more nodes than `size` claims, even if
-            // the chain is somehow longer (corrupt / concurrent mutation).
-            for (std::int32_t i{ 0 }; i < n && node_oop && vmhook::hotspot::is_valid_pointer(node_oop); ++i)
-            {
-                vmhook::hotspot::klass* const node_klass{ vmhook::klass_from_oop(node_oop) };
-                if (!node_klass)
-                {
-                    break;
-                }
-
-                const auto item_entry{ vmhook::find_field(node_klass, "item") };
-                const auto next_entry{ vmhook::find_field(node_klass, "next") };
-                if (!item_entry || !next_entry)
-                {
-                    break;
-                }
-
-                const std::uint32_t item_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + item_entry->offset) };
-                void* const item_oop{ vmhook::hotspot::decode_oop_pointer(item_compressed) };
-                if (item_oop && vmhook::hotspot::is_valid_pointer(item_oop))
-                {
-                    result.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(item_oop)));
-                }
-                else
-                {
-                    result.push_back(nullptr);
-                }
-
-                const std::uint32_t next_compressed{
-                    *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(node_oop) + next_entry->offset) };
-                node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
-            }
-            return result;
         }
     };
 
@@ -11255,12 +11024,15 @@ namespace vmhook
     /*
         @brief C++ wrapper for java.util.HashMap objects.
 
-        Identical entry-walking logic to vmhook::map (which already handles
-        HashMap via its "table" fast path), but documents the intended use
-        and keeps the type system explicit so callers can declare exactly
-        what shape they expect.  Also covers LinkedHashMap by inheritance —
-        LinkedHashMap reuses HashMap.table, just adds a doubly-linked
-        iteration order through Node.before/Node.after.
+        Type-tag, same role as vmhook::list.  All entry-walking logic
+        already lives in vmhook::map::to_entries (HashMap "table" path
+        then TreeMap "root" path), so `get_field("foo")->get()
+        .to_entries<K, V>()` already does the right thing.  This class
+        exists so callers can declare intent — e.g. a detour parameter
+        of type `const std::unique_ptr<vmhook::hash_map>&`.  Covers
+        LinkedHashMap by inheritance (LinkedHashMap reuses
+        HashMap.table; only the iteration order differs, via
+        Node.before / Node.after).
     */
     class hash_map : public vmhook::map
     {
@@ -11271,11 +11043,79 @@ namespace vmhook
         }
     };
 
-    // --- Map / Set walk helpers ----------------------------------------------
+    // --- Collection / Map / Set walk helpers --------------------------------
     //
     // Templated free helpers used by the wrappers above.  Defined out-of-line
-    // so they can reference vmhook::map (complete by this point) and so that
-    // the set wrapper can call them without depending on hash_map's identity.
+    // so they can reference vmhook::map (complete by this point) and so the
+    // collection / set / map wrappers can all reuse the same traversal code
+    // without depending on each other's identity.
+
+    /*
+        @brief Walks a LinkedList's first->next Node chain and appends items.
+        @details
+        Reads the Node klass once per node (HotSpot guarantees every node
+        in a single list shares the same concrete klass), then offsets into
+        each node by the cached "item" and "next" field offsets.  The `size`
+        argument bounds the walk so a corrupt or concurrently-mutated chain
+        cannot loop forever; null `item`s become nullptr entries in `out`.
+    */
+    template<typename element_type, typename out_t>
+    inline auto linked_list_walk_items(void* const list_oop, const std::int32_t size, out_t& out) -> void
+    {
+        if (!list_oop || !vmhook::hotspot::is_valid_pointer(list_oop) || size <= 0)
+        {
+            return;
+        }
+        vmhook::hotspot::klass* const list_klass{ vmhook::klass_from_oop(list_oop) };
+        if (!list_klass)
+        {
+            return;
+        }
+        const auto first_entry{ vmhook::find_field(list_klass, "first") };
+        if (!first_entry)
+        {
+            return;
+        }
+        const std::uint32_t first_compressed{
+            *reinterpret_cast<const std::uint32_t*>(
+                reinterpret_cast<const std::uint8_t*>(list_oop) + first_entry->offset) };
+        void* node_oop{ vmhook::hotspot::decode_oop_pointer(first_compressed) };
+
+        out.reserve(static_cast<std::size_t>(size));
+        for (std::int32_t i{ 0 };
+             i < size && node_oop && vmhook::hotspot::is_valid_pointer(node_oop);
+             ++i)
+        {
+            vmhook::hotspot::klass* const node_klass{ vmhook::klass_from_oop(node_oop) };
+            if (!node_klass)
+            {
+                break;
+            }
+            const auto item_entry{ vmhook::find_field(node_klass, "item") };
+            const auto next_entry{ vmhook::find_field(node_klass, "next") };
+            if (!item_entry || !next_entry)
+            {
+                break;
+            }
+            const std::uint32_t item_compressed{
+                *reinterpret_cast<const std::uint32_t*>(
+                    reinterpret_cast<const std::uint8_t*>(node_oop) + item_entry->offset) };
+            void* const item_oop{ vmhook::hotspot::decode_oop_pointer(item_compressed) };
+            if (item_oop && vmhook::hotspot::is_valid_pointer(item_oop))
+            {
+                out.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(item_oop)));
+            }
+            else
+            {
+                out.push_back(nullptr);
+            }
+
+            const std::uint32_t next_compressed{
+                *reinterpret_cast<const std::uint32_t*>(
+                    reinterpret_cast<const std::uint8_t*>(node_oop) + next_entry->offset) };
+            node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
+        }
+    }
 
     /*
         @brief Walks a HashMap's "table" Node[] and appends entries to `out`.

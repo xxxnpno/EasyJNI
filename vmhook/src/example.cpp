@@ -1059,10 +1059,9 @@ public:
     auto get_linked_list_of_as()
         -> std::vector<std::unique_ptr<a_class>>
     {
-        // Wrap explicitly as linked_list so the Node-chain fast path is used
-        // instead of the inherited list ArrayList path or the O(N^2) fallback.
-        return get_field("linkedListOfAs")->get<std::unique_ptr<vmhook::linked_list>>()
-                   ->to_vector<a_class>();
+        // collection::to_vector probes the live OOP and picks the LinkedList
+        // Node-chain fast path automatically; no need to name a wrapper type.
+        return get_field("linkedListOfAs")->get().to_vector<a_class>();
     }
 
     static auto get_set_probe_requested() -> bool { return static_field("setProbeRequested")->get(); }
@@ -1073,8 +1072,9 @@ public:
     auto get_set_of_as()
         -> std::vector<std::unique_ptr<a_class>>
     {
-        return get_field("setOfAs")->get<std::unique_ptr<vmhook::set>>()
-                   ->to_vector<a_class>();
+        // HashSet path inside collection::to_vector reads the backing
+        // "map" field and walks its table for keys.
+        return get_field("setOfAs")->get().to_vector<a_class>();
     }
 
     static auto get_map_probe_requested() -> bool { return static_field("mapProbeRequested")->get(); }
@@ -1107,17 +1107,17 @@ public:
     auto get_hash_map_of_as_entries()
         -> std::vector<std::pair<std::unique_ptr<vmhook::object<>>, std::unique_ptr<a_class>>>
     {
-        // Construct vmhook::hash_map explicitly so the typed wrapper path is
-        // covered in addition to the field_proxy::to_entries flow above.
-        return get_field("hashMapOfAs")->get<std::unique_ptr<vmhook::hash_map>>()
-                   ->to_entries<vmhook::object<>, a_class>();
+        // value_t::to_entries wraps in vmhook::map, which probes the live
+        // OOP and picks the HashMap "table" walk automatically.
+        return get_field("hashMapOfAs")->get().to_entries<vmhook::object<>, a_class>();
     }
 
     auto get_tree_map_of_as_entries()
         -> std::vector<std::pair<std::unique_ptr<vmhook::object<>>, std::unique_ptr<a_class>>>
     {
-        return get_field("treeMapOfAs")->get<std::unique_ptr<vmhook::map>>()
-                   ->to_entries<vmhook::object<>, a_class>();
+        // Same call site as hashMapOfAs; map::to_entries falls through to the
+        // TreeMap "root" red-black walk when "table" isn't present.
+        return get_field("treeMapOfAs")->get().to_entries<vmhook::object<>, a_class>();
     }
 
     // Poly probe

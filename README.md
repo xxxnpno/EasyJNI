@@ -272,38 +272,45 @@ static auto reset_global_state()
 
 ## Collections and maps
 
-vmhook ships ready-made wrappers for the common `java.util` containers so
-hook detours and field reads can convert a Java reference to a native
-`std::vector` (or `std::vector<std::pair<...>>` for maps) in one line.
-Every wrapper reads HotSpot heap layout directly — no JNI round-trip, no
-`register_class<>()` for the container itself.
-
-| Wrapper                | Covers                                       | Fast path                                                 |
-|------------------------|----------------------------------------------|-----------------------------------------------------------|
-| `vmhook::collection`   | any `java.util.Collection`                   | ArrayList `elementData`, otherwise `size()` + `get(int)`  |
-| `vmhook::list`         | `java.util.List`                             | ArrayList `elementData`                                   |
-| `vmhook::linked_list`  | `java.util.LinkedList`                       | `first → next` Node chain (O(N) instead of O(N²))         |
-| `vmhook::set`          | `HashSet`, `LinkedHashSet`, `TreeSet`        | backing `map.table` / `m.root`                            |
-| `vmhook::map`          | any `java.util.Map`                          | HashMap `table` then TreeMap `root` walk                  |
-| `vmhook::hash_map`     | `HashMap`, `LinkedHashMap`                   | `table` bucket-chain walk                                 |
-
-Read a field directly:
+vmhook converts a Java container field to a native `std::vector` (or
+`std::vector<std::pair<...>>` for maps) in one line.  Two entry points
+do all the work; both probe the live OOP and pick the right HotSpot
+layout walk automatically.  No template argument on `get()` — the field
+signature plus the runtime klass tell vmhook which fast path to take.
 
 ```cpp
-// Java:  public List<A> listOfAs;
-auto vec = get_field("listOfAs")->get().to_vector<a_class>();
-
-// Java:  public LinkedList<A> chainOfAs;
-auto vec = get_field("chainOfAs")
-               ->get<std::unique_ptr<vmhook::linked_list>>()
-               ->to_vector<a_class>();
-
-// Java:  public HashMap<String, A> mapOfAs;
-auto pairs = get_field("mapOfAs")->get().to_entries<string_w, a_class>();
-// pairs is std::vector<std::pair<unique_ptr<string_w>, unique_ptr<a_class>>>
+auto vec   = get_field("foo")->get().to_vector<T>();        // Collection / List / Set
+auto pairs = get_field("bar")->get().to_entries<K, V>();    // Map
 ```
 
-Or wrap an OOP you already received from a hook:
+| Java field type                              | Fast path used inside `to_vector` / `to_entries`              |
+|----------------------------------------------|---------------------------------------------------------------|
+| `ArrayList<E>` / any `List<E>` with `elementData` | Direct read of the backing `Object[]`                    |
+| `LinkedList<E>`                              | `first → next` Node-chain walk (O(N) instead of O(N²))        |
+| `HashSet<E>` / `LinkedHashSet<E>`            | Backing `HashMap.table` bucket walk, keys collected           |
+| `TreeSet<E>`                                 | Backing `TreeMap.root` in-order walk, keys collected          |
+| Any other `Collection<E>`                    | `size()` + `get(int)` Java-side calls (only valid for List)   |
+| `HashMap<K,V>` / `LinkedHashMap<K,V>`        | `table` bucket walk over `Node{key, value, next}`             |
+| `TreeMap<K,V>`                               | `root` red-black in-order walk                                |
+
+End-to-end examples:
+
+```cpp
+// Java:  public List<A>           listOfAs;
+// Java:  public LinkedList<A>     chainOfAs;
+// Java:  public HashSet<A>        setOfAs;
+// Java:  public HashMap<String,A> mapOfAs;
+// Java:  public TreeMap<String,A> treeMapOfAs;
+
+auto v1     = get_field("listOfAs")   ->get().to_vector<a_class>();
+auto v2     = get_field("chainOfAs")  ->get().to_vector<a_class>();
+auto v3     = get_field("setOfAs")    ->get().to_vector<a_class>();
+auto pairs1 = get_field("mapOfAs")    ->get().to_entries<string_w, a_class>();
+auto pairs2 = get_field("treeMapOfAs")->get().to_entries<string_w, a_class>();
+```
+
+The same flow works inside a hook detour — declare a wrapper-typed
+parameter to express intent, then call `to_vector` / `to_entries`:
 
 ```cpp
 vmhook::hook<example_class>("acceptMap",
@@ -318,9 +325,15 @@ vmhook::hook<example_class>("acceptMap",
     });
 ```
 
-`to_vector` / `to_entries` return empty containers (never throw) when the
-container is null, the layout is unrecognised, or the field is missing.
-Null Java elements become `nullptr` slots in the result.
+`vmhook::list`, `vmhook::linked_list`, `vmhook::set`, `vmhook::map`,
+and `vmhook::hash_map` are thin type tags — they exist so callers can
+declare exactly what shape they expect (especially as hook parameters);
+the actual heap-layout dispatch always happens in
+`collection::to_vector` and `map::to_entries`.
+
+`to_vector` / `to_entries` return empty containers (never throw) when
+the container is null, the layout is unrecognised, or the field is
+missing.  Null Java elements become `nullptr` slots in the result.
 
 ## Hooks
 

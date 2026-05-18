@@ -115,18 +115,14 @@ static auto exercise_collection_wrappers() -> void
 
 static auto exercise_field_proxy_entrypoints() -> void
 {
-    // field_proxy::get<T>() with a wrapped-OOP target type, and the
-    // value_t::to_vector / value_t::to_entries entry points.  Construct a
-    // null-OOP field_proxy directly so the test does not depend on the
-    // static-vs-instance get_field resolution rules (which differ between
-    // GCC and MSVC / Clang — see the README "Fields" section).
+    // value_t::to_vector / value_t::to_entries — the two entry points
+    // users actually reach via `get_field("foo")->get().to_vector<T>()`
+    // and `get_field("foo")->get().to_entries<K,V>()`.  No template arg
+    // on get() — the right wrapper / fast path is picked from the live
+    // OOP's field layout inside collection::to_vector and map::to_entries.
+    // Construct a null-OOP field_proxy directly so the test does not
+    // depend on static-vs-instance get_field resolution.
     vmhook::field_proxy field{ nullptr, "Ljava/util/List;", false };
-
-    auto wrap_set         = field.get<std::unique_ptr<vmhook::set>>();
-    auto wrap_linked_list = field.get<std::unique_ptr<vmhook::linked_list>>();
-    auto wrap_hash_map    = field.get<std::unique_ptr<vmhook::hash_map>>();
-    auto wrap_map         = field.get<std::unique_ptr<vmhook::map>>();
-    (void)wrap_set; (void)wrap_linked_list; (void)wrap_hash_map; (void)wrap_map;
 
     auto via_value_t_vec     = field.get().to_vector<element_w>();
     auto via_value_t_entries = field.get().to_entries<key_w, value_w>();
