@@ -8677,12 +8677,19 @@ namespace vmhook
         auto get() const noexcept
             -> target_type
         {
-            // Use the explicit `.template operator T()` invocation rather
-            // than a static_cast.  MSVC refuses to bind static_cast to the
-            // templated conversion operator on value_t when the target is
-            // a move-only type like std::unique_ptr<wrapper>, but it
-            // accepts the explicit operator call.
-            return this->get().template operator target_type();
+            // Copy-init through a named local so every supported compiler
+            // resolves the templated conversion operator on value_t the
+            // same way:
+            //   * static_cast<T>(value_t) is rejected by MSVC for move-only T
+            //     because it does not consider templated user-defined
+            //     conversion operators in static_cast contexts.
+            //   * .template operator T() is rejected by Clang in dependent
+            //     contexts (it treats `operator T` as a non-template-name).
+            //   * Copy-init from a value_t to a named T (and then a return)
+            //     goes through the standard implicit-conversion path that
+            //     all three accept.
+            target_type result = this->get();
+            return result;
         }
 
         auto get() const noexcept
