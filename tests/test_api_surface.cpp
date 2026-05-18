@@ -47,10 +47,101 @@ static auto exercise_hooks() -> void
     vmhook::shutdown_hooks();
 }
 
+// Compile-only coverage of the java.util container wrappers (collection,
+// list, set, linked_list, map, hash_map) and the matching field_proxy
+// value_t entry points.  No JVM is running, so every call returns an
+// empty container; the point of the test is purely to type-check that
+// all of the templated `to_vector` / `to_entries` instantiations compile
+// on every supported toolchain.
+class element_w : public vmhook::object<element_w>
+{
+public:
+    explicit element_w(vmhook::oop_t oop) noexcept
+        : vmhook::object<element_w>{ oop }
+    {
+    }
+};
+
+class key_w : public vmhook::object<key_w>
+{
+public:
+    explicit key_w(vmhook::oop_t oop) noexcept
+        : vmhook::object<key_w>{ oop }
+    {
+    }
+};
+
+class value_w : public vmhook::object<value_w>
+{
+public:
+    explicit value_w(vmhook::oop_t oop) noexcept
+        : vmhook::object<value_w>{ oop }
+    {
+    }
+};
+
+static auto exercise_collection_wrappers() -> void
+{
+    // Direct construction from a null OOP — every member must be callable
+    // without dereferencing anything.
+    vmhook::collection  c{ nullptr };
+    vmhook::list        l{ nullptr };
+    vmhook::set         s{ nullptr };
+    vmhook::linked_list ll{ nullptr };
+    vmhook::map         m{ nullptr };
+    vmhook::hash_map    hm{ nullptr };
+
+    // size() / is_empty() resolve through the live OOP's klass; with a null
+    // OOP they short-circuit to 0/true.  Just want the call to type-check.
+    (void)c.size();
+    (void)l.size();
+    (void)s.size();
+    (void)ll.size();
+    (void)m.size();
+    (void)hm.size();
+    (void)c.is_empty();
+    (void)m.is_empty();
+
+    // Every to_vector<T>() / to_entries<K,V>() instantiation must compile.
+    auto v0 = c.to_vector<element_w>();
+    auto v1 = l.to_vector<element_w>();
+    auto v2 = s.to_vector<element_w>();
+    auto v3 = ll.to_vector<element_w>();
+    auto e0 = m.to_entries<key_w, value_w>();
+    auto e1 = hm.to_entries<key_w, value_w>();
+    (void)v0; (void)v1; (void)v2; (void)v3;
+    (void)e0; (void)e1;
+}
+
+static auto exercise_field_proxy_entrypoints() -> void
+{
+    // field_proxy::get<T>() with a wrapped-OOP target type, and the
+    // value_t::to_vector / value_t::to_entries entry points.  Construct a
+    // null-OOP field_proxy directly so the test does not depend on the
+    // static-vs-instance get_field resolution rules (which differ between
+    // GCC and MSVC / Clang — see the README "Fields" section).
+    vmhook::field_proxy field{ nullptr, "Ljava/util/List;", false };
+
+    auto wrap_set         = field.get<std::unique_ptr<vmhook::set>>();
+    auto wrap_linked_list = field.get<std::unique_ptr<vmhook::linked_list>>();
+    auto wrap_hash_map    = field.get<std::unique_ptr<vmhook::hash_map>>();
+    auto wrap_map         = field.get<std::unique_ptr<vmhook::map>>();
+    (void)wrap_set; (void)wrap_linked_list; (void)wrap_hash_map; (void)wrap_map;
+
+    auto via_value_t_vec     = field.get().to_vector<element_w>();
+    auto via_value_t_entries = field.get().to_entries<key_w, value_w>();
+    (void)via_value_t_vec; (void)via_value_t_entries;
+}
+
 int main()
 {
     vmhook::register_class<my_class>("my/Class");
+    vmhook::register_class<element_w>("my/Element");
+    vmhook::register_class<key_w>("my/Key");
+    vmhook::register_class<value_w>("my/Value");
     exercise_hooks();
+    exercise_collection_wrappers();
+    exercise_field_proxy_entrypoints();
     std::printf("vmhook API surface: OK\n");
     return 0;
 }

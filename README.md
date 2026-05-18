@@ -136,6 +136,10 @@ Two test suites ship with the project:
    - Hooks: installation, force-return, cancel, arg mutation (int + string),
      method calling from inside the detour, `make_unique` allocating
      wrappers from a hook.
+   - Container wrappers: `ArrayList`, `LinkedList`, `HashSet`,
+     `LinkedHashMap`, `HashMap`, and `TreeMap` — each loaded with three
+     deterministic entries, read back through the matching wrapper, and
+     checked for size, element validity, and (for maps) key identity.
 
 ## Debug And Release Logging
 
@@ -265,6 +269,58 @@ static auto reset_global_state()
     static_method("resetGlobalState")->call();
 }
 ```
+
+## Collections and maps
+
+vmhook ships ready-made wrappers for the common `java.util` containers so
+hook detours and field reads can convert a Java reference to a native
+`std::vector` (or `std::vector<std::pair<...>>` for maps) in one line.
+Every wrapper reads HotSpot heap layout directly — no JNI round-trip, no
+`register_class<>()` for the container itself.
+
+| Wrapper                | Covers                                       | Fast path                                                 |
+|------------------------|----------------------------------------------|-----------------------------------------------------------|
+| `vmhook::collection`   | any `java.util.Collection`                   | ArrayList `elementData`, otherwise `size()` + `get(int)`  |
+| `vmhook::list`         | `java.util.List`                             | ArrayList `elementData`                                   |
+| `vmhook::linked_list`  | `java.util.LinkedList`                       | `first → next` Node chain (O(N) instead of O(N²))         |
+| `vmhook::set`          | `HashSet`, `LinkedHashSet`, `TreeSet`        | backing `map.table` / `m.root`                            |
+| `vmhook::map`          | any `java.util.Map`                          | HashMap `table` then TreeMap `root` walk                  |
+| `vmhook::hash_map`     | `HashMap`, `LinkedHashMap`                   | `table` bucket-chain walk                                 |
+
+Read a field directly:
+
+```cpp
+// Java:  public List<A> listOfAs;
+auto vec = get_field("listOfAs")->get().to_vector<a_class>();
+
+// Java:  public LinkedList<A> chainOfAs;
+auto vec = get_field("chainOfAs")
+               ->get<std::unique_ptr<vmhook::linked_list>>()
+               ->to_vector<a_class>();
+
+// Java:  public HashMap<String, A> mapOfAs;
+auto pairs = get_field("mapOfAs")->get().to_entries<string_w, a_class>();
+// pairs is std::vector<std::pair<unique_ptr<string_w>, unique_ptr<a_class>>>
+```
+
+Or wrap an OOP you already received from a hook:
+
+```cpp
+vmhook::hook<example_class>("acceptMap",
+    [](vmhook::return_value&,
+       const std::unique_ptr<example_class>& self,
+       const std::unique_ptr<vmhook::map>& m)
+    {
+        for (auto& [k, v] : m->to_entries<key_w, value_w>())
+        {
+            // ...
+        }
+    });
+```
+
+`to_vector` / `to_entries` return empty containers (never throw) when the
+container is null, the layout is unrecognised, or the field is missing.
+Null Java elements become `nullptr` slots in the result.
 
 ## Hooks
 
@@ -637,7 +693,8 @@ The complete example lives in `vmhook/src/example.cpp` with Java fixtures in
 - hook argument mutation with `set_arg`
 - Java object allocation with `make_unique`
 - superclass field and method lookup
-- `java.util.List` conversion to `std::vector<std::unique_ptr<T>>`
+- `java.util.{List, LinkedList, Set}` conversion to `std::vector<std::unique_ptr<T>>`
+- `java.util.{Map, HashMap, LinkedHashMap, TreeMap}` conversion to vectors of `std::pair<unique_ptr<K>, unique_ptr<V>>`
 - enum singletons (`Color.RED/GREEN/BLUE` with constructor args)
 - interface default methods + override dispatch (`Animal` + `Dog`)
 - static nested classes + non-static inner classes with synthetic outer ref

@@ -74,6 +74,29 @@ public class Main
                 () -> Example.listProbeSize = Example.instance.listOfAs.size(),
                 () -> Example.listProbeDone = true);
 
+            // Mirror probes for the new container fixtures.  Each one reports
+            // the Java-side size; the C++ harness then reads the container
+            // through the matching wrapper and asserts the sizes match.
+            runProbe(() -> Example.linkedListProbeRequested && !Example.linkedListProbeDone,
+                () -> Example.linkedListProbeSize = Example.instance.linkedListOfAs.size(),
+                () -> Example.linkedListProbeDone = true);
+
+            runProbe(() -> Example.setProbeRequested && !Example.setProbeDone,
+                () -> Example.setProbeSize = Example.instance.setOfAs.size(),
+                () -> Example.setProbeDone = true);
+
+            runProbe(() -> Example.mapProbeRequested && !Example.mapProbeDone,
+                () -> Example.mapProbeSize = Example.instance.mapOfAs.size(),
+                () -> Example.mapProbeDone = true);
+
+            runProbe(() -> Example.hashMapProbeRequested && !Example.hashMapProbeDone,
+                () -> Example.hashMapProbeSize = Example.instance.hashMapOfAs.size(),
+                () -> Example.hashMapProbeDone = true);
+
+            runProbe(() -> Example.treeMapProbeRequested && !Example.treeMapProbeDone,
+                () -> Example.treeMapProbeSize = Example.instance.treeMapOfAs.size(),
+                () -> Example.treeMapProbeDone = true);
+
             runProbe(() -> Example.polyProbeRequested && !Example.polyProbeDone,
                 () ->
                 {

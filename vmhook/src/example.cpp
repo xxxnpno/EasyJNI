@@ -1045,6 +1045,80 @@ public:
         return get_field("listOfAs")->get().to_vector<a_class>();
     }
 
+    // Linked list / set / map probe accessors -----------------------------------
+    // Each mirrors the listOfAs pattern: a typed wrapper-construction helper
+    // for the C++ side plus paired probe-coordination static methods (request /
+    // done / size) so the Java thread reports its observed size back to us.
+
+    static auto get_linked_list_probe_requested() -> bool { return static_field("linkedListProbeRequested")->get(); }
+    static auto set_linked_list_probe_requested(bool v) -> void { static_field("linkedListProbeRequested")->set(v); }
+    static auto get_linked_list_probe_done() -> bool { return static_field("linkedListProbeDone")->get(); }
+    static auto set_linked_list_probe_done(bool v) -> void { static_field("linkedListProbeDone")->set(v); }
+    static auto get_linked_list_probe_size() -> std::int32_t { return static_field("linkedListProbeSize")->get(); }
+    auto get_linked_list_of_as()
+        -> std::vector<std::unique_ptr<a_class>>
+    {
+        // Wrap explicitly as linked_list so the Node-chain fast path is used
+        // instead of the inherited list ArrayList path or the O(N^2) fallback.
+        return get_field("linkedListOfAs")->get<std::unique_ptr<vmhook::linked_list>>()
+                   ->to_vector<a_class>();
+    }
+
+    static auto get_set_probe_requested() -> bool { return static_field("setProbeRequested")->get(); }
+    static auto set_set_probe_requested(bool v) -> void { static_field("setProbeRequested")->set(v); }
+    static auto get_set_probe_done() -> bool { return static_field("setProbeDone")->get(); }
+    static auto set_set_probe_done(bool v) -> void { static_field("setProbeDone")->set(v); }
+    static auto get_set_probe_size() -> std::int32_t { return static_field("setProbeSize")->get(); }
+    auto get_set_of_as()
+        -> std::vector<std::unique_ptr<a_class>>
+    {
+        return get_field("setOfAs")->get<std::unique_ptr<vmhook::set>>()
+                   ->to_vector<a_class>();
+    }
+
+    static auto get_map_probe_requested() -> bool { return static_field("mapProbeRequested")->get(); }
+    static auto set_map_probe_requested(bool v) -> void { static_field("mapProbeRequested")->set(v); }
+    static auto get_map_probe_done() -> bool { return static_field("mapProbeDone")->get(); }
+    static auto set_map_probe_done(bool v) -> void { static_field("mapProbeDone")->set(v); }
+    static auto get_map_probe_size() -> std::int32_t { return static_field("mapProbeSize")->get(); }
+
+    static auto get_hash_map_probe_requested() -> bool { return static_field("hashMapProbeRequested")->get(); }
+    static auto set_hash_map_probe_requested(bool v) -> void { static_field("hashMapProbeRequested")->set(v); }
+    static auto get_hash_map_probe_done() -> bool { return static_field("hashMapProbeDone")->get(); }
+    static auto set_hash_map_probe_done(bool v) -> void { static_field("hashMapProbeDone")->set(v); }
+    static auto get_hash_map_probe_size() -> std::int32_t { return static_field("hashMapProbeSize")->get(); }
+
+    static auto get_tree_map_probe_requested() -> bool { return static_field("treeMapProbeRequested")->get(); }
+    static auto set_tree_map_probe_requested(bool v) -> void { static_field("treeMapProbeRequested")->set(v); }
+    static auto get_tree_map_probe_done() -> bool { return static_field("treeMapProbeDone")->get(); }
+    static auto set_tree_map_probe_done(bool v) -> void { static_field("treeMapProbeDone")->set(v); }
+    static auto get_tree_map_probe_size() -> std::int32_t { return static_field("treeMapProbeSize")->get(); }
+
+    // Field-proxy entry point: returns a vector of key/value pairs straight
+    // from field_proxy::value_t::to_entries<K,V>() — the exact API users
+    // would hit in their own hook detours.
+    auto get_map_of_as_entries()
+        -> std::vector<std::pair<std::unique_ptr<vmhook::object<>>, std::unique_ptr<a_class>>>
+    {
+        return get_field("mapOfAs")->get().to_entries<vmhook::object<>, a_class>();
+    }
+
+    auto get_hash_map_of_as_entries()
+        -> std::vector<std::pair<std::unique_ptr<vmhook::object<>>, std::unique_ptr<a_class>>>
+    {
+        // Construct vmhook::hash_map explicitly so the typed wrapper path is
+        // covered in addition to the field_proxy::to_entries flow above.
+        return get_field("hashMapOfAs")->get<std::unique_ptr<vmhook::hash_map>>()
+                   ->to_entries<vmhook::object<>, a_class>();
+    }
+
+    auto get_tree_map_of_as_entries()
+        -> std::vector<std::pair<std::unique_ptr<vmhook::object<>>, std::unique_ptr<a_class>>>
+    {
+        return get_field("treeMapOfAs")->get<std::unique_ptr<vmhook::map>>()
+                   ->to_entries<vmhook::object<>, a_class>();
+    }
+
     // Poly probe
     static auto get_poly_probe_requested()
         -> bool
@@ -1339,6 +1413,16 @@ namespace
     std::atomic_bool make_unique_initialized_counter{};
     std::atomic_bool list_probe_size_correct{};
     std::atomic_bool list_probe_elements_correct{};
+    std::atomic_bool linked_list_probe_size_correct{};
+    std::atomic_bool linked_list_probe_elements_correct{};
+    std::atomic_bool set_probe_size_correct{};
+    std::atomic_bool set_probe_elements_correct{};
+    std::atomic_bool map_probe_size_correct{};
+    std::atomic_bool map_probe_elements_correct{};
+    std::atomic_bool hash_map_probe_size_correct{};
+    std::atomic_bool hash_map_probe_elements_correct{};
+    std::atomic_bool tree_map_probe_size_correct{};
+    std::atomic_bool tree_map_probe_elements_correct{};
     std::atomic_bool poly_probe_inherited_field{};
     std::atomic_bool poly_probe_inherited_method{};
     std::atomic_bool poly_probe_own_field{};
@@ -1829,6 +1913,243 @@ namespace
             }
             list_probe_elements_correct.store(elements_ok);
             check("listToVectorElements", list_probe_elements_correct.load());
+        }
+    }
+
+    auto test_linked_list_probe(example_class& instance)
+        -> void
+    {
+        /*
+            Reads Example.linkedListOfAs (a java.util.LinkedList<A>) via
+            vmhook::linked_list, which walks the first->next Node chain in O(N)
+            instead of the O(N^2) LinkedList.get(int) generic fallback.
+        */
+        linked_list_probe_size_correct.store(false);
+        linked_list_probe_elements_correct.store(false);
+
+        example_class::set_linked_list_probe_done(false);
+        example_class::set_linked_list_probe_requested(false);
+
+        const bool probe_done{ run_java_probe(example_class::set_linked_list_probe_requested,
+                                              example_class::get_linked_list_probe_done) };
+
+        check("linkedListProbeDone", probe_done);
+        check_equal("linkedListProbeSize", example_class::get_linked_list_probe_size(), static_cast<std::int32_t>(3));
+
+        auto vec = instance.get_linked_list_of_as();
+        linked_list_probe_size_correct.store(static_cast<std::int32_t>(vec.size()) == 3);
+        check("linkedListToVectorSize", linked_list_probe_size_correct.load());
+
+        if (!vec.empty())
+        {
+            bool elements_ok{ true };
+            for (const auto& elem : vec)
+            {
+                if (!elem)
+                {
+                    elements_ok = false;
+                }
+            }
+            linked_list_probe_elements_correct.store(elements_ok);
+            check("linkedListToVectorElements", linked_list_probe_elements_correct.load());
+        }
+    }
+
+    auto test_set_probe(example_class& instance)
+        -> void
+    {
+        /*
+            Reads Example.setOfAs (a java.util.HashSet<A>) via vmhook::set,
+            which walks the backing HashMap.table for keys.
+        */
+        set_probe_size_correct.store(false);
+        set_probe_elements_correct.store(false);
+
+        example_class::set_set_probe_done(false);
+        example_class::set_set_probe_requested(false);
+
+        const bool probe_done{ run_java_probe(example_class::set_set_probe_requested,
+                                              example_class::get_set_probe_done) };
+
+        check("setProbeDone", probe_done);
+        check_equal("setProbeSize", example_class::get_set_probe_size(), static_cast<std::int32_t>(3));
+
+        auto vec = instance.get_set_of_as();
+        set_probe_size_correct.store(static_cast<std::int32_t>(vec.size()) == 3);
+        check("setToVectorSize", set_probe_size_correct.load());
+
+        if (!vec.empty())
+        {
+            bool elements_ok{ true };
+            for (const auto& elem : vec)
+            {
+                if (!elem)
+                {
+                    elements_ok = false;
+                }
+            }
+            set_probe_elements_correct.store(elements_ok);
+            check("setToVectorElements", set_probe_elements_correct.load());
+        }
+    }
+
+    auto test_map_probe(example_class& instance)
+        -> void
+    {
+        /*
+            Reads Example.mapOfAs (a LinkedHashMap<String, A>) via
+            field_proxy::value_t::to_entries<K,V>().  Validates the entry
+            count, the well-formedness of every key/value pair, and that the
+            keys decode to "k0"/"k1"/"k2" (insertion order is preserved by
+            LinkedHashMap, but we don't rely on the iteration order here).
+        */
+        map_probe_size_correct.store(false);
+        map_probe_elements_correct.store(false);
+
+        example_class::set_map_probe_done(false);
+        example_class::set_map_probe_requested(false);
+
+        const bool probe_done{ run_java_probe(example_class::set_map_probe_requested,
+                                              example_class::get_map_probe_done) };
+
+        check("mapProbeDone", probe_done);
+        check_equal("mapProbeSize", example_class::get_map_probe_size(), static_cast<std::int32_t>(3));
+
+        auto entries = instance.get_map_of_as_entries();
+        map_probe_size_correct.store(static_cast<std::int32_t>(entries.size()) == 3);
+        check("mapToEntriesSize", map_probe_size_correct.load());
+
+        if (!entries.empty())
+        {
+            bool elements_ok{ true };
+            bool keys_ok{ true };
+            std::array<bool, 3> seen_key{ false, false, false };
+            for (const auto& kv : entries)
+            {
+                if (!kv.first || !kv.second)
+                {
+                    elements_ok = false;
+                    continue;
+                }
+                const std::string key{ vmhook::read_java_string(kv.first->get_instance()) };
+                if      (key == "k0") { seen_key[0] = true; }
+                else if (key == "k1") { seen_key[1] = true; }
+                else if (key == "k2") { seen_key[2] = true; }
+                else { keys_ok = false; }
+            }
+            map_probe_elements_correct.store(elements_ok
+                                             && keys_ok
+                                             && seen_key[0] && seen_key[1] && seen_key[2]);
+            check("mapToEntriesElements", map_probe_elements_correct.load());
+        }
+    }
+
+    auto test_hash_map_probe(example_class& instance)
+        -> void
+    {
+        /*
+            Reads Example.hashMapOfAs (a HashMap<String, A>) through the
+            typed vmhook::hash_map wrapper.  Exercises the same table walk
+            as the LinkedHashMap test but via the explicit wrapper path
+            (field_proxy::get<unique_ptr<hash_map>>()) instead of
+            value_t::to_entries.
+        */
+        hash_map_probe_size_correct.store(false);
+        hash_map_probe_elements_correct.store(false);
+
+        example_class::set_hash_map_probe_done(false);
+        example_class::set_hash_map_probe_requested(false);
+
+        const bool probe_done{ run_java_probe(example_class::set_hash_map_probe_requested,
+                                              example_class::get_hash_map_probe_done) };
+
+        check("hashMapProbeDone", probe_done);
+        check_equal("hashMapProbeSize", example_class::get_hash_map_probe_size(), static_cast<std::int32_t>(3));
+
+        auto entries = instance.get_hash_map_of_as_entries();
+        hash_map_probe_size_correct.store(static_cast<std::int32_t>(entries.size()) == 3);
+        check("hashMapToEntriesSize", hash_map_probe_size_correct.load());
+
+        if (!entries.empty())
+        {
+            bool elements_ok{ true };
+            bool keys_ok{ true };
+            std::array<bool, 3> seen_key{ false, false, false };
+            for (const auto& kv : entries)
+            {
+                if (!kv.first || !kv.second)
+                {
+                    elements_ok = false;
+                    continue;
+                }
+                const std::string key{ vmhook::read_java_string(kv.first->get_instance()) };
+                if      (key == "h0") { seen_key[0] = true; }
+                else if (key == "h1") { seen_key[1] = true; }
+                else if (key == "h2") { seen_key[2] = true; }
+                else { keys_ok = false; }
+            }
+            hash_map_probe_elements_correct.store(elements_ok
+                                                  && keys_ok
+                                                  && seen_key[0] && seen_key[1] && seen_key[2]);
+            check("hashMapToEntriesElements", hash_map_probe_elements_correct.load());
+        }
+    }
+
+    auto test_tree_map_probe(example_class& instance)
+        -> void
+    {
+        /*
+            Reads Example.treeMapOfAs (a TreeMap<String, A>) via the
+            vmhook::map wrapper, which falls through to the TreeMap "root"
+            red-black walk.  Exercises the in-order traversal helper, which
+            is also reused by vmhook::set for TreeSet.
+        */
+        tree_map_probe_size_correct.store(false);
+        tree_map_probe_elements_correct.store(false);
+
+        example_class::set_tree_map_probe_done(false);
+        example_class::set_tree_map_probe_requested(false);
+
+        const bool probe_done{ run_java_probe(example_class::set_tree_map_probe_requested,
+                                              example_class::get_tree_map_probe_done) };
+
+        check("treeMapProbeDone", probe_done);
+        check_equal("treeMapProbeSize", example_class::get_tree_map_probe_size(), static_cast<std::int32_t>(3));
+
+        auto entries = instance.get_tree_map_of_as_entries();
+        tree_map_probe_size_correct.store(static_cast<std::int32_t>(entries.size()) == 3);
+        check("treeMapToEntriesSize", tree_map_probe_size_correct.load());
+
+        if (!entries.empty())
+        {
+            bool elements_ok{ true };
+            bool keys_ok{ true };
+            std::array<bool, 3> seen_key{ false, false, false };
+            // TreeMap iterates in natural order, so the entries should come
+            // out sorted by key as "t0" < "t1" < "t2".
+            for (std::size_t i{ 0 }; i < entries.size(); ++i)
+            {
+                const auto& kv = entries[i];
+                if (!kv.first || !kv.second)
+                {
+                    elements_ok = false;
+                    continue;
+                }
+                const std::string key{ vmhook::read_java_string(kv.first->get_instance()) };
+                if      (key == "t0") { seen_key[0] = true; }
+                else if (key == "t1") { seen_key[1] = true; }
+                else if (key == "t2") { seen_key[2] = true; }
+                else { keys_ok = false; }
+                // Order check: the i-th key should be "t{i}".
+                if (key.size() != 2 || key[0] != 't' || key[1] != static_cast<char>('0' + i))
+                {
+                    keys_ok = false;
+                }
+            }
+            tree_map_probe_elements_correct.store(elements_ok
+                                                  && keys_ok
+                                                  && seen_key[0] && seen_key[1] && seen_key[2]);
+            check("treeMapToEntriesElements", tree_map_probe_elements_correct.load());
         }
     }
 
@@ -2685,6 +3006,11 @@ static auto run_test_suite() -> void
         test_static_method_force_return();
         test_make_unique_status();
         test_list_probe(*instance);
+        test_linked_list_probe(*instance);
+        test_set_probe(*instance);
+        test_map_probe(*instance);
+        test_hash_map_probe(*instance);
+        test_tree_map_probe(*instance);
         test_poly_probe(*instance);
         test_method_call_return_value(*instance);
         test_arg_mutation();

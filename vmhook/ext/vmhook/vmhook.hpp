@@ -8653,6 +8653,33 @@ namespace vmhook
               "L"/"["  uint32_t (compressed OOP)
             The returned value is a copy - safe to store and return from methods.
         */
+        /*
+            @brief Typed read: returns the field as the requested target type.
+            @details
+            Convenience overload of get() that routes through value_t's implicit
+            conversion operator.  Lets callers write a concrete C++ type at the
+            call site instead of going through `value_t -> target` deduction
+            via implicit conversion:
+
+                auto raw  = proxy->get();                          // value_t
+                auto i    = proxy->get<std::int32_t>();            // typed
+                auto wrap = proxy->get<std::unique_ptr<my_t>>();   // wrapped OOP
+
+            For `std::unique_ptr<wrapper>` targets the underlying OOP is decoded
+            and a new wrapper instance is constructed — this is how vmhook::list,
+            vmhook::map, etc. are obtained from a field without going through
+            register_class<>() for the container itself.
+
+            Returns a value-initialised target_type when the field pointer is
+            null or the conversion cannot succeed.
+        */
+        template<typename target_type>
+        auto get() const noexcept
+            -> target_type
+        {
+            return static_cast<target_type>(this->get());
+        }
+
         auto get() const noexcept
             -> value_t
         {

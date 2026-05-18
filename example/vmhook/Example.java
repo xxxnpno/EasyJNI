@@ -1,7 +1,14 @@
 package vmhook;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 
 // Central probe target for vmhook.  Every Java type and JVM situation
 // that vmhook needs to handle has at least one field, method, or hook
@@ -147,6 +154,37 @@ public class Example
         listOfAs.add(new A());
         listOfAs.add(new A());
         listOfAs.add(new A());
+
+        // Populate the new container fixtures with three deterministic
+        // entries each so the C++ side can check both size and content.
+        linkedListOfAs = new LinkedList<>();
+        linkedListOfAs.add(new A());
+        linkedListOfAs.add(new A());
+        linkedListOfAs.add(new A());
+
+        setOfAs = new HashSet<>();
+        setOfAs.add(new A());
+        setOfAs.add(new A());
+        setOfAs.add(new A());
+
+        // Insertion-ordered Map so the C++ side can assert on keys "k0/k1/k2"
+        // appearing in a known order in addition to the size check.
+        mapOfAs = new LinkedHashMap<>();
+        mapOfAs.put("k0", new A());
+        mapOfAs.put("k1", new A());
+        mapOfAs.put("k2", new A());
+
+        // Plain HashMap variant so the unordered fast path is exercised too.
+        hashMapOfAs = new HashMap<>();
+        hashMapOfAs.put("h0", new A());
+        hashMapOfAs.put("h1", new A());
+        hashMapOfAs.put("h2", new A());
+
+        // TreeMap to exercise the red-black BST walk.
+        treeMapOfAs = new TreeMap<>();
+        treeMapOfAs.put("t0", new A());
+        treeMapOfAs.put("t1", new A());
+        treeMapOfAs.put("t2", new A());
     }
 
     // ── Method invocation counters (for probe machinery) ──────────────────
@@ -174,6 +212,36 @@ public class Example
     public static volatile boolean listProbeDone      = false;
     public static volatile int     listProbeSize      = 0;
     public static volatile boolean listProbeElementsCorrect = false;
+
+    // ── LinkedList<A> probe ───────────────────────────────────────────────
+    public LinkedList<A> linkedListOfAs;
+    public static volatile boolean linkedListProbeRequested = false;
+    public static volatile boolean linkedListProbeDone      = false;
+    public static volatile int     linkedListProbeSize      = 0;
+
+    // ── HashSet<A> probe ──────────────────────────────────────────────────
+    public Set<A> setOfAs;
+    public static volatile boolean setProbeRequested = false;
+    public static volatile boolean setProbeDone      = false;
+    public static volatile int     setProbeSize      = 0;
+
+    // ── LinkedHashMap<String, A> probe (covers HashMap fast path too) ─────
+    public Map<String, A> mapOfAs;
+    public static volatile boolean mapProbeRequested = false;
+    public static volatile boolean mapProbeDone      = false;
+    public static volatile int     mapProbeSize      = 0;
+
+    // ── HashMap<String, A> probe (unordered, distinct keys "h0/h1/h2") ────
+    public HashMap<String, A> hashMapOfAs;
+    public static volatile boolean hashMapProbeRequested = false;
+    public static volatile boolean hashMapProbeDone      = false;
+    public static volatile int     hashMapProbeSize      = 0;
+
+    // ── TreeMap<String, A> probe (red-black BST walk) ─────────────────────
+    public TreeMap<String, A> treeMapOfAs;
+    public static volatile boolean treeMapProbeRequested = false;
+    public static volatile boolean treeMapProbeDone      = false;
+    public static volatile int     treeMapProbeSize      = 0;
 
     // ── Inheritance / polymorphism probe ──────────────────────────────────
     public B bInstance = new B();
