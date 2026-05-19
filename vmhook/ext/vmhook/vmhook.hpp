@@ -6006,6 +6006,10 @@ namespace vmhook
         vmhook::hotspot::klass* const target_klass{ vmhook::find_class(type_map_it->second) };
         if (!target_klass)
         {
+            VMHOOK_LOG("{} for_each_instance: find_class('{}') returned null - the registered "
+                       "class is not loaded in the JVM yet (or VMStructs+JNI fallback couldn't "
+                       "resolve it).  Visitor will not be invoked.",
+                       vmhook::warning_tag, type_map_it->second);
             return 0;
         }
 
@@ -6222,9 +6226,17 @@ namespace vmhook
                 {
                     this->block->on_stop();
                 }
+                catch (const std::exception& ex)
+                {
+                    VMHOOK_LOG("{} watch_handle::stop(): on_stop callback threw: {} - "
+                               "swallowed to honour the no-throw contract.",
+                               vmhook::error_tag, ex.what());
+                }
                 catch (...)
                 {
-                    // never let disarm exceptions propagate.
+                    VMHOOK_LOG("{} watch_handle::stop(): on_stop callback threw an unknown "
+                               "exception - swallowed to honour the no-throw contract.",
+                               vmhook::error_tag);
                 }
                 this->block->on_stop = nullptr;
             }
@@ -6722,12 +6734,18 @@ namespace vmhook
     {
         if (!this->stack_frame || index < 0)
         {
+            VMHOOK_LOG("{} return_value::set_arg(index={}): missing stack_frame or negative index "
+                       "(stack_frame={}).",
+                       vmhook::error_tag, index, static_cast<const void*>(this->stack_frame));
             return false;
         }
 
         void** const locals{ this->stack_frame->get_locals() };
         if (!locals)
         {
+            VMHOOK_LOG("{} return_value::set_arg(index={}): frame.get_locals() returned null - "
+                       "cannot mutate interpreter locals on this JDK.",
+                       vmhook::error_tag, index);
             return false;
         }
 
@@ -6776,6 +6794,9 @@ namespace vmhook
                 : vmhook::make_java_string(value) };
             if (!string_oop)
             {
+                VMHOOK_LOG("{} return_value::set_arg(index={}): both JNI NewStringUTF and "
+                           "make_java_string fallback failed - cannot inject a Java String.",
+                           vmhook::error_tag, index);
                 return false;
             }
 
@@ -6790,6 +6811,9 @@ namespace vmhook
                 : vmhook::make_java_string(text) };
             if (!string_oop)
             {
+                VMHOOK_LOG("{} return_value::set_arg(index={}): both JNI NewStringUTF and "
+                           "make_java_string fallback failed for const char* arg.",
+                           vmhook::error_tag, index);
                 return false;
             }
 
@@ -6804,6 +6828,9 @@ namespace vmhook
         }
         else
         {
+            VMHOOK_LOG("{} return_value::set_arg(index={}): unsupported value_type '{}' "
+                       "(not trivially copyable or larger than a pointer).",
+                       vmhook::error_tag, index, typeid(clean_value_type).name());
             return false;
         }
     }
@@ -7040,15 +7067,23 @@ namespace vmhook
                 }
                 else
                 {
-                    // No adapter pointer recoverable — refuse to deopt rather than
-                    // crash the JVM at the next safepoint.  The hook is still
-                    // installed on the i2i stub, so calls made through the
-                    // interpreter will hit it; calls dispatched by the existing
-                    // nmethod (and any nmethod that inlined this method) will
-                    // bypass the hook until they're naturally invalidated.
-                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; leaving method JIT-compiled. "
-                               "Calls that reach the interpreter will still hit the hook; calls dispatched "
-                               "by the existing nmethod will bypass it.", vmhook::error_tag, method_name);
+                    // c2i adapter unrecoverable.  The upstream-conservative
+                    // policy is to leave _code intact and accept that compiled
+                    // callers bypass the hook, but that defeats the entire
+                    // point of installing the hook in the first place for
+                    // hot methods like runTick.  Match the older vmhook
+                    // behaviour: redirect the interpreted entry to the i2i
+                    // stub and clear _code so subsequent dispatch falls back
+                    // through the interpreter and hits the hook.  Compiled
+                    // callers with stale inline caches still reach the old
+                    // nmethod for one cycle, but the cache is repaired at
+                    // the next safepoint when the IC re-resolves and finds
+                    // _code == nullptr.
+                    found_method->set_from_interpreted_entry(i2i);
+                    found_method->set_code(nullptr);
+                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; forced deopt - _code cleared, "
+                               "_from_interpreted_entry redirected to i2i.  Compiled inline caches will repair "
+                               "themselves at the next safepoint.", vmhook::warning_tag, method_name);
                 }
             }
 
@@ -7187,9 +7222,17 @@ namespace vmhook
 
             hooks.erase(entry_it);
         }
+        catch (const std::exception& ex)
+        {
+            VMHOOK_LOG("{} hook_handle removal: exception while uninstalling a single hook: {} - "
+                       "swallowed because the user is dropping a handle and removal must not throw.",
+                       vmhook::error_tag, ex.what());
+        }
         catch (...)
         {
-            // Removal must never throw; the user is dropping a handle.
+            VMHOOK_LOG("{} hook_handle removal: unknown exception while uninstalling a single hook - "
+                       "swallowed because the user is dropping a handle and removal must not throw.",
+                       vmhook::error_tag);
         }
     }
 
@@ -7214,6 +7257,9 @@ namespace vmhook
         if (!vmhook::hook<wrapper_type>(method_name, method_signature,
                                          std::forward<decltype(user_detour)>(user_detour)))
         {
+            VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): underlying vmhook::hook() failed - returning empty handle.",
+                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       method_name, method_signature);
             return hook_handle{};
         }
 
@@ -7228,18 +7274,30 @@ namespace vmhook
                 std::type_index{ typeid(wrapper_type) }) };
             if (type_map_entry == vmhook::type_to_class_map.end())
             {
+                VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): wrapper type not registered "
+                           "(call register_class<T>() first) - returning empty handle.",
+                           vmhook::error_tag, typeid(wrapper_type).name(),
+                           method_name, method_signature);
                 return hook_handle{};
             }
             vmhook::hotspot::klass* const target_klass{
                 vmhook::find_class(type_map_entry->second) };
             if (!target_klass)
             {
+                VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): find_class('{}') returned null - "
+                           "returning empty handle.",
+                           vmhook::error_tag, typeid(wrapper_type).name(),
+                           method_name, method_signature, type_map_entry->second);
                 return hook_handle{};
             }
             const std::int32_t method_count{ target_klass->get_methods_count() };
             vmhook::hotspot::method** const methods_array{ target_klass->get_methods_ptr() };
             if (!methods_array || method_count <= 0)
             {
+                VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): klass has no methods array (count={}) - "
+                           "returning empty handle.",
+                           vmhook::error_tag, typeid(wrapper_type).name(),
+                           method_name, method_signature, method_count);
                 return hook_handle{};
             }
             for (std::int32_t i{ 0 }; i < method_count; ++i)
@@ -7259,8 +7317,26 @@ namespace vmhook
                 }
                 return hook_handle{ m };
             }
+            VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): hook installed but Method* re-resolution "
+                       "did not find a matching method in the klass; returning empty handle. "
+                       "The hook IS active, but the caller has no way to disarm it individually.",
+                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       method_name, method_signature);
         }
-        catch (...) { /* swallow — return empty handle */ }
+        catch (const std::exception& exception)
+        {
+            VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): exception during Method* re-resolution: {} - "
+                       "returning empty handle.",
+                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       method_name, method_signature, exception.what());
+        }
+        catch (...)
+        {
+            VMHOOK_LOG("{} scoped_hook<{}>('{}{}'): unknown exception during Method* re-resolution - "
+                       "returning empty handle.",
+                       vmhook::error_tag, typeid(wrapper_type).name(),
+                       method_name, method_signature);
+        }
         return hook_handle{};
     }
 
@@ -7714,6 +7790,10 @@ namespace vmhook
             if (!launch_class)
             {
                 vmhook::detail::jni_exception_clear();
+                VMHOOK_LOG("{} jni_find_class_with_context_loader('{}'): all class loader paths "
+                           "failed (thread context, system, Minecraft Launch).  Class is not "
+                           "reachable from any class loader visible to JNI.",
+                           vmhook::warning_tag, class_name);
                 return nullptr;
             }
 
@@ -7725,6 +7805,9 @@ namespace vmhook
             }
 
             vmhook::detail::jni_exception_clear();
+            VMHOOK_LOG("{} jni_find_class_with_context_loader('{}'): all class loader paths "
+                       "failed including Minecraft Launch loader.  Class is not loaded anywhere.",
+                       vmhook::warning_tag, class_name);
             return nullptr;
         }
 
@@ -8097,12 +8180,22 @@ namespace vmhook
             new_object_a_t const new_object_a{ vmhook::detail::jni_function<30, new_object_a_t>(vmhook::hotspot::current_jni_env) };
             if (!new_object_a)
             {
+                VMHOOK_LOG("{} jni_make_unique<{}>(): NewObjectA slot 30 is null - the JNIEnv "
+                           "function table is unusable.",
+                           vmhook::error_tag, typeid(wrapper_type).name());
                 return nullptr;
             }
 
             void* const object_handle{ new_object_a(vmhook::hotspot::current_jni_env, klass, method_id, values.data()) };
             void* const oop{ vmhook::detail::jni_decode_object(object_handle) };
-            return oop ? std::make_unique<wrapper_type>(oop) : nullptr;
+            if (!oop)
+            {
+                VMHOOK_LOG("{} jni_make_unique<{}>(): NewObjectA returned null for '{}' "
+                           "(signature '{}') - likely a constructor exception or invalid args.",
+                           vmhook::error_tag, typeid(wrapper_type).name(), class_name, signature);
+                return nullptr;
+            }
+            return std::make_unique<wrapper_type>(oop);
         }
     }
 
@@ -8150,6 +8243,8 @@ namespace vmhook
         vmhook::hotspot::klass* const klass{ vmhook::find_class(map_entry->second) };
         if (!klass)
         {
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): find_class('{}') returned null - class not loaded.",
+                       vmhook::error_tag, typeid(wrapper_type).name(), map_entry->second);
             return nullptr;
         }
 
@@ -8435,11 +8530,17 @@ namespace vmhook
     {
         if (!vmhook::hotspot::ensure_current_java_thread())
         {
+            VMHOOK_LOG("{} vmhook::make_java_object(): ensure_current_java_thread() failed - "
+                       "cannot allocate without an attached JavaThread.",
+                       vmhook::error_tag);
             return nullptr;
         }
 
         if (!klass || requested_size == 0)
         {
+            VMHOOK_LOG("{} vmhook::make_java_object(): invalid arguments (klass={}, "
+                       "requested_size={}).",
+                       vmhook::error_tag, static_cast<const void*>(klass), requested_size);
             return nullptr;
         }
 
@@ -8475,6 +8576,9 @@ namespace vmhook
 
         if (!object_pointer)
         {
+            VMHOOK_LOG("{} vmhook::make_java_object(): TLAB allocation failed across all "
+                       "candidate JavaThreads ({} bytes).",
+                       vmhook::warning_tag, object_size);
             return nullptr;
         }
 
@@ -8536,12 +8640,18 @@ namespace vmhook
     {
         if (length < 0)
         {
+            VMHOOK_LOG("{} vmhook::make_java_array('{}'): negative length {}.",
+                       vmhook::error_tag, class_name, length);
             return nullptr;
         }
 
         vmhook::hotspot::klass* const array_klass{ vmhook::find_class(class_name) };
         if (!array_klass)
         {
+            VMHOOK_LOG("{} vmhook::make_java_array('{}'): array klass not found - the array "
+                       "descriptor is not loaded yet, or class_name uses the wrong syntax "
+                       "(e.g. should be \"[B\" not \"byte[]\").",
+                       vmhook::error_tag, class_name);
             return nullptr;
         }
 
@@ -8549,6 +8659,10 @@ namespace vmhook
         void* const array_oop{ vmhook::make_java_object(array_klass, array_header_size + static_cast<std::size_t>(length) * element_size) };
         if (!array_oop)
         {
+            VMHOOK_LOG("{} vmhook::make_java_array('{}'): make_java_object failed for {} elements "
+                       "({} bytes total).",
+                       vmhook::error_tag, class_name, length,
+                       array_header_size + static_cast<std::size_t>(length) * element_size);
             return nullptr;
         }
 
@@ -8579,12 +8693,18 @@ namespace vmhook
         vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
         if (!string_klass)
         {
+            VMHOOK_LOG("{} vmhook::make_java_string(): find_class('java/lang/String') returned null. "
+                       "This indicates a very early bootstrap state or a broken VMStructs lookup.",
+                       vmhook::error_tag);
             return nullptr;
         }
 
         void* const string_oop{ vmhook::make_java_object(string_klass, string_klass->get_instance_size()) };
         if (!string_oop)
         {
+            VMHOOK_LOG("{} vmhook::make_java_string(): make_java_object for java.lang.String failed "
+                       "(instance_size={} bytes).",
+                       vmhook::error_tag, string_klass->get_instance_size());
             return nullptr;
         }
 
@@ -8596,6 +8716,9 @@ namespace vmhook
             void* const value_array{ vmhook::make_java_array("[B", length, sizeof(std::uint8_t)) };
             if (!value_array)
             {
+                VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
+                           "array (compact string path, length={}).",
+                           vmhook::error_tag, length);
                 return nullptr;
             }
 
@@ -8608,6 +8731,9 @@ namespace vmhook
             void* const value_array{ vmhook::make_java_array("[C", length, sizeof(std::uint16_t)) };
             if (!value_array)
             {
+                VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the char[] backing "
+                           "array (classic string path, length={}).",
+                           vmhook::error_tag, length);
                 return nullptr;
             }
 
@@ -9401,6 +9527,9 @@ namespace vmhook
             auto* const env_void{ vmhook::hotspot::current_jni_env };
             if (!env_void)
             {
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): current_jni_env is null - "
+                           "have we attached the calling thread?",
+                           vmhook::error_tag, this->name(), this->signature_text);
                 return value_t{ std::monostate{} };
             }
 
@@ -9416,6 +9545,8 @@ namespace vmhook
                 rparen = this->signature_text.rfind(')');
                 if (rparen == std::string::npos)
                 {
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): malformed signature - no ')' found.",
+                               vmhook::error_tag, this->name(), this->signature_text);
                     return value_t{ std::monostate{} };
                 }
                 ret_char = (rparen + 1 < this->signature_text.size())
@@ -9441,6 +9572,9 @@ namespace vmhook
                     // jclass.
                     if (!this->method)
                     {
+                        VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): static call requested but "
+                                   "underlying Method* is null - cannot derive jclass.",
+                                   vmhook::error_tag, this->name(), this->signature_text);
                         return value_t{ std::monostate{} };
                     }
                     if (auto* const const_method{ this->method->get_const_method() };
@@ -9467,6 +9601,9 @@ namespace vmhook
                     }
                     if (!class_handle)
                     {
+                        VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): FindClass(name from pool_holder) "
+                                   "returned null - the declaring class is not reachable via JNI.",
+                                   vmhook::error_tag, this->name(), this->signature_text);
                         return value_t{ std::monostate{} };
                     }
                     this->cached_class_handle = class_handle;
@@ -9482,6 +9619,9 @@ namespace vmhook
                     class_handle = vmhook::detail::jni_get_object_class(object_handle);
                     if (!class_handle)
                     {
+                        VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetObjectClass returned null - "
+                                   "receiver OOP is invalid or not yet visible to JNI.",
+                                   vmhook::error_tag, this->name(), this->signature_text);
                         return value_t{ std::monostate{} };
                     }
                     this->cached_class_handle = class_handle;
@@ -9491,6 +9631,10 @@ namespace vmhook
 
                 if (!this->cached_method_id)
                 {
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetMethodID returned null; "
+                               "falling back to raw Method* as jmethodID (works on JDK 8, "
+                               "likely no-op on JDK 9+ where jmethodID is tagged).",
+                               vmhook::warning_tag, this->name(), this->signature_text);
                     vmhook::detail::jni_exception_clear();
                     if (this->method && vmhook::hotspot::is_valid_pointer(this->method))
                     {
@@ -9501,6 +9645,9 @@ namespace vmhook
                     }
                     else
                     {
+                        VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): no usable jmethodID and Method* "
+                                   "is null or invalid - aborting call.",
+                                   vmhook::error_tag, this->name(), this->signature_text);
                         return value_t{ std::monostate{} };
                     }
                 }
@@ -9553,6 +9700,34 @@ namespace vmhook
                     if (auto* const fn{ reinterpret_cast<fn_t>(table[slot]) })
                     {
                         fn(env_void, receiver, method_id, values);
+
+                        // Diagnostic: surface any Java exception thrown by the callee.
+                        // Without this, exceptions silently poison subsequent JNI
+                        // operations on the thread and produce "the method seemed to
+                        // run but nothing happened" behaviour, e.g. for our outgoing
+                        // chat path on JDK 9+.
+                        using exception_check_t = std::uint8_t(*)(void*);
+                        using exception_describe_t = void(*)(void*);
+                        using exception_clear_t = void(*)(void*);
+                        auto* const exc_check{ reinterpret_cast<exception_check_t>(table[228]) };
+                        if (exc_check && exc_check(env_void) != 0u)
+                        {
+                            VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): Java exception thrown by callee.",
+                                       vmhook::error_tag, this->name(), this->signature_text);
+                            if (auto* const exc_desc{ reinterpret_cast<exception_describe_t>(table[16]) })
+                            {
+                                exc_desc(env_void);
+                            }
+                            if (auto* const exc_clr{ reinterpret_cast<exception_clear_t>(table[17]) })
+                            {
+                                exc_clr(env_void);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): JNI Call(Static)?VoidMethodA slot {} is null.",
+                                   vmhook::error_tag, this->name(), this->signature_text, slot);
                     }
                     return value_t{ std::monostate{} };
                 }
@@ -9628,6 +9803,9 @@ namespace vmhook
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
                     if (!fn)
                     {
+                        VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): JNI Call(Static)?ObjectMethodA "
+                                   "slot {} is null.",
+                                   vmhook::error_tag, this->name(), this->signature_text, slot);
                         return value_t{ std::monostate{} };
                     }
                     void* const result_handle{ fn(env_void, receiver, method_id, values) };
@@ -9649,6 +9827,10 @@ namespace vmhook
                         static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(result_handle)) };
                 }
                 default:
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): unhandled return type char '{}' "
+                               "(0x{:02X}) - cannot dispatch.",
+                               vmhook::error_tag, this->name(), this->signature_text,
+                               ret_char, static_cast<std::uint32_t>(ret_char));
                     return value_t{ std::monostate{} };
             }
         }
@@ -9703,6 +9885,9 @@ namespace vmhook
             {
                 if (!vmhook::hotspot::ensure_current_java_thread())
                 {
+                    VMHOOK_LOG("{} method_proxy::call('{}{}'): call_stub_entry missing AND "
+                               "ensure_current_java_thread() failed - cannot dispatch via either path.",
+                               vmhook::error_tag, this->name(), this->signature_text);
                     return value_t{ std::monostate{} };
                 }
                 return this->call_jni(std::forward<args_t>(args)...);
@@ -10373,12 +10558,17 @@ namespace vmhook
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
             if (!resolved_klass)
             {
+                VMHOOK_LOG("{} object::get_field('{}'): klass not resolved for this object - "
+                           "wrapper type may not be registered, or class not loaded.",
+                           vmhook::error_tag, name);
                 return std::nullopt;
             }
 
             const auto entry{ vmhook::find_field(resolved_klass, name) };
             if (!entry)
             {
+                VMHOOK_LOG("{} object::get_field('{}'): field not found in class hierarchy.",
+                           vmhook::error_tag, name);
                 return std::nullopt;
             }
 
@@ -10425,12 +10615,18 @@ namespace vmhook
             vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
             if (!resolved_klass)
             {
+                VMHOOK_LOG("{} object::get_field('{}') (static): klass not resolved for wrapper "
+                           "type - register_class<T>() may be missing or class not loaded.",
+                           vmhook::error_tag, name);
                 return std::nullopt;
             }
 
             const auto entry{ vmhook::find_field(resolved_klass, name) };
             if (!entry)
             {
+                VMHOOK_LOG("{} object::get_field('{}') (static): field not found in class "
+                           "hierarchy.",
+                           vmhook::error_tag, name);
                 return std::nullopt;
             }
 
@@ -10471,6 +10667,8 @@ namespace vmhook
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
             if (!resolved_klass)
             {
+                VMHOOK_LOG("{} object::get_method('{}'): klass not resolved for this object.",
+                           vmhook::error_tag, method_name);
                 return std::nullopt;
             }
 
@@ -10496,6 +10694,8 @@ namespace vmhook
                 }
             }
 
+            VMHOOK_LOG("{} object::get_method('{}'): method not found in class hierarchy.",
+                       vmhook::error_tag, method_name);
             return std::nullopt;
         }
 
@@ -10519,6 +10719,8 @@ namespace vmhook
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
             if (!resolved_klass)
             {
+                VMHOOK_LOG("{} object::get_method('{}{}'): klass not resolved for this object.",
+                           vmhook::error_tag, method_name, method_signature);
                 return std::nullopt;
             }
 
@@ -10549,6 +10751,9 @@ namespace vmhook
                 }
             }
 
+            VMHOOK_LOG("{} object::get_method('{}{}'): no method with this exact name+signature "
+                       "found in class hierarchy.",
+                       vmhook::error_tag, method_name, method_signature);
             return std::nullopt;
         }
 
@@ -10571,6 +10776,8 @@ namespace vmhook
             vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
             if (!resolved_klass)
             {
+                VMHOOK_LOG("{} object::get_method('{}') (static): klass not resolved for wrapper type.",
+                           vmhook::error_tag, method_name);
                 return std::nullopt;
             }
 
@@ -10596,6 +10803,8 @@ namespace vmhook
                 }
             }
 
+            VMHOOK_LOG("{} object::get_method('{}') (static): method not found in class hierarchy.",
+                       vmhook::error_tag, method_name);
             return std::nullopt;
         }
 
@@ -10620,6 +10829,8 @@ namespace vmhook
             vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
             if (!resolved_klass)
             {
+                VMHOOK_LOG("{} object::get_method('{}{}') (static): klass not resolved for wrapper type.",
+                           vmhook::error_tag, method_name, method_signature);
                 return std::nullopt;
             }
 
@@ -10650,6 +10861,9 @@ namespace vmhook
                 }
             }
 
+            VMHOOK_LOG("{} object::get_method('{}{}') (static): no method with this exact "
+                       "name+signature found in class hierarchy.",
+                       vmhook::error_tag, method_name, method_signature);
             return std::nullopt;
         }
 
@@ -11915,6 +12129,9 @@ namespace vmhook
         void* const collection_oop{ vmhook::hotspot::decode_oop_pointer(compressed_collection) };
         if (!collection_oop || !vmhook::hotspot::is_valid_pointer(collection_oop))
         {
+            VMHOOK_LOG("{} field_proxy::value_t::to_vector<{}>(): underlying collection OOP is "
+                       "null or invalid (compressed=0x{:08X}) - returning empty vector.",
+                       vmhook::warning_tag, typeid(element_type).name(), compressed_collection);
             return {};
         }
 
@@ -11937,6 +12154,10 @@ namespace vmhook
         void* const map_oop{ vmhook::hotspot::decode_oop_pointer(compressed_map) };
         if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop))
         {
+            VMHOOK_LOG("{} field_proxy::value_t::to_entries<{},{}>(): underlying map OOP is null "
+                       "or invalid (compressed=0x{:08X}) - returning empty entries vector.",
+                       vmhook::warning_tag, typeid(key_type).name(), typeid(value_type).name(),
+                       compressed_map);
             return {};
         }
         return vmhook::map{ map_oop }.to_entries<key_type, value_type>();
@@ -11957,24 +12178,36 @@ namespace vmhook
     {
         if (!string_oop || !vmhook::hotspot::is_valid_pointer(string_oop))
         {
+            VMHOOK_LOG("{} read_java_string(): string_oop is null or invalid (0x{:016X}).",
+                       vmhook::warning_tag, reinterpret_cast<std::uintptr_t>(string_oop));
             return {};
         }
 
         vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
         if (!string_klass)
         {
+            VMHOOK_LOG("{} read_java_string(): find_class('java/lang/String') returned null - "
+                       "very early bootstrap, or VMStructs+JNI both failed.",
+                       vmhook::error_tag);
             return {};
         }
 
         const std::uint32_t arr_compressed{ vmhook::get_field<std::uint32_t>(string_oop, string_klass, "value") };
         if (!arr_compressed)
         {
+            // Backing-array compressed pointer is 0 - this is the legitimate
+            // state for a freshly-allocated (uninitialised) String OOP.  Don't
+            // log here to avoid spamming the common case.
             return {};
         }
 
         void* const arr_oop{ vmhook::hotspot::decode_oop_pointer(arr_compressed) };
         if (!arr_oop || !vmhook::hotspot::is_valid_pointer(arr_oop))
         {
+            VMHOOK_LOG("{} read_java_string(): backing array OOP is invalid after decompression "
+                       "(compressed=0x{:08X}, decoded=0x{:016X}).",
+                       vmhook::warning_tag, arr_compressed,
+                       reinterpret_cast<std::uintptr_t>(arr_oop));
             return {};
         }
 
@@ -11982,6 +12215,9 @@ namespace vmhook
         const std::int32_t length{ *reinterpret_cast<const std::int32_t*>(arr + 12) };
         if (length <= 0 || length > 4096)
         {
+            VMHOOK_LOG("{} read_java_string(): array length {} out of range (must be 1..4096) - "
+                       "either an empty string or the array header is corrupt.",
+                       vmhook::warning_tag, length);
             return {};
         }
 
@@ -12481,7 +12717,18 @@ namespace vmhook
                 std::memcpy(&current, address, sizeof(field_type));
                 on_change(field_type{}, current);
             }
-            catch (...) { /* swallowed */ }
+            catch (const std::exception& ex)
+            {
+                VMHOOK_LOG("{} watch_static_field<{}>: user on_change callback threw: {} - "
+                           "swallowed to keep the DR trap handler safe.",
+                           vmhook::error_tag, typeid(field_type).name(), ex.what());
+            }
+            catch (...)
+            {
+                VMHOOK_LOG("{} watch_static_field<{}>: user on_change callback threw an unknown "
+                           "exception - swallowed to keep the DR trap handler safe.",
+                           vmhook::error_tag, typeid(field_type).name());
+            }
         };
         detail::dr_slots[slot].in_use.store(true, std::memory_order_release);
 
@@ -12641,7 +12888,16 @@ namespace vmhook
                                 detail::class_load_callbacks.end(), cb),
                     detail::class_load_callbacks.end());
             }
-            catch (...) { /* swallowed */ }
+            catch (const std::exception& ex)
+            {
+                VMHOOK_LOG("{} on_class_loaded on_stop: failed to erase callback: {} - swallowed.",
+                           vmhook::error_tag, ex.what());
+            }
+            catch (...)
+            {
+                VMHOOK_LOG("{} on_class_loaded on_stop: unknown exception while erasing callback - "
+                           "swallowed.", vmhook::error_tag);
+            }
         };
 
         return watch_handle{ std::move(block) };
@@ -12789,7 +13045,16 @@ namespace vmhook
                                 detail::exception_callbacks.end(), cb),
                     detail::exception_callbacks.end());
             }
-            catch (...) { /* swallowed */ }
+            catch (const std::exception& ex)
+            {
+                VMHOOK_LOG("{} on_exception on_stop: failed to erase callback: {} - swallowed.",
+                           vmhook::error_tag, ex.what());
+            }
+            catch (...)
+            {
+                VMHOOK_LOG("{} on_exception on_stop: unknown exception while erasing callback - "
+                           "swallowed.", vmhook::error_tag);
+            }
         };
 
         return watch_handle{ std::move(block) };
