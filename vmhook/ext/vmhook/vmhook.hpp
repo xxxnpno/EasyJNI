@@ -9691,6 +9691,106 @@ namespace vmhook
             //   static   Object=116, Bool=119, Byte=122, Char=125,
             //            Short=128, Int=131, Long=134, Float=137,
             //            Double=140, Void=143
+            // Helper that runs after every JNI Call*Method dispatch to surface any
+            // pending Java exception in our own log line.  Some host environments
+            // (notably Forge with a wrapped System.err) swallow ExceptionDescribe's
+            // stderr output, so we additionally extract Throwable.toString() and
+            // embed it in VMHOOK_LOG.  Without this, exceptions silently poison
+            // subsequent JNI operations on the thread and produce "the method
+            // seemed to run but nothing happened" behaviour.
+            using exception_check_t          = std::uint8_t(*)(void*);
+            using exception_occurred_t       = void*(*)(void*);
+            using exception_describe_t       = void(*)(void*);
+            using exception_clear_t          = void(*)(void*);
+            using get_object_class_t         = void*(*)(void*, void*);
+            using get_method_id_t            = void*(*)(void*, void*, const char*, const char*);
+            using call_object_method_t       = void*(*)(void*, void*, void*);
+            using get_string_utf_chars_t     = const char*(*)(void*, void*, std::uint8_t*);
+            using release_string_utf_chars_t = void(*)(void*, void*, const char*);
+            using delete_local_ref_t         = void(*)(void*, void*);
+
+            auto check_callee_exception = [&]() noexcept -> void
+            {
+                auto* const exc_check{ reinterpret_cast<exception_check_t>(table[228]) };
+                if (!exc_check || exc_check(env_void) == 0u)
+                {
+                    return;
+                }
+
+                auto* const exc_occurred{ reinterpret_cast<exception_occurred_t>(table[15]) };
+                void* const throwable{ exc_occurred ? exc_occurred(env_void) : nullptr };
+
+                // ExceptionDescribe prints the stack trace AND clears the pending
+                // exception as a side effect.  We call it first so stderr-capturing
+                // launchers (Lunar, plain Forge launchers without stderr wrapping)
+                // get the full backtrace.
+                if (auto* const exc_desc{ reinterpret_cast<exception_describe_t>(table[16]) })
+                {
+                    exc_desc(env_void);
+                }
+                else if (auto* const exc_clr{ reinterpret_cast<exception_clear_t>(table[17]) })
+                {
+                    exc_clr(env_void);
+                }
+
+                // Now extract Throwable.toString() into a std::string so the
+                // exception's class+message also lands in our VMHOOK_LOG output
+                // (which is what users see when stderr is captured/wrapped).
+                std::string exception_text;
+                void* throwable_class{ nullptr };
+                void* result_handle{ nullptr };
+                if (throwable)
+                {
+                    auto* const get_object_class{ reinterpret_cast<get_object_class_t>(table[31]) };
+                    auto* const get_method_id{ reinterpret_cast<get_method_id_t>(table[33]) };
+                    auto* const call_object_method{ reinterpret_cast<call_object_method_t>(table[36]) };
+                    auto* const get_utf{ reinterpret_cast<get_string_utf_chars_t>(table[169]) };
+                    auto* const release_utf{ reinterpret_cast<release_string_utf_chars_t>(table[170]) };
+                    auto* const exc_clr{ reinterpret_cast<exception_clear_t>(table[17]) };
+
+                    if (get_object_class && get_method_id && call_object_method && get_utf && release_utf)
+                    {
+                        throwable_class = get_object_class(env_void, throwable);
+                        if (throwable_class)
+                        {
+                            void* const to_string_id{ get_method_id(env_void, throwable_class,
+                                                                     "toString", "()Ljava/lang/String;") };
+                            if (exc_clr && exc_check(env_void) != 0u) { exc_clr(env_void); }
+
+                            if (to_string_id)
+                            {
+                                result_handle = call_object_method(env_void, throwable, to_string_id);
+                                if (exc_clr && exc_check(env_void) != 0u) { exc_clr(env_void); }
+
+                                if (result_handle)
+                                {
+                                    const char* const utf{ get_utf(env_void, result_handle, nullptr) };
+                                    if (utf)
+                                    {
+                                        exception_text.assign(utf);
+                                        release_utf(env_void, result_handle, utf);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): Java exception thrown by callee: {}",
+                           vmhook::error_tag, this->name(), this->signature_text,
+                           exception_text.empty() ? "(unable to extract via Throwable.toString)" : exception_text);
+
+                // Best-effort cleanup of local references so they don't accumulate
+                // on long-lived attached threads.  Missing DeleteLocalRef just leaks
+                // a few jobjects, no correctness issue.
+                if (auto* const delete_local_ref{ reinterpret_cast<delete_local_ref_t>(table[23]) })
+                {
+                    if (throwable)       { delete_local_ref(env_void, throwable); }
+                    if (throwable_class) { delete_local_ref(env_void, throwable_class); }
+                    if (result_handle)   { delete_local_ref(env_void, result_handle); }
+                }
+            };
+
             switch (ret_char)
             {
                 case 'V':
@@ -9700,29 +9800,7 @@ namespace vmhook
                     if (auto* const fn{ reinterpret_cast<fn_t>(table[slot]) })
                     {
                         fn(env_void, receiver, method_id, values);
-
-                        // Diagnostic: surface any Java exception thrown by the callee.
-                        // Without this, exceptions silently poison subsequent JNI
-                        // operations on the thread and produce "the method seemed to
-                        // run but nothing happened" behaviour, e.g. for our outgoing
-                        // chat path on JDK 9+.
-                        using exception_check_t = std::uint8_t(*)(void*);
-                        using exception_describe_t = void(*)(void*);
-                        using exception_clear_t = void(*)(void*);
-                        auto* const exc_check{ reinterpret_cast<exception_check_t>(table[228]) };
-                        if (exc_check && exc_check(env_void) != 0u)
-                        {
-                            VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): Java exception thrown by callee.",
-                                       vmhook::error_tag, this->name(), this->signature_text);
-                            if (auto* const exc_desc{ reinterpret_cast<exception_describe_t>(table[16]) })
-                            {
-                                exc_desc(env_void);
-                            }
-                            if (auto* const exc_clr{ reinterpret_cast<exception_clear_t>(table[17]) })
-                            {
-                                exc_clr(env_void);
-                            }
-                        }
+                        check_callee_exception();
                     }
                     else
                     {
@@ -9736,64 +9814,80 @@ namespace vmhook
                     using fn_t = std::uint8_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 119u : 39u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) != 0 }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const std::uint8_t r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r != 0 };
                 }
                 case 'B':
                 {
                     using fn_t = std::int8_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 122u : 42u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const std::int8_t r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r };
                 }
                 case 'C':
                 {
                     using fn_t = std::uint16_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 125u : 45u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const std::uint16_t r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r };
                 }
                 case 'S':
                 {
                     using fn_t = std::int16_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 128u : 48u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const std::int16_t r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r };
                 }
                 case 'I':
                 {
                     using fn_t = std::int32_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 131u : 51u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const std::int32_t r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r };
                 }
                 case 'J':
                 {
                     using fn_t = std::int64_t(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 134u : 54u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const std::int64_t r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r };
                 }
                 case 'F':
                 {
                     using fn_t = float(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 137u : 57u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const float r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r };
                 }
                 case 'D':
                 {
                     using fn_t = double(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 140u : 60u };
                     auto* const fn{ reinterpret_cast<fn_t>(table[slot]) };
-                    return fn ? value_t{ fn(env_void, receiver, method_id, values) }
-                              : value_t{ std::monostate{} };
+                    if (!fn) { return value_t{ std::monostate{} }; }
+                    const double r{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
+                    return value_t{ r };
                 }
                 case 'L':
                 case '[':
@@ -9809,6 +9903,7 @@ namespace vmhook
                         return value_t{ std::monostate{} };
                     }
                     void* const result_handle{ fn(env_void, receiver, method_id, values) };
+                    check_callee_exception();
                     // Convenience: when the method returns
                     // java.lang.String, return a std::string copy.
                     if (rparen == std::string::npos)
