@@ -8582,6 +8582,196 @@ namespace vmhook
         }
     }
 
+    // -------------------------------------------------------------------------
+    // vmhook::jni — public surface for direct JNI access
+    //
+    // The actual implementations live in vmhook::detail::jni_* (and have for
+    // a while) because most call sites in this header still reach them with
+    // the long name.  This namespace is a thin, well-documented forwarding
+    // layer that exposes the same helpers under the spelling we want library
+    // users to write:
+    //
+    //     vmhook::jni::find_class("java/lang/String")
+    //     vmhook::jni::get_method_id(klass, "<init>", "(I)V")
+    //     vmhook::jni::new_string_utf("hello")
+    //     vmhook::jni::make_unique<my_wrapper>("com/example/MyClass", 1, 2.0)
+    //
+    // The `jni_` prefix the underlying functions carry is redundant once a
+    // dedicated namespace conveys the same thing.  vmhook::detail::jni_*
+    // remains available for internal use and for source compatibility with
+    // any existing consumer code; new code should prefer vmhook::jni::*.
+    //
+    // Thread-safety contract is the same as the underlying helpers: each
+    // call requires the current thread to be JNI-attached (use
+    // vmhook::hotspot::ensure_current_java_thread() if unsure).
+    // -------------------------------------------------------------------------
+    namespace jni
+    {
+        // The jvalue union HotSpot expects on the stack for CallXMethodA / NewObjectA.
+        using value = vmhook::detail::jni_value;
+
+        /*
+            @brief Look up a JNI function pointer by table index.
+            @tparam index      Zero-based index into the JNIEnv function table
+                               (e.g. 6 = FindClass, 30 = NewObjectA, 33 = GetMethodID,
+                               63 = CallVoidMethodA, 93 = CallNonvirtualVoidMethodA).
+            @tparam function_t Expected function pointer type.
+            @param env         JNIEnv* (use vmhook::hotspot::current_jni_env).
+            @return  Callable function pointer, or nullptr if env is invalid.
+        */
+        template<std::size_t index, typename function_t>
+        inline auto function(void* const env) noexcept
+        {
+            return vmhook::detail::jni_function<index, function_t>(env);
+        }
+
+        // Decode a JNI local-reference handle (jobject) to the raw heap OOP.
+        inline auto decode_object(void* const object_handle) noexcept -> void*
+        {
+            return vmhook::detail::jni_decode_object(object_handle);
+        }
+
+        // Wrap a raw heap OOP as a fake JNI handle (pointer-to-storage).
+        // handle_storage is caller-owned and must outlive the JNI call.
+        inline auto oop_handle(void* const oop, void*& handle_storage) noexcept -> void*
+        {
+            return vmhook::detail::jni_oop_handle(oop, handle_storage);
+        }
+
+        // JNI FindClass.  Looks up a class through the calling thread's
+        // context classloader.  See vmhook::find_class for a HotSpot-internal
+        // lookup that doesn't need a classloader.
+        inline auto find_class(const std::string_view class_name) noexcept -> void*
+        {
+            return vmhook::detail::jni_find_class(class_name);
+        }
+
+        // Multi-step lookup: tries thread context loader, system loader, then
+        // Forge's LaunchClassLoader as last resort.  Returns the resolved
+        // HotSpot Klass* (NOT a JNI handle).
+        inline auto find_class_with_context_loader(const std::string_view class_name) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            return vmhook::detail::jni_find_class_with_context_loader(class_name);
+        }
+
+        // JNI ExceptionCheck + ExceptionClear.  Idempotent.
+        inline auto exception_clear() noexcept -> void
+        {
+            vmhook::detail::jni_exception_clear();
+        }
+
+        // JNI GetObjectClass.  Returns a jclass local-ref handle.
+        inline auto get_object_class(void* const object_handle) noexcept -> void*
+        {
+            return vmhook::detail::jni_get_object_class(object_handle);
+        }
+
+        // JNI GetMethodID (instance method).  Clears pending exceptions on failure.
+        inline auto get_method_id(void* const klass,
+                                  const std::string& name,
+                                  const std::string& signature) noexcept -> void*
+        {
+            return vmhook::detail::jni_get_method_id(klass, name, signature);
+        }
+
+        // JNI GetStaticMethodID.
+        inline auto get_static_method_id(void* const klass,
+                                         const std::string& name,
+                                         const std::string& signature) noexcept -> void*
+        {
+            return vmhook::detail::jni_get_static_method_id(klass, name, signature);
+        }
+
+        // JNI GetStaticFieldID.
+        inline auto get_static_field_id(void* const klass,
+                                        const std::string& name,
+                                        const std::string& signature) noexcept -> void*
+        {
+            return vmhook::detail::jni_get_static_field_id(klass, name, signature);
+        }
+
+        // JNI GetStaticObjectField.  Returns a jobject local-ref handle.
+        inline auto get_static_object_field(void* const klass, void* const field_id) noexcept -> void*
+        {
+            return vmhook::detail::jni_get_static_object_field(klass, field_id);
+        }
+
+        // JNI CallObjectMethodA.  args may be nullptr for zero-argument methods.
+        inline auto call_object_method(void* const object,
+                                       void* const method_id,
+                                       const vmhook::jni::value* const args = nullptr) noexcept -> void*
+        {
+            return vmhook::detail::jni_call_object_method(object, method_id, args);
+        }
+
+        // JNI CallStaticObjectMethodA.
+        inline auto call_static_object_method(void* const klass,
+                                              void* const method_id,
+                                              const vmhook::jni::value* const args = nullptr) noexcept -> void*
+        {
+            return vmhook::detail::jni_call_static_object_method(klass, method_id, args);
+        }
+
+        // Given a jclass handle (= java.lang.Class mirror), return the
+        // underlying HotSpot Klass*.  Useful for converting a JNI lookup
+        // back into a vmhook-internal pointer.
+        inline auto klass_from_class_mirror(void* const class_handle) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            return vmhook::detail::jni_klass_from_class_mirror(class_handle);
+        }
+
+        // JNI NewStringUTF.  Returns a jstring local-ref handle.
+        inline auto new_string_utf(const std::string_view value) noexcept -> void*
+        {
+            return vmhook::detail::jni_new_string_utf(value);
+        }
+
+        // JNI GetStringUTFChars (+ release).  Copies into a std::string.
+        inline auto get_string_utf(void* const string_handle) noexcept -> std::string
+        {
+            return vmhook::detail::jni_get_string_utf(string_handle);
+        }
+
+        /*
+            @brief Returns the JVM signature descriptor for a C++ argument type.
+            @details  Compile-time table mapping; see jni_signature_for_arg for
+                      the full list (std::string -> "Ljava/lang/String;",
+                      bool -> "Z", float -> "F", etc.).
+        */
+        template<typename arg_type>
+        inline auto signature_for_arg() noexcept -> std::string
+        {
+            return vmhook::detail::jni_signature_for_arg<arg_type>();
+        }
+
+        /*
+            @brief Construct a Java object via JNI NewObjectA and return a wrapper.
+            @details
+            Allocates and runs the full constructor chain through the JVM's
+            standard interpreter path - the resulting object has its mark
+            word, klass pointer, AND every field (including inherited ones)
+            properly initialised.  Prefer this entry point over the lower-level
+            TLAB allocator when you have JNI available and the constructor
+            does real work; see make_unique() in the parent namespace for the
+            high-level wrapper that picks between this and the TLAB path.
+
+            @tparam wrapper_type  C++ wrapper class deriving from vmhook::object_base.
+            @tparam args_t        Constructor argument types.
+            @param class_name     Internal JVM class name with '/' separators.
+            @param args           Constructor arguments.
+            @return  Constructed wrapper, or nullptr on failure (each failure
+                     path logs via VMHOOK_LOG).
+        */
+        template<typename wrapper_type, typename... args_t>
+        inline auto make_unique(const std::string& class_name, args_t&&... args) noexcept
+            -> std::unique_ptr<wrapper_type>
+        {
+            return vmhook::detail::jni_make_unique<wrapper_type>(class_name, std::forward<args_t>(args)...);
+        }
+    }
+
     /*
         @brief Constructs a new Java object and returns a C++ wrapper.
         @tparam T The C++ wrapper class (must derive from vmhook::object).

@@ -109,6 +109,40 @@ static_assert(!vmhook::detail::dependent_false_v<std::vector<int>>,
               "dependent_false_v<T> must be false for any T");
 
 // -----------------------------------------------------------------------------
+// vmhook::jni namespace — public surface
+//
+// New public spelling for the JNI helpers that used to require digging into
+// vmhook::detail::jni_*.  These static_asserts pin down the type signatures
+// of the wrappers so accidental drift between detail::jni_* and jni::* (or
+// missing wrappers as the API grows) is caught at build time.
+// -----------------------------------------------------------------------------
+static_assert(std::is_same_v<vmhook::jni::value, vmhook::detail::jni_value>,
+              "vmhook::jni::value must alias the underlying jni_value union");
+
+// These are non-template, non-overloaded - take their address and check the type.
+// If the wrapper signature ever drifts from the underlying detail function, the
+// types won't match and this fires at compile time.
+static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::find_class), std::string_view>,
+              "vmhook::jni::find_class must accept string_view and return void* (jclass handle)");
+static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::decode_object), void*>,
+              "vmhook::jni::decode_object must take a jobject and return the decoded oop");
+static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::new_string_utf), std::string_view>,
+              "vmhook::jni::new_string_utf must accept string_view");
+static_assert(std::is_invocable_r_v<std::string, decltype(vmhook::jni::get_string_utf), void*>,
+              "vmhook::jni::get_string_utf must return std::string");
+static_assert(std::is_invocable_r_v<void, decltype(vmhook::jni::exception_clear)>,
+              "vmhook::jni::exception_clear must take no args");
+static_assert(std::is_invocable_r_v<void*, decltype(vmhook::jni::get_object_class), void*>,
+              "vmhook::jni::get_object_class must take a jobject and return a jclass");
+
+// signature_for_arg<T> returns std::string (non-constexpr) so the cross-check
+// against the underlying detail::jni_signature_for_arg lives in
+// test_helpers.cpp where we can call it at runtime.  Here we just confirm the
+// wrapper exists and the return type matches.
+static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<int>()), std::string>,
+              "signature_for_arg<T> must return std::string");
+
+// -----------------------------------------------------------------------------
 // Platform / compiler / arch self-check (unchanged)
 // -----------------------------------------------------------------------------
 #if (VMHOOK_OS_WINDOWS + VMHOOK_OS_LINUX + VMHOOK_OS_MACOS \

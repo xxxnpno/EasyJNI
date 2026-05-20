@@ -501,6 +501,54 @@ static auto test_write_jni_arg_to_slot_null_unique_ptr() -> void
           storage == nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// 11. vmhook::jni wrappers - verify they delegate to the underlying detail
+//     functions with no signature drift.  signature_for_arg<T> returns a
+//     std::string (non-constexpr) so we cross-check at runtime instead of
+//     via static_assert.
+// ---------------------------------------------------------------------------
+static auto test_jni_namespace_signature_for_arg() -> void
+{
+    check("jni::signature_for_arg<bool> == 'Z'",
+          vmhook::jni::signature_for_arg<bool>() == "Z");
+    check("jni::signature_for_arg<int8_t> == 'B'",
+          vmhook::jni::signature_for_arg<std::int8_t>() == "B");
+    check("jni::signature_for_arg<int16_t> == 'S'",
+          vmhook::jni::signature_for_arg<std::int16_t>() == "S");
+    check("jni::signature_for_arg<uint16_t> == 'C'",
+          vmhook::jni::signature_for_arg<std::uint16_t>() == "C");
+    check("jni::signature_for_arg<int32_t> == 'I'",
+          vmhook::jni::signature_for_arg<std::int32_t>() == "I");
+    check("jni::signature_for_arg<int64_t> == 'J'",
+          vmhook::jni::signature_for_arg<std::int64_t>() == "J");
+    check("jni::signature_for_arg<float> == 'F'",
+          vmhook::jni::signature_for_arg<float>() == "F");
+    check("jni::signature_for_arg<double> == 'D'",
+          vmhook::jni::signature_for_arg<double>() == "D");
+    check("jni::signature_for_arg<string> == 'Ljava/lang/String;'",
+          vmhook::jni::signature_for_arg<std::string>() == "Ljava/lang/String;");
+    check("jni::signature_for_arg<string_view> == 'Ljava/lang/String;'",
+          vmhook::jni::signature_for_arg<std::string_view>() == "Ljava/lang/String;");
+    check("jni::signature_for_arg<const char*> == 'Ljava/lang/String;'",
+          vmhook::jni::signature_for_arg<const char*>() == "Ljava/lang/String;");
+
+    // Cross-check that the wrapper returns the same string as the underlying
+    // implementation it delegates to.  Catches accidental drift between the
+    // two if someone adds a new type to detail::jni_signature_for_arg but
+    // forgets the corresponding wrapper instantiation (templates compile
+    // lazily, so without this check the wrapper would just silently fall to
+    // the default 'I' branch).
+    check("jni::signature_for_arg<bool> matches detail::jni_signature_for_arg<bool>",
+          vmhook::jni::signature_for_arg<bool>()
+          == vmhook::detail::jni_signature_for_arg<bool>());
+    check("jni::signature_for_arg<string> matches detail::jni_signature_for_arg<string>",
+          vmhook::jni::signature_for_arg<std::string>()
+          == vmhook::detail::jni_signature_for_arg<std::string>());
+    check("jni::signature_for_arg<int64_t> matches detail::jni_signature_for_arg<int64_t>",
+          vmhook::jni::signature_for_arg<std::int64_t>()
+          == vmhook::detail::jni_signature_for_arg<std::int64_t>());
+}
+
 static auto test_write_jni_arg_to_slot_primitive_branches() -> void
 {
     // Sanity that the primitive branches still hit, after the static_assert
@@ -553,6 +601,7 @@ int main()
     test_write_jni_arg_to_slot_unique_ptr_branch();
     test_write_jni_arg_to_slot_null_unique_ptr();
     test_write_jni_arg_to_slot_primitive_branches();
+    test_jni_namespace_signature_for_arg();
 
     if (failures == 0)
     {
