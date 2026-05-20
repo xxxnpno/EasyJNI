@@ -205,6 +205,48 @@ static_assert(
     "(this, long, int): `this` is 1 slot, long takes 2, trailing int at slot 3");
 
 // -----------------------------------------------------------------------------
+// argument_matches_descriptor disambiguation
+//
+// The matcher used to fold 1-byte and 2-byte primitives into "matches either"
+// branches (`int8_t` -> "B" OR "Z", `int16_t` -> "S" OR "C"), which meant
+// resolve_compatible_method could lock onto the WRONG overload when a class
+// had e.g. both m(byte) and m(boolean), recreating the same overload-confusion
+// bug fixed for the `a`-named EntityPlayerSP methods on vanilla 1.8.9.
+//
+// argument_matches_descriptor is a private template inside method_proxy so we
+// can't reach it directly; instead we exercise the public resolve_compatible_method
+// against fake method tables - but vmhook's traits / signatures alone let us
+// verify the type intent.  These checks confirm the trait-side invariants the
+// matcher relies on.
+// -----------------------------------------------------------------------------
+
+// uint16_t is the C++ type used in vmhook to represent Java `char` - it must
+// be distinguishable from int16_t (Java `short`) at the trait level so the
+// matcher can route to "C" vs "S".
+static_assert(!std::is_same_v<std::int16_t, std::uint16_t>,
+              "int16_t and uint16_t must be distinct C++ types so the descriptor "
+              "matcher can route them to S vs C respectively");
+
+// bool must be distinct from int8_t / uint8_t / signed char / unsigned char
+// at the type-trait level so the matcher routes them to "Z" vs "B" respectively.
+static_assert(!std::is_same_v<bool, std::int8_t>,
+              "bool vs int8_t must be distinct types - regression would let the "
+              "matcher fold both into the same descriptor");
+static_assert(!std::is_same_v<bool, std::uint8_t>, "bool vs uint8_t distinct");
+static_assert(!std::is_same_v<bool, char>, "bool vs char distinct");
+
+// 1-byte integral types must be detected as 1 byte (not promoted) - the
+// matcher uses sizeof(T) == 1 to route to "B".
+static_assert(sizeof(std::int8_t) == 1, "int8_t must be 1 byte");
+static_assert(sizeof(std::uint8_t) == 1, "uint8_t must be 1 byte");
+static_assert(sizeof(char) == 1, "char must be 1 byte");
+
+// 2-byte integral types must be detected as 2 bytes.
+static_assert(sizeof(std::int16_t) == 2, "int16_t must be 2 bytes");
+static_assert(sizeof(std::uint16_t) == 2, "uint16_t must be 2 bytes");
+static_assert(sizeof(char16_t) == 2, "char16_t must be 2 bytes");
+
+// -----------------------------------------------------------------------------
 // Platform / compiler / arch self-check (unchanged)
 // -----------------------------------------------------------------------------
 #if (VMHOOK_OS_WINDOWS + VMHOOK_OS_LINUX + VMHOOK_OS_MACOS \

@@ -11306,13 +11306,30 @@ namespace vmhook
             {
                 return descriptor == "Z";
             }
+            // Java `char` is always 2 bytes wide and unsigned (UTF-16 code unit);
+            // map `char16_t` and `std::uint16_t` to "C" specifically.  This used
+            // to be folded into the generic 2-byte branch alongside "S", which
+            // meant a `uint16_t` argument matched BOTH the `S` and `C`
+            // descriptors — recreating the same first-match-wins overload
+            // resolution bug that bit vanilla Minecraft 1.8.9
+            // EntityPlayerSP::a() before commit 1a536b7 fixed it on the JNI
+            // dispatch side.
+            else if constexpr (std::is_same_v<clean_type, char16_t> || std::is_same_v<clean_type, std::uint16_t>)
+            {
+                return descriptor == "C";
+            }
+            // Java `byte` is signed 8-bit; map `int8_t` / `uint8_t` /
+            // `(un)signed char` to "B" only (NOT "Z" — that's the boolean
+            // descriptor and `bool` is the only C++ type allowed to match it).
             else if constexpr (std::is_integral_v<clean_type> && sizeof(clean_type) == 1)
             {
-                return descriptor == "B" || descriptor == "Z";
+                return descriptor == "B";
             }
+            // Java `short` is signed 16-bit; signed 2-byte types map to "S"
+            // only (the unsigned 2-byte branch above already claimed "C").
             else if constexpr (std::is_integral_v<clean_type> && sizeof(clean_type) == 2)
             {
-                return descriptor == "S" || descriptor == "C";
+                return descriptor == "S";
             }
             else if constexpr (std::is_integral_v<clean_type> && sizeof(clean_type) == 4)
             {
