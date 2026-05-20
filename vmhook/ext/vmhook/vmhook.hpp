@@ -6662,6 +6662,74 @@ namespace vmhook
             @param index  Zero-based argument index (0 = this / first parameter).
             @return The decoded argument value, or base_t{} on failure.
         */
+        /*
+            @brief Compile-time slot width of a Java arg of C++ type T.
+            @details
+            HotSpot's interpreter stores each `long` and `double` parameter
+            in TWO adjacent local-variable slots; every other type (int,
+            float, object, etc.) takes one slot.  Both `arg index` (which
+            arg, in declaration order) and `slot index` (where it lives in
+            the locals array) are needed when walking frames - and they
+            differ as soon as any earlier arg was a long or double.
+
+            Mapping convention:
+              std::int64_t / std::uint64_t -> Java long   -> 2 slots
+              double                       -> Java double -> 2 slots
+              everything else              -> 1 slot
+        */
+        template<typename type>
+        inline constexpr bool is_java_double_slot_v{
+            std::is_same_v<std::remove_cvref_t<type>, std::int64_t>
+            || std::is_same_v<std::remove_cvref_t<type>, std::uint64_t>
+            || std::is_same_v<std::remove_cvref_t<type>, double> };
+
+        /*
+            @brief Compile-time table of JVM slot offsets, one per arg in
+                   a tuple of C++ arg types.
+            @details
+            For a tuple `(int, long, int)`:
+              result[0] = 0  // int starts at slot 0
+              result[1] = 1  // long starts at slot 1, takes slots 1 and 2
+              result[2] = 3  // second int starts at slot 3 (NOT slot 2)
+
+            Built once at template instantiation; never recomputed.
+
+            Critical: extract_frame_arg used to be called with the TUPLE
+            INDEX directly (`extract_frame_arg<T>(frame, 0)`,
+            `extract_frame_arg<T>(frame, 1)`, ...).  That happens to work
+            when no arg is a long or double, but every method whose
+            argument list contains a J/D followed by anything else read
+            the wrong slot for every following arg and silently fed the
+            user detour garbage.
+        */
+        template<typename tuple_type>
+        struct java_slot_offsets;
+
+        template<typename... arg_types>
+        struct java_slot_offsets<std::tuple<arg_types...>>
+        {
+            static constexpr auto compute() noexcept
+            {
+                std::array<std::int32_t, sizeof...(arg_types)> offsets{};
+                std::int32_t offset{ 0 };
+                std::size_t index{ 0 };
+                (
+                    (offsets[index++] = offset,
+                     offset += (vmhook::detail::is_java_double_slot_v<arg_types> ? 2 : 1)),
+                    ...
+                );
+                return offsets;
+            }
+
+            static constexpr auto value{ compute() };
+        };
+
+        template<>
+        struct java_slot_offsets<std::tuple<>>
+        {
+            static constexpr std::array<std::int32_t, 0> value{};
+        };
+
         template<typename value_type>
         auto extract_frame_arg(vmhook::hotspot::frame* const frame, const std::int32_t index)
             -> std::remove_cvref_t<value_type>
@@ -7239,12 +7307,19 @@ namespace vmhook
             (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot* const slot)
                 {
                     vmhook::return_value retval{ slot, frame_pointer };
-                    // Slots indexed from 0: instance methods have 'this' at slot 0.
+                    // Per-arg JVM slot offsets, computed at template-instantiation
+                    // time.  Each long / double consumes TWO slots in HotSpot's
+                    // interpreter local-variable array, so passing the raw tuple
+                    // index (0, 1, 2, ...) to extract_frame_arg reads garbage as
+                    // soon as any long/double arg precedes a later arg.  See
+                    // detail::java_slot_offsets for the table.
                     auto invoke = [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
                     {
+                        constexpr auto slot_offsets{
+                            vmhook::detail::java_slot_offsets<method_arg_tuple_t>::value };
                         detour(retval,
                             vmhook::detail::extract_frame_arg<std::tuple_element_t<indexes, method_arg_tuple_t>>(
-                                frame_pointer, static_cast<std::int32_t>(indexes))...);
+                                frame_pointer, slot_offsets[indexes])...);
                     };
                     invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple_t>>{});
                 };
@@ -10092,6 +10167,16 @@ namespace vmhook
                     }
                 }
             }
+            else
+            {
+                static_assert(vmhook::detail::dependent_false_v<clean_value_type>,
+                              "field_proxy::set: unsupported value type.  Previously, types that "
+                              "weren't string / string_view / std::vector / unique_ptr<wrapper> / "
+                              "trivially_copyable silently no-op'd - the set call returned and the "
+                              "field was unchanged with no compile-time error or runtime warning.  "
+                              "Convert the value to one of those, or extend the if-constexpr chain "
+                              "above with a specific branch.");
+            }
         }
 
         /*
@@ -10456,25 +10541,25 @@ namespace vmhook
 
                 if (!this->cached_method_id)
                 {
-                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetMethodID returned null; "
-                               "falling back to raw Method* as jmethodID (works on JDK 8, "
-                               "likely no-op on JDK 9+ where jmethodID is tagged).",
-                               vmhook::warning_tag, this->name(), this->signature_text);
+                    // Previously: fell back to handing this->method straight
+                    // through as the jmethodID.  On JDK 8 that worked because
+                    // jmethodIDs WERE Method* pointers; on JDK 9+ they are
+                    // tagged slot pointers (`(slot << 1) | 1`) and the JVM
+                    // resolves them by `*(Method**)(id & ~1)` - handing it
+                    // an untagged Method* dereferences `*ConstMethod**` and
+                    // jumps to garbage on the next dispatch.  Quietly
+                    // "succeeding" only to corrupt the JVM is strictly worse
+                    // than failing the call.  Refuse and let the caller see
+                    // the diagnostic.
+                    VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetMethodID returned null - "
+                               "the receiver's class is not reachable via JNI from this thread, "
+                               "or the method does not exist on the runtime type.  Ensure the "
+                               "context classloader is set (vmhook now does this automatically "
+                               "at attach), and that the method name + signature match exactly "
+                               "(check overload resolution).  Aborting call.",
+                               vmhook::error_tag, this->name(), this->signature_text);
                     vmhook::detail::jni_exception_clear();
-                    if (this->method && vmhook::hotspot::is_valid_pointer(this->method))
-                    {
-                        // Fallback: hand the Method* through verbatim.
-                        // Some JNI implementations accept this when
-                        // GetMethodID can't resolve.
-                        this->cached_method_id = reinterpret_cast<void*>(this->method);
-                    }
-                    else
-                    {
-                        VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): no usable jmethodID and Method* "
-                                   "is null or invalid - aborting call.",
-                                   vmhook::error_tag, this->name(), this->signature_text);
-                        return value_t{ std::monostate{} };
-                    }
+                    return value_t{ std::monostate{} };
                 }
             }
 

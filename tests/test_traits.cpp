@@ -143,6 +143,68 @@ static_assert(std::is_same_v<decltype(vmhook::jni::signature_for_arg<int>()), st
               "signature_for_arg<T> must return std::string");
 
 // -----------------------------------------------------------------------------
+// java_slot_offsets — JVM interpreter slot widths for long / double
+//
+// HotSpot stores Java `long` and `double` parameters in TWO adjacent locals
+// slots; every other type takes one.  Before this trait existed, the wrapper
+// in vmhook::hook<T>() handed extract_frame_arg the C++ tuple index directly
+// as the slot index, which silently read garbage for every arg following a
+// long or double.
+// -----------------------------------------------------------------------------
+// Slot widths
+static_assert( vmhook::detail::is_java_double_slot_v<std::int64_t>,
+               "Java long must take 2 slots");
+static_assert( vmhook::detail::is_java_double_slot_v<std::uint64_t>,
+               "uint64_t (also mapped to Java long) must take 2 slots");
+static_assert( vmhook::detail::is_java_double_slot_v<double>,
+               "Java double must take 2 slots");
+static_assert(!vmhook::detail::is_java_double_slot_v<std::int32_t>,
+              "Java int must take 1 slot");
+static_assert(!vmhook::detail::is_java_double_slot_v<bool>,
+              "Java boolean must take 1 slot");
+static_assert(!vmhook::detail::is_java_double_slot_v<float>,
+              "Java float must take 1 slot (NOT double - different type)");
+static_assert(!vmhook::detail::is_java_double_slot_v<void*>,
+              "Object refs take 1 slot");
+static_assert(!vmhook::detail::is_java_double_slot_v<std::string>,
+              "String args take 1 slot");
+
+// Slot offset tables
+static_assert(vmhook::detail::java_slot_offsets<std::tuple<>>::value.size() == 0,
+              "Empty tuple yields empty offsets");
+
+static_assert(
+    vmhook::detail::java_slot_offsets<std::tuple<std::int32_t, std::int32_t, std::int32_t>>::value
+    == std::array<std::int32_t, 3>{ 0, 1, 2 },
+    "Three ints: tuple index == slot index");
+
+// (int, long, int) — the classic regression case: previously the second int
+// was read from slot 2 (the high half of the long) instead of slot 3.
+static_assert(
+    vmhook::detail::java_slot_offsets<std::tuple<std::int32_t, std::int64_t, std::int32_t>>::value
+    == std::array<std::int32_t, 3>{ 0, 1, 3 },
+    "(int, long, int): the trailing int must be slot 3, NOT slot 2 - "
+    "long occupies slots 1 and 2");
+
+// (long, long, int) — two longs in a row.
+static_assert(
+    vmhook::detail::java_slot_offsets<std::tuple<std::int64_t, std::int64_t, std::int32_t>>::value
+    == std::array<std::int32_t, 3>{ 0, 2, 4 },
+    "(long, long, int): trailing int at slot 4 - each long takes 2 slots");
+
+// (double, int, double) — double has the same slot-width-2 semantics as long.
+static_assert(
+    vmhook::detail::java_slot_offsets<std::tuple<double, std::int32_t, double>>::value
+    == std::array<std::int32_t, 3>{ 0, 2, 3 },
+    "(double, int, double): doubles occupy 2 slots each");
+
+// (this[object], long, int) — instance-method case.  `this` is a 1-slot oop.
+static_assert(
+    vmhook::detail::java_slot_offsets<std::tuple<void*, std::int64_t, std::int32_t>>::value
+    == std::array<std::int32_t, 3>{ 0, 1, 3 },
+    "(this, long, int): `this` is 1 slot, long takes 2, trailing int at slot 3");
+
+// -----------------------------------------------------------------------------
 // Platform / compiler / arch self-check (unchanged)
 // -----------------------------------------------------------------------------
 #if (VMHOOK_OS_WINDOWS + VMHOOK_OS_LINUX + VMHOOK_OS_MACOS \
