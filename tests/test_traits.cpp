@@ -6,8 +6,12 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
+// -----------------------------------------------------------------------------
+// is_vector
+// -----------------------------------------------------------------------------
 static_assert(vmhook::detail::is_vector_v<std::vector<int>>,
               "is_vector_v must recognise std::vector<int>");
 static_assert(vmhook::detail::is_vector_v<const std::vector<int>&>,
@@ -15,12 +19,98 @@ static_assert(vmhook::detail::is_vector_v<const std::vector<int>&>,
 static_assert(!vmhook::detail::is_vector_v<int>,
               "is_vector_v must reject non-vector types");
 
+// is_vector<...>::value_type_t had the same template-parameter-shadowing bug
+// is_unique_ptr had (see below): the std::true_type base inherits a
+// `using value_type = bool` typedef which silently won over the template
+// parameter, making value_type_t resolve to bool for every vector type.
+static_assert(std::is_same_v<typename vmhook::detail::is_vector<std::vector<int>>::value_type_t, int>,
+              "is_vector<vector<int>>::value_type_t must be int, NOT bool "
+              "(template-parameter shadowing the std::true_type::value_type "
+              "typedef would silently regress this)");
+static_assert(std::is_same_v<typename vmhook::detail::is_vector<std::vector<double>>::value_type_t, double>,
+              "is_vector<vector<double>>::value_type_t must be double");
+static_assert(std::is_same_v<typename vmhook::detail::is_vector<std::vector<std::string>>::value_type_t, std::string>,
+              "is_vector<vector<string>>::value_type_t must be string");
+
+// -----------------------------------------------------------------------------
+// is_unique_ptr
+// -----------------------------------------------------------------------------
 static_assert(vmhook::detail::is_unique_ptr_v<std::unique_ptr<int>>,
               "is_unique_ptr_v must recognise std::unique_ptr<int>");
 static_assert(!vmhook::detail::is_unique_ptr_v<int*>,
               "is_unique_ptr_v must reject raw pointers");
+static_assert(vmhook::detail::is_unique_ptr_v<const std::unique_ptr<int>&>,
+              "is_unique_ptr_v must strip cv-ref before testing");
 
-// Platform-detection sanity.  Exactly one OS macro must be 1.
+// THIS is the regression test for the bug commit 9466ca5 fixed.  Before the
+// fix, the partial specialisation was written as:
+//
+//   template<typename value_type, typename deleter_type>
+//   struct is_unique_ptr<std::unique_ptr<value_type, deleter_type>>
+//       : std::true_type
+//   { using value_type_t = value_type; };
+//
+// The std::true_type base (= std::integral_constant<bool, true>) brings in
+// `using value_type = bool;`.  Inside the class body, unqualified lookup of
+// `value_type` finds the INHERITED typedef before the template parameter of
+// the same name, so value_type_t collapsed to bool for every wrapper type.
+// Downstream `if constexpr (is_base_of_v<object_base, value_type_t>)` then
+// silently skipped the JNI-arg-write branch, leaving values[i].l == 0 and
+// dispatching null IChatComponent into Lunar / Forge / vanilla.
+static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_ptr<int>>::value_type_t, int>,
+              "is_unique_ptr<unique_ptr<int>>::value_type_t must be int, NOT bool "
+              "(template-parameter shadow regression).");
+static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_ptr<std::string>>::value_type_t, std::string>,
+              "is_unique_ptr<unique_ptr<string>>::value_type_t must be string");
+static_assert(std::is_same_v<typename vmhook::detail::is_unique_ptr<std::unique_ptr<vmhook::object_base>>::value_type_t, vmhook::object_base>,
+              "is_unique_ptr<unique_ptr<object_base>>::value_type_t must be object_base "
+              "(this is the exact trait usage that drives write_jni_arg_to_slot and "
+              "would re-introduce the chat-not-sending bug if it broke).");
+
+// And the indirect chain that makes the bug bite: a typical vmhook wrapper
+// like `class my_wrapper : public vmhook::object<my_wrapper>` is what users
+// pass through unique_ptr.  Verify the trait + is_base_of combination
+// resolves correctly.
+namespace {
+    struct test_wrapper : public vmhook::object<test_wrapper> {
+        using vmhook::object<test_wrapper>::object;
+    };
+}
+static_assert(std::is_base_of_v<vmhook::object_base, test_wrapper>,
+              "vmhook::object<T> -> object_base inheritance must hold for the "
+              "static_assert in write_jni_arg_to_slot to accept user wrappers");
+static_assert(std::is_base_of_v<
+                  vmhook::object_base,
+                  typename vmhook::detail::is_unique_ptr<std::unique_ptr<test_wrapper>>::value_type_t>,
+              "End-to-end: is_unique_ptr<unique_ptr<MyWrapper>>::value_type_t must yield "
+              "a type that derives from object_base.  Regression of this is what made "
+              "every player->add_chat_message(...) call pass null to the JVM.");
+
+// -----------------------------------------------------------------------------
+// is_unique_object_ptr (sibling trait — has bool_constant base, same shadow risk)
+// -----------------------------------------------------------------------------
+static_assert(vmhook::detail::is_unique_object_ptr<std::unique_ptr<test_wrapper>>::value,
+              "is_unique_object_ptr must report true for unique_ptr<MyWrapper>");
+static_assert(!vmhook::detail::is_unique_object_ptr<std::unique_ptr<int>>::value,
+              "is_unique_object_ptr must report false for unique_ptr<int> "
+              "(int is not an object_base)");
+static_assert(!vmhook::detail::is_unique_object_ptr<int>::value,
+              "is_unique_object_ptr must report false for raw int");
+
+// -----------------------------------------------------------------------------
+// dependent_false_v — the lazy static_assert helper used by the new
+// fall-through guards in write_jni_arg_to_slot / append_jni_arg.
+// -----------------------------------------------------------------------------
+static_assert(!vmhook::detail::dependent_false_v<int>,
+              "dependent_false_v<T> must always be false (it is meant to be passed "
+              "to static_assert in discarded if-constexpr branches and only fire "
+              "when its branch is actually reached at instantiation)");
+static_assert(!vmhook::detail::dependent_false_v<std::vector<int>>,
+              "dependent_false_v<T> must be false for any T");
+
+// -----------------------------------------------------------------------------
+// Platform / compiler / arch self-check (unchanged)
+// -----------------------------------------------------------------------------
 #if (VMHOOK_OS_WINDOWS + VMHOOK_OS_LINUX + VMHOOK_OS_MACOS \
    + VMHOOK_OS_IOS    + VMHOOK_OS_ANDROID) != 1
 #  error "exactly one VMHOOK_OS_* macro should be 1"

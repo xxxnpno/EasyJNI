@@ -421,6 +421,122 @@ static auto test_format_log_safe_on_bad_pattern() -> void
     check("format_log_handles_bad_pattern", !result.empty());
 }
 
+// ---------------------------------------------------------------------------
+// 10. write_jni_arg_to_slot for unique_ptr<wrapper> — regression test for the
+//     value_type-shadowing bug that silently dropped every IChatComponent arg
+//     into Lunar / Forge / vanilla addChatMessage calls.
+//
+//     The bug:
+//       template<typename value_type, typename deleter_type>
+//       struct is_unique_ptr<std::unique_ptr<value_type, deleter_type>>
+//           : std::true_type
+//       { using value_type_t = value_type; };
+//
+//     The std::true_type base inherits `using value_type = bool` from
+//     std::integral_constant<bool, true>; inside the class body unqualified
+//     name lookup found the inherited typedef first, so value_type_t became
+//     bool, then `is_base_of_v<object_base, value_type_t>` evaluated to
+//     `is_base_of_v<object_base, bool>` -> false, the unique_ptr branch in
+//     write_jni_arg_to_slot was silently skipped, and the JVM received
+//     values[0].l == nullptr for the IChatComponent arg.
+//
+//     This test wraps a sentinel oop in a test_wrapper, runs the arg slot
+//     packer, and asserts that value.l points back at the storage cell
+//     containing our sentinel.  Re-introducing the trait bug would set
+//     value.l to nullptr and this would fail loudly.
+// ---------------------------------------------------------------------------
+namespace {
+    struct test_wrapper_helpers : public vmhook::object<test_wrapper_helpers> {
+        using vmhook::object<test_wrapper_helpers>::object;
+    };
+}
+
+static auto test_write_jni_arg_to_slot_unique_ptr_branch() -> void
+{
+    // Sentinel OOP value - just an opaque pointer.  We never deref it; the
+    // arg-packer only stores it.
+    auto* const sentinel_oop{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xDEADBEEFCAFE0000ull)) };
+    auto wrapper{ std::make_unique<test_wrapper_helpers>(sentinel_oop) };
+
+    vmhook::detail::jni_value value{};
+    void* storage{ nullptr };
+    vmhook::detail::write_jni_arg_to_slot(value, storage, wrapper);
+
+    // value.l must be a NON-NULL pointer (specifically, &storage).
+    check("write_jni_arg_to_slot_unique_ptr_value_l_non_null",
+          value.l != nullptr);
+
+    // value.l must point at our local `storage` slot - that is the
+    // indirect-handle pattern the JVM expects (jobject = jobject*).
+    check("write_jni_arg_to_slot_unique_ptr_value_l_points_at_storage",
+          value.l == static_cast<void*>(&storage));
+
+    // The storage slot must hold our sentinel.  Re-introducing the trait
+    // shadow bug (value_type_t = bool) would skip both writes and leave
+    // storage == nullptr.
+    check("write_jni_arg_to_slot_unique_ptr_storage_holds_oop",
+          storage == sentinel_oop);
+
+    // Dereferencing value.l (the JVM-internal JNIHandles::resolve operation)
+    // must yield the sentinel - this is what call_jni's diagnostic dump
+    // does, and is also exactly what the JVM does inside CallVoidMethodA.
+    check("write_jni_arg_to_slot_unique_ptr_deref_yields_oop",
+          *static_cast<void**>(value.l) == sentinel_oop);
+}
+
+static auto test_write_jni_arg_to_slot_null_unique_ptr() -> void
+{
+    // A null unique_ptr arg should result in storage == nullptr but
+    // value.l still pointing at &storage (so the JVM receives a NULL jobject,
+    // not garbage).
+    std::unique_ptr<test_wrapper_helpers> wrapper{};   // empty
+
+    vmhook::detail::jni_value value{};
+    void* storage{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xDEADull)) };  // pre-fill to detect overwrite
+    vmhook::detail::write_jni_arg_to_slot(value, storage, wrapper);
+
+    check("write_jni_arg_to_slot_null_unique_ptr_value_l_still_points_at_storage",
+          value.l == static_cast<void*>(&storage));
+    check("write_jni_arg_to_slot_null_unique_ptr_storage_cleared",
+          storage == nullptr);
+}
+
+static auto test_write_jni_arg_to_slot_primitive_branches() -> void
+{
+    // Sanity that the primitive branches still hit, after the static_assert
+    // guard was added in the trailing else.
+    {
+        vmhook::detail::jni_value value{};
+        void* storage{};
+        vmhook::detail::write_jni_arg_to_slot(value, storage, true);
+        check("write_jni_arg_to_slot_bool", value.z == true);
+    }
+    {
+        vmhook::detail::jni_value value{};
+        void* storage{};
+        vmhook::detail::write_jni_arg_to_slot(value, storage, std::int32_t{ 42 });
+        check("write_jni_arg_to_slot_int", value.i == 42);
+    }
+    {
+        vmhook::detail::jni_value value{};
+        void* storage{};
+        vmhook::detail::write_jni_arg_to_slot(value, storage, std::int64_t{ 0x1122334455667788ll });
+        check("write_jni_arg_to_slot_long", value.j == 0x1122334455667788ll);
+    }
+    {
+        vmhook::detail::jni_value value{};
+        void* storage{};
+        vmhook::detail::write_jni_arg_to_slot(value, storage, 3.14f);
+        check("write_jni_arg_to_slot_float", value.f == 3.14f);
+    }
+    {
+        vmhook::detail::jni_value value{};
+        void* storage{};
+        vmhook::detail::write_jni_arg_to_slot(value, storage, 2.71828);
+        check("write_jni_arg_to_slot_double", value.d == 2.71828);
+    }
+}
+
 int main()
 {
     test_version_macros();
@@ -434,6 +550,9 @@ int main()
 #endif
     test_array_helpers();
     test_format_log_safe_on_bad_pattern();
+    test_write_jni_arg_to_slot_unique_ptr_branch();
+    test_write_jni_arg_to_slot_null_unique_ptr();
+    test_write_jni_arg_to_slot_primitive_branches();
 
     if (failures == 0)
     {

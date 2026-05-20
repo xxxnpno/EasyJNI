@@ -1404,13 +1404,31 @@ namespace vmhook
 
             Exception safety: noexcept — compile-time trait, no runtime cost.
         */
+        // Helper for `static_assert(false)`-in-discarded-branch.  Pre-C++23
+        // this would fire eagerly during template-definition; C++23 P2593R1
+        // makes it lazy ONLY if it depends on the template parameter.  We
+        // target C++23, so a one-line `dependent_false_v<T>` keeps the
+        // assertion benign for branches that are discarded for a particular
+        // T but still fires loudly when T actually reaches the bad branch.
+        template<typename...>
+        inline constexpr bool dependent_false_v{ false };
+
         template<typename type>
         struct is_vector : std::false_type {};
 
-        template<typename value_type, typename allocator_type>
-        struct is_vector<std::vector<value_type, allocator_type>> : std::true_type
+        // Same template-parameter-shadowing rule as is_unique_ptr below:
+        // do not name the parameter `value_type` — the std::true_type base
+        // already exports a `value_type` typedef (= bool, inherited from
+        // std::integral_constant<bool, true>) which silently wins in name
+        // lookup over the same-named template parameter, so
+        // `using value_type_t = value_type;` resolves to `bool`.  No
+        // caller currently reaches is_vector<...>::value_type_t (only
+        // `::value` is used), but ship the safe spelling so a future
+        // user doesn't get bitten.
+        template<typename element_type, typename allocator_type>
+        struct is_vector<std::vector<element_type, allocator_type>> : std::true_type
         {
-            using value_type_t = value_type;
+            using value_type_t = element_type;
         };
 
         /*
@@ -5669,8 +5687,18 @@ namespace vmhook
         Populated by find_class() on first lookup of each class name.
         Subsequent calls return the cached klass* directly without repeating
         the full ClassLoaderDataGraph walk.
+
+        Concurrency: every read / write is gated by klass_lookup_cache_mutex.
+        Without that, two worker threads racing through find_class() with
+        different names could both trip an unordered_map rehash mid-insert
+        and corrupt the bucket array (segfault or hang).  The cache only
+        ever grows, so a shared_mutex would be slightly nicer for the steady
+        state, but a plain mutex keeps the lock-acquisition logic simple and
+        the contention is negligible (cache is warm after the first second
+        of process lifetime).
     */
     inline std::unordered_map<std::string, vmhook::hotspot::klass*> klass_lookup_cache{};
+    inline std::mutex klass_lookup_cache_mutex{};
 
     /*
         @brief Finds a loaded Java class by its internal name using HotSpot internals only.
@@ -5681,14 +5709,21 @@ namespace vmhook
         Searches all loaded classloaders for a class matching the given name by walking
         the HotSpot ClassLoaderDataGraph entirely via gHotSpotVMStructs, without any
         JNI or JVMTI calls. Results are cached on first lookup.
+
+        Thread-safe: cache reads and writes are serialised via
+        klass_lookup_cache_mutex.  The HotSpot walk itself is safe to run
+        concurrently — it only reads exported VMStructs.
     */
     static auto find_class(const std::string_view class_name)
         -> vmhook::hotspot::klass*
     {
-        const auto cache_entry{ vmhook::klass_lookup_cache.find(std::string{ class_name }) };
-        if (cache_entry != vmhook::klass_lookup_cache.end())
         {
-            return cache_entry->second;
+            std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+            const auto cache_entry{ vmhook::klass_lookup_cache.find(std::string{ class_name }) };
+            if (cache_entry != vmhook::klass_lookup_cache.end())
+            {
+                return cache_entry->second;
+            }
         }
 
         try
@@ -5705,7 +5740,12 @@ namespace vmhook
                 }
             }
 
-            vmhook::klass_lookup_cache.insert({ std::string{ class_name }, found_klass });
+            {
+                std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+                // Use insert (not assign) so a racing thread that beat us to
+                // the punch with the same name doesn't overwrite their entry.
+                vmhook::klass_lookup_cache.insert({ std::string{ class_name }, found_klass });
+            }
             // Latch onto the first non-bootstrap class we see so freshly-
             // attached worker threads can inherit its loader — without this,
             // host mixins (Lunar's Adventure chat handler, Forge's wrapped
@@ -8272,11 +8312,17 @@ namespace vmhook
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
                 using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
-                if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
-                {
-                    object_handles.push_back(arg ? arg->get_instance() : nullptr);
-                    value.l = object_handles.empty() ? nullptr : &object_handles.back();
-                }
+                // Catch traits that silently mis-evaluate value_type_t (e.g. the
+                // `value_type` shadowing bug we hit on MSVC where the inherited
+                // std::true_type::value_type=bool typedef won over the template
+                // parameter and made wrapper_type=bool, dropping the arg).
+                static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
+                              "vmhook::detail::append_jni_arg: unique_ptr<T> arg's T does not "
+                              "derive from vmhook::object_base.  Either the wrapper type is wrong "
+                              "or is_unique_ptr<>::value_type_t is mis-resolving (this caught the "
+                              "value_type-shadowing trait bug).");
+                object_handles.push_back(arg ? arg->get_instance() : nullptr);
+                value.l = object_handles.empty() ? nullptr : &object_handles.back();
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
@@ -8302,6 +8348,14 @@ namespace vmhook
             else if constexpr (std::is_same_v<clean_t, double>)
             {
                 value.d = arg;
+            }
+            else
+            {
+                static_assert(vmhook::detail::dependent_false_v<clean_t>,
+                              "vmhook::detail::append_jni_arg: unsupported argument type.  "
+                              "Add a branch above or convert the arg to one of: string, c-string, "
+                              "unique_ptr<vmhook::object>, object_base-derived, bool, integral, "
+                              "float, double.");
             }
 
             values.push_back(value);
@@ -8368,11 +8422,14 @@ namespace vmhook
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
                 using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
-                if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
-                {
-                    storage = arg ? arg->get_instance() : nullptr;
-                    value.l = &storage;
-                }
+                static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
+                              "vmhook::detail::write_jni_arg_to_slot: unique_ptr<T> arg's T does "
+                              "not derive from vmhook::object_base.  Either the wrapper type is "
+                              "wrong or is_unique_ptr<>::value_type_t is mis-resolving (this "
+                              "caught the value_type-shadowing trait bug that silently dropped "
+                              "every IChatComponent arg).");
+                storage = arg ? arg->get_instance() : nullptr;
+                value.l = &storage;
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
@@ -8398,6 +8455,14 @@ namespace vmhook
             else if constexpr (std::is_same_v<clean_t, double>)
             {
                 value.d = arg;
+            }
+            else
+            {
+                static_assert(vmhook::detail::dependent_false_v<clean_t>,
+                              "vmhook::detail::write_jni_arg_to_slot: unsupported argument type.  "
+                              "Add a branch above or convert the arg to one of: string, c-string, "
+                              "unique_ptr<vmhook::object>, object_base-derived, bool, integral, "
+                              "float, double.");
             }
         }
 
@@ -8686,6 +8751,7 @@ namespace vmhook
         would invalidate them, but that is not a concern for the typical use case here.
     */
     inline std::unordered_map<vmhook::hotspot::klass*, std::unordered_map<std::string, vmhook::hotspot::field_entry_t>> g_field_cache{};
+    inline std::mutex g_field_cache_mutex{};
 
     /*
         @brief Looks up and caches a field entry for a named field on a klass.
@@ -8696,6 +8762,13 @@ namespace vmhook
         @details
         On the first call for a given (target_klass, name) pair the full InstanceKlass._fields
         array is walked; subsequent calls return the cached result directly.
+
+        Thread-safe: cache reads / inserts are serialised via g_field_cache_mutex.
+        Without that, concurrent worker threads racing through find_field() can
+        trip an unordered_map rehash mid-insert and corrupt the bucket array.
+        The superclass walk itself is done outside the lock (it only reads
+        immutable HotSpot metadata) so the lock is only held for the
+        find / insert.
     */
     static auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name)
         -> std::optional<vmhook::hotspot::field_entry_t>
@@ -8706,21 +8779,32 @@ namespace vmhook
             return std::nullopt;
         }
 
-        auto& class_fields{ vmhook::g_field_cache[target_klass] };
         const std::string name_str{ name };
 
-        if (const auto field_cache_entry{ class_fields.find(name_str) }; field_cache_entry != class_fields.end())
         {
-            return field_cache_entry->second;
+            std::lock_guard<std::mutex> lock{ vmhook::g_field_cache_mutex };
+            if (const auto klass_entry{ vmhook::g_field_cache.find(target_klass) };
+                klass_entry != vmhook::g_field_cache.end())
+            {
+                if (const auto field_cache_entry{ klass_entry->second.find(name_str) };
+                    field_cache_entry != klass_entry->second.end())
+                {
+                    return field_cache_entry->second;
+                }
+            }
         }
 
-        // Walk the superclass chain so that inherited fields are found.
+        // Walk the superclass chain so that inherited fields are found.  Done
+        // OUTSIDE the cache lock — the HotSpot metadata is immutable for
+        // already-loaded classes and the walk is the slow part; we don't want
+        // every field lookup serialising on each other.
         for (vmhook::hotspot::klass* k{ target_klass }; k != nullptr; k = k->get_super())
         {
             const auto entry{ k->find_field(name) };
             if (entry)
             {
-                class_fields.emplace(name_str, *entry);
+                std::lock_guard<std::mutex> lock{ vmhook::g_field_cache_mutex };
+                vmhook::g_field_cache[target_klass].emplace(name_str, *entry);
                 return entry;
             }
         }
@@ -10217,12 +10301,17 @@ namespace vmhook
                     // constructor — the method ID must not be <init> or
                     // <clinit>.  Some JVMs silently no-op the call (leaving
                     // the object only partially constructed), others raise
-                    // an internal error.  Dispatch <init> through
-                    // CallNonvirtualVoidMethodA (slot 93) with the
-                    // constructor's declaring klass instead; that is the
-                    // documented way to invoke a constructor on an
-                    // already-allocated receiver via JNI.
-                    const bool is_init_call{ !is_static_call && this->name() == "<init>" && this->cached_class_handle };
+                    // an internal error.  Dispatch <init> / <clinit>
+                    // through CallNonvirtualVoidMethodA (slot 93) with the
+                    // method's declaring klass instead; that is the
+                    // documented way to invoke a constructor / static
+                    // initialiser on an already-allocated receiver via JNI.
+                    const std::string method_name{ this->name() };
+                    const bool is_init_call{
+                        !is_static_call
+                        && (method_name == "<init>" || method_name == "<clinit>")
+                        && this->cached_class_handle
+                    };
                     if (is_init_call)
                     {
                         using nonvirtual_fn_t = void(*)(void*, void*, void*, void*, const vmhook::detail::jni_value*);
