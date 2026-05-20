@@ -391,209 +391,6 @@ namespace vmhook
     };
 
     // -------------------------------------------------------------------------
-    // Cross-thread dispatch
-    //
-    // JNI calls and Java field/method work installed via vmhook must execute on
-    // a thread that the JVM (and any host-application mixins, e.g. Lunar
-    // Client's Adventure-based chat handler) consider "the main client
-    // thread" - i.e. the thread that normally runs Java bytecode for the
-    // host application.  Calls made from a worker thread or the injector
-    // DLL's bootstrap thread can throw, NPE, or silently corrupt host state
-    // even when the calling thread is JNI-attached, because the host's
-    // ThreadLocal / context-classloader state isn't set up there.
-    //
-    // vmhook::dispatch(task) queues a function for later execution on a
-    // "safe" thread.  The queue is drained automatically at the entry of
-    // every installed hook detour - those detours fire on whichever Java
-    // thread invoked the hooked method, which by definition is a thread
-    // the JVM is happy with.  In practice you hook a per-tick method like
-    // Minecraft.runTick and the queue drains every tick.
-    //
-    // Typical use from outside a detour (worker thread, DLL bootstrap):
-    //     vmhook::dispatch([msg]
-    //     {
-    //         player->add_chat_message(
-    //             vmhook::make_unique<chat_component_text>(msg)
-    //         );
-    //     });
-    //
-    // The whole composite operation - allocation, constructor call, void
-    // method call - runs atomically on the detour thread, so no half-built
-    // OOPs leak out and no JNI exception is thrown by the host's mixin.
-    //
-    // detail::in_detour is a thread_local flag that public APIs can read
-    // to decide whether they're already on a detour thread.  It is set
-    // automatically by common_detour and by drain_dispatch_queue.
-    // -------------------------------------------------------------------------
-
-    namespace detail
-    {
-        inline std::mutex                         dispatch_mutex{};
-        inline std::vector<std::function<void()>> dispatch_queue{};
-        inline thread_local bool                  in_detour{ false };
-    }
-
-    /*
-        @brief Queue a task for later execution on a hook-detour thread.
-        @details
-        Thread-safe.  The task is run at the start of the next hook detour
-        invocation on this process (or immediately, if drain_dispatch_queue
-        is called manually from a detour thread).  Use this to defer JNI
-        work originated from background threads (worker threads, the DLL's
-        own bootstrap thread, etc.) onto a thread the JVM accepts.
-
-        If invoked from a thread that is already a detour thread
-        (vmhook::on_detour_thread() == true) the task runs inline so the
-        caller does not have to wait for the next hook firing.
-
-        Exception safety: noexcept.  An exception thrown by `task` is
-        caught and logged when the queue is drained; subsequent tasks in
-        the queue still run.
-
-        @param task  Callable invoked with no arguments and no return value.
-                     A no-op `task` (empty std::function) is accepted but
-                     not queued.
-    */
-    inline auto dispatch(std::function<void()> task) noexcept
-        -> void
-    {
-        if (!task)
-        {
-            return;
-        }
-        if (vmhook::detail::in_detour)
-        {
-            try
-            {
-                task();
-            }
-            catch (const std::exception& exception)
-            {
-                VMHOOK_LOG("{} vmhook::dispatch: inline task threw: {}",
-                           vmhook::error_tag, exception.what());
-            }
-            catch (...)
-            {
-                VMHOOK_LOG("{} vmhook::dispatch: inline task threw an unknown exception.",
-                           vmhook::error_tag);
-            }
-            return;
-        }
-        try
-        {
-            std::lock_guard<std::mutex> lock{ vmhook::detail::dispatch_mutex };
-            vmhook::detail::dispatch_queue.push_back(std::move(task));
-        }
-        catch (const std::exception& exception)
-        {
-            VMHOOK_LOG("{} vmhook::dispatch: failed to enqueue task: {}",
-                       vmhook::error_tag, exception.what());
-        }
-        catch (...)
-        {
-            VMHOOK_LOG("{} vmhook::dispatch: failed to enqueue task: unknown exception",
-                       vmhook::error_tag);
-        }
-    }
-
-    /*
-        @brief Drain all pending tasks queued via dispatch().
-        @details
-        Each task runs synchronously on the calling thread.  Tasks that
-        themselves call dispatch() add to the queue while we drain, and
-        the loop re-checks the queue until it stays empty.  Exceptions
-        thrown by tasks are caught and logged; the next task still runs.
-
-        While draining, detail::in_detour is set to true so that callees
-        (e.g. method_proxy::call_jni) can tell they're now executing on
-        a thread that is safe for JNI work, even if the original detour
-        guard set up by common_detour has unwound.
-
-        Re-entrant calls (drain_dispatch_queue invoked from inside a
-        task) are no-ops to keep iteration linear.
-
-        Called automatically at the entry of every hook detour - you
-        normally do not need to invoke this manually.
-
-        Exception safety: noexcept.
-    */
-    inline auto drain_dispatch_queue() noexcept
-        -> void
-    {
-        static thread_local bool draining{ false };
-        if (draining)
-        {
-            return;
-        }
-        draining = true;
-
-        const bool previous_in_detour{ vmhook::detail::in_detour };
-        vmhook::detail::in_detour = true;
-
-        while (true)
-        {
-            std::vector<std::function<void()>> local;
-            try
-            {
-                std::lock_guard<std::mutex> lock{ vmhook::detail::dispatch_mutex };
-                if (vmhook::detail::dispatch_queue.empty())
-                {
-                    break;
-                }
-                local.swap(vmhook::detail::dispatch_queue);
-            }
-            catch (...)
-            {
-                VMHOOK_LOG("{} vmhook::drain_dispatch_queue: failed to lock the queue.",
-                           vmhook::error_tag);
-                break;
-            }
-
-            for (auto& task : local)
-            {
-                if (!task)
-                {
-                    continue;
-                }
-                try
-                {
-                    task();
-                }
-                catch (const std::exception& exception)
-                {
-                    VMHOOK_LOG("{} vmhook::drain_dispatch_queue: task threw: {}",
-                               vmhook::error_tag, exception.what());
-                }
-                catch (...)
-                {
-                    VMHOOK_LOG("{} vmhook::drain_dispatch_queue: task threw an unknown exception.",
-                               vmhook::error_tag);
-                }
-            }
-        }
-
-        vmhook::detail::in_detour = previous_in_detour;
-        draining = false;
-    }
-
-    /*
-        @brief Reports whether the calling thread is currently inside a hook detour.
-        @details
-        True while common_detour is dispatching to a user detour, and also
-        while drain_dispatch_queue is running tasks.  False otherwise.
-
-        Use this in user code to decide whether a JNI-touching helper can
-        run inline or must be deferred via vmhook::dispatch.
-
-        Exception safety: noexcept.
-    */
-    inline auto on_detour_thread() noexcept
-        -> bool
-    {
-        return vmhook::detail::in_detour;
-    }
-
-    // -------------------------------------------------------------------------
     // OS abstraction layer
     //
     // Wraps Windows-only and POSIX-only primitives behind a portable surface so
@@ -1509,6 +1306,13 @@ namespace vmhook
     namespace detail
     {
         inline auto find_call_stub_entry() noexcept -> void*;
+
+        /*
+            @brief Forward declaration for the host-context-classloader inheritance
+                   helper, defined further down alongside the JNI helpers it relies on.
+        */
+        inline auto inherit_host_context_classloader_for_current_thread() noexcept
+            -> void;
     }
 
     /*
@@ -3144,6 +2948,61 @@ namespace vmhook
                     return nullptr;
                 }
             }
+
+            /*
+                @brief Returns the java.lang.ClassLoader instance OOP for this CLD.
+                @details
+                Reads ClassLoaderData::_class_loader.  Layout depends on JDK:
+
+                  JDK 8-9:   oop _class_loader              (direct heap pointer)
+                  JDK 10+:   OopHandle _class_loader        ({ oop* _obj })
+
+                Detected from gHotSpotVMStructs type_string at runtime so the
+                code stays version-agnostic.
+
+                The bootstrap loader is represented by a null pointer here,
+                so a null return is a valid result for bootstrap classes
+                (java.lang, jdk.internal, etc.).  For everything else this is
+                the heap ClassLoader oop suitable for use as a fake JNI handle
+                target.
+
+                Complexity: O(1) after VMStructs offset is cached on first call.
+                Exception safety: noexcept — returns nullptr on any failure.
+
+                @return  Raw heap pointer to the java.lang.ClassLoader instance,
+                         or nullptr for the bootstrap loader / on failure.
+            */
+            auto get_class_loader_oop() const noexcept
+                -> void*
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{
+                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_class_loader") };
+
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return nullptr;
+                }
+
+                static const bool is_oop_handle{
+                    entry->type_string && std::strcmp(entry->type_string, "OopHandle") == 0 };
+
+                const void* const field_addr{
+                    reinterpret_cast<const std::uint8_t*>(this) + entry->offset };
+
+                if (is_oop_handle)
+                {
+                    const void* const oop_storage_slot{ vmhook::hotspot::safe_read_pointer(field_addr) };
+                    if (!vmhook::hotspot::is_valid_pointer(oop_storage_slot))
+                    {
+                        return nullptr;
+                    }
+                    void* const loader_oop{ const_cast<void*>(vmhook::hotspot::safe_read_pointer(oop_storage_slot)) };
+                    return vmhook::hotspot::is_valid_pointer(loader_oop) ? loader_oop : nullptr;
+                }
+
+                const void* const loader_oop{ vmhook::hotspot::safe_read_pointer(field_addr) };
+                return vmhook::hotspot::is_valid_pointer(loader_oop) ? const_cast<void*>(loader_oop) : nullptr;
+            }
         };
 
         /*
@@ -3944,18 +3803,21 @@ namespace vmhook
             if (vm->functions->GetEnv && vm->functions->GetEnv(vm, &env, jni_version_1_8) == 0)
             {
                 vmhook::hotspot::current_jni_env = env;
+                vmhook::detail::inherit_host_context_classloader_for_current_thread();
                 return true;
             }
 
             if (vm->functions->AttachCurrentThreadAsDaemon && vm->functions->AttachCurrentThreadAsDaemon(vm, &env, nullptr) == 0)
             {
                 vmhook::hotspot::current_jni_env = env;
+                vmhook::detail::inherit_host_context_classloader_for_current_thread();
                 return true;
             }
 
             if (vm->functions->AttachCurrentThread && vm->functions->AttachCurrentThread(vm, &env, nullptr) == 0)
             {
                 vmhook::hotspot::current_jni_env = env;
+                vmhook::detail::inherit_host_context_classloader_for_current_thread();
                 return true;
             }
 
@@ -5518,33 +5380,6 @@ namespace vmhook
                     }
                 } guard{ thread };
 
-                // Mark this thread as "inside a detour" while we dispatch.  This
-                // is the cue that vmhook::on_detour_thread() reads, and it lets
-                // off-thread helpers know it's safe to issue JNI calls inline.
-                struct in_detour_guard
-                {
-                    bool previous;
-
-                    in_detour_guard() noexcept
-                        : previous{ vmhook::detail::in_detour }
-                    {
-                        vmhook::detail::in_detour = true;
-                    }
-
-                    ~in_detour_guard()
-                    {
-                        vmhook::detail::in_detour = previous;
-                    }
-                } detour_marker{};
-
-                // Drain any work queued from off-thread (DLL bootstrap, worker
-                // threads, command handlers, etc.) so it executes on this
-                // detour thread - which the JVM and host mixins are happy
-                // with - rather than on whatever background thread originally
-                // enqueued it.  Runs before the user detour so a user detour
-                // can rely on the queue being empty.
-                vmhook::drain_dispatch_queue();
-
                 for (const vmhook::hotspot::hooked_method& hook : vmhook::hotspot::g_hooked_methods)
                 {
                     if (hook.method == current_method)
@@ -5804,6 +5639,16 @@ namespace vmhook
         */
         inline auto jni_find_class_with_context_loader(const std::string_view class_name) noexcept
             -> vmhook::hotspot::klass*;
+
+        /*
+            @brief Remembers candidate as the host-application's class source.
+            @details
+            Forward declaration; defined alongside the rest of the
+            host-context-classloader machinery further down so it can call into
+            the JNI helpers.  No-op when candidate is null or bootstrap-loaded.
+        */
+        inline auto capture_host_classloader_klass(vmhook::hotspot::klass* candidate) noexcept
+            -> void;
     }
 
     // --- Cache and class lookup -----------------------------------------------
@@ -5851,6 +5696,12 @@ namespace vmhook
             }
 
             vmhook::klass_lookup_cache.insert({ std::string{ class_name }, found_klass });
+            // Latch onto the first non-bootstrap class we see so freshly-
+            // attached worker threads can inherit its loader — without this,
+            // host mixins (Lunar's Adventure chat handler, Forge's wrapped
+            // GuiNewChat) throw the moment they try to resolve a class via
+            // Thread.currentThread().getContextClassLoader() on our threads.
+            vmhook::detail::capture_host_classloader_klass(found_klass);
             return found_klass;
         }
         catch (const std::exception& exception)
@@ -8039,6 +7890,186 @@ namespace vmhook
                        "failed including Minecraft Launch loader.  Class is not loaded anywhere.",
                        vmhook::warning_tag, class_name);
             return nullptr;
+        }
+
+        // -------------------------------------------------------------------
+        // Host context-classloader inheritance
+        //
+        // When the injector attaches a worker thread via JNI AttachCurrentThread*,
+        // the JVM gives the new thread the platform / application classloader
+        // as its context classloader.  That loader cannot see classes loaded by
+        // the host application's custom loader chain (Forge's LaunchClassLoader,
+        // Lunar Client's mixin chain, etc.), so any JNI work that runs through
+        // host mixins fails with UnsupportedOperationException ("Don't know how
+        // to turn ... into a string") or NullPointerException as soon as the
+        // mixin tries to resolve a class via Thread.currentThread()
+        // .getContextClassLoader().
+        //
+        // Fix: as soon as the injector finds at least one host class via
+        // vmhook::find_class, remember its Klass*.  When a new native thread
+        // attaches we read the loader out of that Klass's ClassLoaderData and
+        // call Thread.currentThread().setContextClassLoader(...) on the new
+        // thread so it inherits the host loader chain.
+        // -------------------------------------------------------------------
+
+        /*
+            @brief Cached "host" Klass*.
+            @details
+            Populated by capture_host_classloader_klass() the first time
+            vmhook::find_class succeeds for a class whose owning ClassLoaderData
+            has a non-null _class_loader (i.e. a non-bootstrap loader).  Used by
+            inherit_host_context_classloader_for_current_thread() as the source
+            of the loader to install onto freshly-attached worker threads.
+
+            Klass* in HotSpot lives in Metaspace and is stable across GC; the
+            ClassLoader oop reachable through Klass -> ClassLoaderData ->
+            _class_loader IS heap-resident and may relocate, so we re-derive it
+            on every attach instead of caching the raw oop.
+        */
+        inline std::atomic<vmhook::hotspot::klass*> host_classloader_klass{ nullptr };
+
+        /*
+            @brief Returns the java.lang.ClassLoader oop for a given Klass.
+            @details
+            Walks Klass._class_loader_data -> ClassLoaderData._class_loader and
+            transparently handles the JDK 10+ OopHandle indirection.  Returns
+            nullptr for bootstrap-loaded classes (java/lang/Object, etc.).
+
+            Complexity: O(1) after VMStruct offsets are cached.
+            Exception safety: noexcept — returns nullptr on any failure.
+        */
+        inline auto klass_to_class_loader_oop(vmhook::hotspot::klass* const k) noexcept
+            -> void*
+        {
+            static const vmhook::hotspot::vm_struct_entry_t* const cld_entry{
+                vmhook::hotspot::iterate_struct_entries("Klass", "_class_loader_data") };
+
+            if (!cld_entry || !k || !vmhook::hotspot::is_valid_pointer(k))
+            {
+                return nullptr;
+            }
+
+            vmhook::hotspot::class_loader_data* const cld{
+                *reinterpret_cast<vmhook::hotspot::class_loader_data**>(
+                    reinterpret_cast<std::uint8_t*>(k) + cld_entry->offset) };
+            if (!cld || !vmhook::hotspot::is_valid_pointer(cld))
+            {
+                return nullptr;
+            }
+
+            return cld->get_class_loader_oop();
+        }
+
+        /*
+            @brief Records a Klass whose loader is the host application's loader.
+            @details
+            No-op if a host klass is already cached or if the supplied Klass is
+            bootstrap-loaded (loader == null).  Safe to call from any thread;
+            uses a single CAS to publish the first non-bootstrap candidate.
+        */
+        inline auto capture_host_classloader_klass(vmhook::hotspot::klass* const candidate) noexcept
+            -> void
+        {
+            if (vmhook::detail::host_classloader_klass.load(std::memory_order_acquire))
+            {
+                return;
+            }
+            if (!candidate || !vmhook::hotspot::is_valid_pointer(candidate))
+            {
+                return;
+            }
+            if (!vmhook::detail::klass_to_class_loader_oop(candidate))
+            {
+                return;
+            }
+            vmhook::hotspot::klass* expected{ nullptr };
+            if (vmhook::detail::host_classloader_klass.compare_exchange_strong(
+                    expected, candidate, std::memory_order_acq_rel))
+            {
+                // We just published the first host klass — the thread doing
+                // the publish (usually the injector's bootstrap thread) may
+                // itself need the loader for follow-up JNI work, so apply it
+                // here instead of waiting for the next attach_current_native_thread
+                // round-trip.
+                vmhook::detail::inherit_host_context_classloader_for_current_thread();
+            }
+        }
+
+        /*
+            @brief Sets Thread.currentThread().contextClassLoader on the current thread.
+            @details
+            No-op if no host classloader has been captured yet (see
+            capture_host_classloader_klass) or if any JNI step fails.  Called from
+            attach_current_native_thread so that worker threads we spin up
+            inherit the same loader chain Minecraft / Forge / Lunar uses for
+            their own threads; without this, mixin-wrapped methods invoked by
+            JNI on our worker threads throw because they cannot resolve classes
+            through Thread.currentThread().getContextClassLoader().
+
+            Exception safety: noexcept — best-effort; failures are logged once
+            via VMHOOK_LOG and skipped on subsequent calls in the same process.
+        */
+        inline auto inherit_host_context_classloader_for_current_thread() noexcept
+            -> void
+        {
+            vmhook::hotspot::klass* const host_klass{
+                vmhook::detail::host_classloader_klass.load(std::memory_order_acquire) };
+            if (!host_klass)
+            {
+                return;
+            }
+
+            void* const loader_oop{ vmhook::detail::klass_to_class_loader_oop(host_klass) };
+            if (!loader_oop)
+            {
+                return;
+            }
+
+            if (!vmhook::hotspot::current_jni_env)
+            {
+                return;
+            }
+
+            void* const thread_class{ vmhook::detail::jni_find_class("java/lang/Thread") };
+            if (!thread_class)
+            {
+                vmhook::detail::jni_exception_clear();
+                return;
+            }
+
+            void* const current_thread_id{ vmhook::detail::jni_get_static_method_id(
+                thread_class, "currentThread", "()Ljava/lang/Thread;") };
+            void* const set_loader_id{ vmhook::detail::jni_get_method_id(
+                thread_class, "setContextClassLoader", "(Ljava/lang/ClassLoader;)V") };
+            if (!current_thread_id || !set_loader_id)
+            {
+                vmhook::detail::jni_exception_clear();
+                return;
+            }
+
+            void* const current_thread{ vmhook::detail::jni_call_static_object_method(
+                thread_class, current_thread_id) };
+            if (!current_thread)
+            {
+                vmhook::detail::jni_exception_clear();
+                return;
+            }
+
+            void* loader_storage{};
+            void* const loader_handle{ vmhook::detail::jni_oop_handle(loader_oop, loader_storage) };
+            vmhook::detail::jni_value args[1]{};
+            args[0].l = loader_handle;
+
+            using call_void_method_a_t = void (*)(void*, void*, void*, const vmhook::detail::jni_value*);
+            auto* const call_void_method_a{
+                vmhook::detail::jni_function<63, call_void_method_a_t>(vmhook::hotspot::current_jni_env) };
+            if (!call_void_method_a)
+            {
+                return;
+            }
+
+            call_void_method_a(vmhook::hotspot::current_jni_env, current_thread, set_loader_id, args);
+            vmhook::detail::jni_exception_clear();
         }
 
         /*
