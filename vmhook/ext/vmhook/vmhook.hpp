@@ -1435,10 +1435,20 @@ namespace vmhook
         template<typename type>
         struct is_unique_ptr : std::false_type {};
 
-        template<typename value_type, typename deleter_type>
-        struct is_unique_ptr<std::unique_ptr<value_type, deleter_type>> : std::true_type
+        // NOTE: the template parameter cannot be named `value_type` — the
+        // primary `std::true_type` base brings in its own `value_type`
+        // typedef (= bool, from std::integral_constant<bool, true>), and
+        // that inherited typedef shadows a same-named template parameter
+        // when looking up names inside the class body.  The result is that
+        // `using value_type_t = value_type;` silently resolves to
+        // `using value_type_t = bool;`, every unique_ptr<Wrapper> arg
+        // collapses to is_base_of<object_base, bool> == false at the call
+        // site, and the JNI arg slot is left zero-initialised.  Use `wrapped_type`
+        // (or any name that does not collide with the base typedef) instead.
+        template<typename wrapped_type, typename deleter_type>
+        struct is_unique_ptr<std::unique_ptr<wrapped_type, deleter_type>> : std::true_type
         {
-            using value_type_t = value_type;
+            using value_type_t = wrapped_type;
         };
 
         /*
@@ -6593,12 +6603,17 @@ namespace vmhook
 
             Exception safety: noexcept — compile-time trait, no runtime cost.
         */
-        template<typename value_type>
+        template<typename type>
         struct is_unique_object_ptr : std::false_type {};
 
-        template<typename value_type, typename deleter_type>
-        struct is_unique_object_ptr<std::unique_ptr<value_type, deleter_type>>
-            : std::bool_constant<std::is_base_of_v<vmhook::object_base, value_type>> {};
+        // Same shadowing rule as is_unique_ptr above: do not name the
+        // template parameter `value_type`, since the std::true_type /
+        // std::bool_constant base also exports a `value_type` typedef
+        // (= bool).  Use `wrapped_type` so the trait stays robust if
+        // someone later adds a `using value_type_t = wrapped_type;`.
+        template<typename wrapped_type, typename deleter_type>
+        struct is_unique_object_ptr<std::unique_ptr<wrapped_type, deleter_type>>
+            : std::bool_constant<std::is_base_of_v<vmhook::object_base, wrapped_type>> {};
 
         /*
             @brief Decodes a JNI local reference to a raw heap OOP pointer.
@@ -8343,18 +8358,12 @@ namespace vmhook
                        || std::is_same_v<clean_t, std::string_view>)
             {
                 value.l = vmhook::detail::jni_new_string_utf(arg);
-                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: string branch -> jstring=0x{:016X}",
-                           vmhook::info_tag, typeid(arg_type).name(),
-                           reinterpret_cast<std::uintptr_t>(value.l));
             }
             else if constexpr (std::is_same_v<clean_t, const char*>
                             || std::is_same_v<clean_t, char*>)
             {
                 value.l = arg ? vmhook::detail::jni_new_string_utf(std::string_view{ arg })
                               : nullptr;
-                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: c-string branch -> jstring=0x{:016X}",
-                           vmhook::info_tag, typeid(arg_type).name(),
-                           reinterpret_cast<std::uintptr_t>(value.l));
             }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
@@ -8363,24 +8372,12 @@ namespace vmhook
                 {
                     storage = arg ? arg->get_instance() : nullptr;
                     value.l = &storage;
-                    VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: unique_ptr<object_base> branch -> storage=0x{:016X} value.l=0x{:016X}",
-                               vmhook::info_tag, typeid(wrapper_type).name(),
-                               reinterpret_cast<std::uintptr_t>(storage),
-                               reinterpret_cast<std::uintptr_t>(value.l));
-                }
-                else
-                {
-                    VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: unique_ptr branch taken but is_base_of<object_base, {}> is FALSE",
-                               vmhook::warning_tag, typeid(arg_type).name(), typeid(wrapper_type).name());
                 }
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
                 storage = arg.get_instance();
                 value.l = &storage;
-                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: object_base-by-value branch -> storage=0x{:016X}",
-                           vmhook::info_tag, typeid(arg_type).name(),
-                           reinterpret_cast<std::uintptr_t>(storage));
             }
             else if constexpr (std::is_same_v<clean_t, bool>)
             {
@@ -8401,11 +8398,6 @@ namespace vmhook
             else if constexpr (std::is_same_v<clean_t, double>)
             {
                 value.d = arg;
-            }
-            else
-            {
-                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: NO BRANCH MATCHED - arg dropped on the floor",
-                           vmhook::warning_tag, typeid(arg_type).name());
             }
         }
 
