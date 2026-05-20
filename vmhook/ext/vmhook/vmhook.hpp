@@ -8343,12 +8343,18 @@ namespace vmhook
                        || std::is_same_v<clean_t, std::string_view>)
             {
                 value.l = vmhook::detail::jni_new_string_utf(arg);
+                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: string branch -> jstring=0x{:016X}",
+                           vmhook::info_tag, typeid(arg_type).name(),
+                           reinterpret_cast<std::uintptr_t>(value.l));
             }
             else if constexpr (std::is_same_v<clean_t, const char*>
                             || std::is_same_v<clean_t, char*>)
             {
                 value.l = arg ? vmhook::detail::jni_new_string_utf(std::string_view{ arg })
                               : nullptr;
+                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: c-string branch -> jstring=0x{:016X}",
+                           vmhook::info_tag, typeid(arg_type).name(),
+                           reinterpret_cast<std::uintptr_t>(value.l));
             }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
@@ -8357,12 +8363,24 @@ namespace vmhook
                 {
                     storage = arg ? arg->get_instance() : nullptr;
                     value.l = &storage;
+                    VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: unique_ptr<object_base> branch -> storage=0x{:016X} value.l=0x{:016X}",
+                               vmhook::info_tag, typeid(wrapper_type).name(),
+                               reinterpret_cast<std::uintptr_t>(storage),
+                               reinterpret_cast<std::uintptr_t>(value.l));
+                }
+                else
+                {
+                    VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: unique_ptr branch taken but is_base_of<object_base, {}> is FALSE",
+                               vmhook::warning_tag, typeid(arg_type).name(), typeid(wrapper_type).name());
                 }
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
             {
                 storage = arg.get_instance();
                 value.l = &storage;
+                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: object_base-by-value branch -> storage=0x{:016X}",
+                           vmhook::info_tag, typeid(arg_type).name(),
+                           reinterpret_cast<std::uintptr_t>(storage));
             }
             else if constexpr (std::is_same_v<clean_t, bool>)
             {
@@ -8383,6 +8401,11 @@ namespace vmhook
             else if constexpr (std::is_same_v<clean_t, double>)
             {
                 value.d = arg;
+            }
+            else
+            {
+                VMHOOK_LOG("{} write_jni_arg_to_slot<{}>: NO BRANCH MATCHED - arg dropped on the floor",
+                           vmhook::warning_tag, typeid(arg_type).name());
             }
         }
 
