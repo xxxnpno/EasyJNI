@@ -507,6 +507,99 @@ static auto test_write_jni_arg_to_slot_null_unique_ptr() -> void
 //     std::string (non-constexpr) so we cross-check at runtime instead of
 //     via static_assert.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 12. is_valid_pointer must reject debug-poison sentinel patterns
+//
+// Old behaviour: a pointer whose low 32 bits are 0xDEADBEEF / 0xCDCDCDCD /
+// 0xCAFEBABE etc. fell inside the user-address range and was passed through
+// untouched, then segfaulted on dereference.  After the fix is_valid_pointer
+// rejects them up-front so callers can rely on the boolean.
+// ---------------------------------------------------------------------------
+static auto test_is_valid_pointer_rejects_sentinels() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+
+    // Well-known debug-poison values that the old range-only check accepted.
+    auto poison = [](std::uint64_t low32) -> const void*
+    {
+        return reinterpret_cast<const void*>(static_cast<std::uintptr_t>(low32));
+    };
+    check("is_valid_pointer_rejects_DEADBEEF", !is_valid_pointer(poison(0xDEADBEEFu)));
+    check("is_valid_pointer_rejects_CAFEBABE", !is_valid_pointer(poison(0xCAFEBABEu)));
+    check("is_valid_pointer_rejects_CCCCCCCC", !is_valid_pointer(poison(0xCCCCCCCCu)));
+    check("is_valid_pointer_rejects_CDCDCDCD", !is_valid_pointer(poison(0xCDCDCDCDu)));
+    check("is_valid_pointer_rejects_BAADF00D", !is_valid_pointer(poison(0xBAADF00Du)));
+    check("is_valid_pointer_rejects_FEEEFEEE", !is_valid_pointer(poison(0xFEEEFEEEu)));
+    check("is_valid_pointer_rejects_ABABABAB", !is_valid_pointer(poison(0xABABABABu)));
+    check("is_valid_pointer_rejects_FDFDFDFD", !is_valid_pointer(poison(0xFDFDFDFDu)));
+    check("is_valid_pointer_rejects_DDDDDDDD", !is_valid_pointer(poison(0xDDDDDDDDu)));
+
+    // Real stack address must STILL pass after the new sentinel check.
+    int local_var{ 42 };
+    check("is_valid_pointer_accepts_stack_address", is_valid_pointer(&local_var));
+
+    // Heap address must pass.
+    auto heap_buf{ std::make_unique<int>(42) };
+    check("is_valid_pointer_accepts_heap_address", is_valid_pointer(heap_buf.get()));
+
+    // Null still rejected.
+    check("is_valid_pointer_rejects_null", !is_valid_pointer(nullptr));
+
+    // Odd low-bit address now rejected (HotSpot pointers are always aligned).
+    const void* odd{ reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(&local_var) | 0x1u) };
+    check("is_valid_pointer_rejects_odd_low_bit", !is_valid_pointer(odd));
+}
+
+// ---------------------------------------------------------------------------
+// 13. return_value::set must sign-extend signed integers into the 64-bit slot.
+//
+// Old behaviour: memcpy of the low N bytes left the upper bits at zero, so a
+// hook returning int8_t{-1} (= 0xFF) was visible to Java as +255 instead of -1.
+// Fix: signed integer types < 8 bytes go through a static_cast<int64_t>(value)
+// which sign-extends; other types still use memcpy.
+// ---------------------------------------------------------------------------
+static auto test_return_value_sign_extension() -> void
+{
+    // Build a fake slot on the stack.  The slot lives in vmhook::hotspot.
+    vmhook::hotspot::return_slot slot{};
+    vmhook::return_value rv{ &slot };
+
+    // int8_t{-1} -> retval should be -1 (sign-extended), not 255 (zero-extended).
+    rv.set(std::int8_t{ -1 });
+    check("return_value_set_int8_minus_one_sign_extends",
+          slot.retval == static_cast<std::int64_t>(-1));
+
+    // int16_t{-12345} -> sign-extend to -12345 in 64 bits.
+    slot.retval = 0; slot.cancel = false;
+    rv.set(std::int16_t{ -12345 });
+    check("return_value_set_int16_neg_sign_extends",
+          slot.retval == static_cast<std::int64_t>(-12345));
+
+    // int32_t{-1} -> sign-extend.
+    slot.retval = 0; slot.cancel = false;
+    rv.set(std::int32_t{ -1 });
+    check("return_value_set_int32_minus_one_sign_extends",
+          slot.retval == static_cast<std::int64_t>(-1));
+
+    // Unsigned types still zero-extend (correct behaviour - JVM treats them
+    // as the corresponding signed types and interprets the bit pattern).
+    slot.retval = 0; slot.cancel = false;
+    rv.set(std::uint8_t{ 0xFF });
+    check("return_value_set_uint8_zero_extends_to_255",
+          slot.retval == static_cast<std::int64_t>(0xFFu));
+
+    // Positive signed values still come through correctly.
+    slot.retval = 0; slot.cancel = false;
+    rv.set(std::int32_t{ 42 });
+    check("return_value_set_int32_positive_unchanged",
+          slot.retval == 42);
+
+    // cancel flag must be set on every set().
+    slot.retval = 0; slot.cancel = false;
+    rv.set(std::int32_t{ 0 });
+    check("return_value_set_sets_cancel_flag", slot.cancel == true);
+}
+
 static auto test_jni_namespace_signature_for_arg() -> void
 {
     check("jni::signature_for_arg<bool> == 'Z'",
@@ -602,6 +695,8 @@ int main()
     test_write_jni_arg_to_slot_null_unique_ptr();
     test_write_jni_arg_to_slot_primitive_branches();
     test_jni_namespace_signature_for_arg();
+    test_is_valid_pointer_rejects_sentinels();
+    test_return_value_sign_extension();
 
     if (failures == 0)
     {

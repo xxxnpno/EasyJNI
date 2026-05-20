@@ -1104,10 +1104,31 @@ namespace vmhook
         auto set(const value_type value) noexcept
             -> void
         {
-            static_assert(sizeof(value_type) <= sizeof(std::int64_t), "return type too large for hook slot");
+            static_assert(sizeof(value_type) <= sizeof(std::int64_t),
+                          "return type too large for hook slot");
+            static_assert(std::is_trivially_copyable_v<value_type>,
+                          "return_value::set: value_type must be trivially copyable - the slot is "
+                          "a raw 64-bit cell, not a managed object.  Pass a primitive, an oop "
+                          "pointer (void*), or a small POD by value.");
             this->return_slot->cancel = true;
-            this->return_slot->retval = 0;
-            std::memcpy(&this->return_slot->retval, &value, sizeof(value_type));
+
+            // Sign-extend signed integers smaller than int64 BEFORE writing the
+            // slot.  Otherwise a hook returning int8_t{-1} would land in the
+            // 64-bit retval cell as 0x00000000000000FF and the interpreter's
+            // ireturn would pop +255 instead of -1.  memcpy alone only copies
+            // the low N bytes, with the upper bits left at zero from the
+            // assignment below.
+            if constexpr (std::is_signed_v<value_type>
+                       && std::is_integral_v<value_type>
+                       && sizeof(value_type) < sizeof(std::int64_t))
+            {
+                this->return_slot->retval = static_cast<std::int64_t>(value);
+            }
+            else
+            {
+                this->return_slot->retval = 0;
+                std::memcpy(&this->return_slot->retval, &value, sizeof(value_type));
+            }
         }
 
         auto cancel() noexcept
@@ -1324,8 +1345,18 @@ namespace vmhook
         Keys   - std::type_index values derived from typeid() of the C++ wrapper type.
         Values - internal JVM class names using '/' separators (e.g. "java/lang/String").
         @see vmhook::register_class, vmhook::hook
+
+        Thread-safety: every read / mutation of this map AND of g_type_factory_map
+        below must hold registration_mutex.  register_class() can be called from
+        whichever thread the user runs setup on, while extract_frame_arg /
+        jni_signature_for_arg / on_class_loaded read the map from hook detour
+        threads.  Without the mutex, a racing insert during an unordered_map
+        rehash corrupts the buckets.  The map only ever grows, so a plain
+        std::mutex is enough — read contention is irrelevant on the steady-state
+        cache-hit path.
     */
     inline std::unordered_map<std::type_index, std::string> type_to_class_map{};
+    inline std::mutex registration_mutex{};
 
     /*
         @brief Factory function type that creates a std::unique_ptr<T> from a raw OOP.
@@ -1625,13 +1656,52 @@ namespace vmhook
             @brief Checks whether a pointer is likely valid for dereferencing.
             @details
             Filters out null pointers, low sentinel values used by HotSpot to mark
-            the end of linked lists, and kernel-space addresses above the user ceiling.
+            the end of linked lists, kernel-space addresses above the user ceiling,
+            AND well-known debug-poison patterns (0xDEADBEEF, 0xCAFEBABE,
+            0xCCCCCCCC, 0xCDCDCDCD, 0xBAADF00D, 0xFEEEFEEE).  The previous
+            implementation only checked the address range, so those patterns
+            (which fall inside user-space) sneaked through and crashed on
+            dereference - the very thing the function exists to prevent.
+            Pointers are also required to be at least 2-byte aligned; HotSpot
+            never produces odd-address Klass / Method / oop pointers.
         */
         inline static auto is_valid_pointer(const void* const pointer) noexcept
             -> bool
         {
             const std::uintptr_t addr{ reinterpret_cast<std::uintptr_t>(pointer) };
-            return addr > vmhook::os::user_address_floor && addr < vmhook::os::user_address_ceiling;
+            if (addr <= vmhook::os::user_address_floor || addr >= vmhook::os::user_address_ceiling)
+            {
+                return false;
+            }
+            // HotSpot oops / Klass / Method are at least 8-byte aligned in
+            // practice; require 2 to reject obviously-bogus odd addresses
+            // without rejecting unaligned interior pointers used by some
+            // helpers (e.g. byte-pointer reads inside a struct).
+            if ((addr & 0x1u) != 0u)
+            {
+                return false;
+            }
+            // Reject the common debug-fill / sentinel patterns the MSVC and
+            // mingw runtimes leave in uninitialised memory and freed blocks.
+            // A pointer whose low 32 bits exactly match one of these is
+            // overwhelmingly a tag, not a real address.
+            const std::uint32_t low32{ static_cast<std::uint32_t>(addr) };
+            switch (low32)
+            {
+                case 0xDEADBEEFu:   // generic C debug sentinel
+                case 0xCAFEBABEu:   // Java class-file magic, also commonly used as a sentinel
+                case 0xCCCCCCCCu:   // MSVC uninitialised stack
+                case 0xCDCDCDCDu:   // MSVC uninitialised heap
+                case 0xBAADF00Du:   // Windows LocalAlloc uninitialised
+                case 0xFEEEFEEEu:   // Windows HeapFree
+                case 0xABABABABu:   // Windows HeapAlloc no-man's land
+                case 0xFDFDFDFDu:   // MSVC heap no-man's land
+                case 0xDDDDDDDDu:   // MSVC freed heap
+                    return false;
+                default:
+                    break;
+            }
+            return true;
         }
 
         /*
@@ -5356,11 +5426,29 @@ namespace vmhook
 
         /*
             @brief Global list of all currently hooked Java methods and their detour functions.
+
+            Thread-safety: every mutation (vmhook::hook(), shutdown_hooks(),
+            hook_handle::stop()) must hold g_hooked_methods_mutex.  common_detour
+            iterates the vector on every hooked-method invocation, but iteration
+            is done WITHOUT acquiring the lock - it relies on the contract that
+            the vector is only ever mutated from the user's setup thread BEFORE
+            hook detours fire.  A reallocation mid-iteration would otherwise
+            invalidate the iterator and use-after-free in the detour pointer
+            cell.  install / uninstall sites pay the lock; the hot detour path
+            stays lock-free.
+
+            If you need to install/remove hooks WHILE detours are firing,
+            either pre-reserve the vector to a known cap or copy the iteration
+            snapshot inside common_detour - see commit log for the analysis.
         */
         inline std::vector<vmhook::hotspot::hooked_method> g_hooked_methods{};
+        inline std::mutex g_hooked_methods_mutex{};
 
         /*
             @brief Global list of all i2i entry points that have been patched and their hooks.
+
+            Shares g_hooked_methods_mutex - the two vectors are always mutated
+            together (install / uninstall both touch the matching entries).
         */
         inline std::vector<vmhook::hotspot::i2i_hook_data> g_hooked_i2i_entries{};
 
@@ -6267,6 +6355,17 @@ namespace vmhook
             return false;
         }
 
+        // Serialise both map writes behind registration_mutex.  Without
+        // this, two threads racing through register_class() can trip an
+        // unordered_map rehash mid-insert and corrupt the bucket array.
+        // Readers in detour-hot paths (extract_frame_arg / jni_signature_for_arg /
+        // on_class_loaded) do NOT take the lock - the documented contract is
+        // that register_class is called from single-threaded setup BEFORE
+        // hooks fire.  This lock guards against concurrent registers, which
+        // can happen on multi-stage initialisation paths or when a hook
+        // detour itself triggers lazy registration of a new wrapper.
+        std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
+
         vmhook::type_to_class_map.insert_or_assign(std::type_index{ typeid(wrapper_type) }, std::string{ class_name });
 
         // Store a factory function so field_proxy::get_as<T>() and frame::get_arguments()
@@ -6630,7 +6729,14 @@ namespace vmhook
             }
             else
             {
-                return base_t{};
+                static_assert(vmhook::detail::dependent_false_v<base_t>,
+                              "vmhook::detail::extract_frame_arg: unsupported argument type.  "
+                              "The previous behaviour silently returned a default-constructed "
+                              "value (all zeros) for any type larger than a pointer that wasn't "
+                              "std::string / unique_ptr<T> / a raw pointer - user hook callbacks "
+                              "saw a hidden zero arg with no compile-time or runtime warning.  "
+                              "Convert the arg to one of: primitive / pointer / std::string / "
+                              "unique_ptr<vmhook::object>.");
             }
         }
 
@@ -7082,6 +7188,14 @@ namespace vmhook
                 throw vmhook::exception{ std::format("Method '{}' not found in class '{}'.", method_name, type_map_entry->second) };
             }
 
+            // Serialise the entire install path behind g_hooked_methods_mutex.
+            // Without this, two threads racing through vmhook::hook<T>() can
+            // (a) both decide a duplicate-membership check passed, end up
+            // installing the trampoline twice, OR (b) race the push_back
+            // against another thread's iteration in common_detour, since the
+            // detour reads g_hooked_methods lock-free.
+            std::lock_guard<std::mutex> install_lock{ vmhook::hotspot::g_hooked_methods_mutex };
+
             for (const vmhook::hotspot::hooked_method& hooked_method_entry : vmhook::hotspot::g_hooked_methods)
             {
                 if (hooked_method_entry.method == found_method)
@@ -7256,6 +7370,12 @@ namespace vmhook
     static auto shutdown_hooks() noexcept
         -> void
     {
+        // Lock for the whole tear-down so no in-flight vmhook::hook<T>() call
+        // can push a new entry between our trampoline-delete loop and our
+        // entry-restore loop.  Once the lock is released, common_detour
+        // observes an empty list and stops dispatching.
+        std::lock_guard<std::mutex> shutdown_lock{ vmhook::hotspot::g_hooked_methods_mutex };
+
         for (const vmhook::hotspot::i2i_hook_data& hook_data_entry : vmhook::hotspot::g_hooked_i2i_entries)
         {
             delete hook_data_entry.hook;
@@ -7313,6 +7433,12 @@ namespace vmhook
 
         try
         {
+            // Single-entry removal contends with vmhook::hook<T>() installs and
+            // with shutdown_hooks() on the same vector.  Lock for the whole
+            // erase + restore so common_detour can never iterate while we are
+            // mid-mutation.
+            std::lock_guard<std::mutex> stop_lock{ vmhook::hotspot::g_hooked_methods_mutex };
+
             auto& hooks{ vmhook::hotspot::g_hooked_methods };
             const auto entry_it{ std::find_if(hooks.begin(), hooks.end(),
                 [target](const vmhook::hotspot::hooked_method& h) noexcept
@@ -8262,9 +8388,60 @@ namespace vmhook
             {
                 return "D";
             }
-            else
+            else if constexpr (std::is_integral_v<clean_t> && sizeof(clean_t) == sizeof(std::int32_t))
             {
                 return "I";
+            }
+            else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
+            {
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
+                static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
+                              "vmhook::detail::jni_signature_for_arg: unique_ptr<T> arg's T must "
+                              "derive from vmhook::object_base.  Pass a wrapper, not a raw object.");
+                // Resolve the JVM class name from the registered wrapper map so the
+                // signature reads `Lcom/example/Foo;` instead of the old silently-wrong
+                // `I` fallback that broke jni_make_unique whenever someone tried to
+                // construct an object whose constructor took another object.
+                const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
+                if (entry == vmhook::type_to_class_map.end())
+                {
+                    VMHOOK_LOG("{} vmhook::detail::jni_signature_for_arg<{}>: unique_ptr<T> wrapper "
+                               "not registered via vmhook::register_class<T>(name); falling back to "
+                               "Ljava/lang/Object;.",
+                               vmhook::warning_tag, typeid(wrapper_type).name());
+                    return "Ljava/lang/Object;";
+                }
+                std::string sig{ "L" };
+                sig.append(entry->second);
+                sig.push_back(';');
+                return sig;
+            }
+            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
+            {
+                const auto entry{ vmhook::type_to_class_map.find(std::type_index{ typeid(clean_t) }) };
+                if (entry == vmhook::type_to_class_map.end())
+                {
+                    VMHOOK_LOG("{} vmhook::detail::jni_signature_for_arg<{}>: object wrapper not "
+                               "registered via vmhook::register_class<T>(name); falling back to "
+                               "Ljava/lang/Object;.",
+                               vmhook::warning_tag, typeid(clean_t).name());
+                    return "Ljava/lang/Object;";
+                }
+                std::string sig{ "L" };
+                sig.append(entry->second);
+                sig.push_back(';');
+                return sig;
+            }
+            else
+            {
+                static_assert(vmhook::detail::dependent_false_v<clean_t>,
+                              "vmhook::detail::jni_signature_for_arg: unsupported argument type.  "
+                              "The old `else return \"I\";` fallback silently mis-encoded every "
+                              "wrapper-pointer / 64-bit / unknown-integral arg as Java `int`, "
+                              "which then made GetMethodID fail in jni_make_unique with no clear "
+                              "explanation.  Add an explicit branch above or convert the arg to one "
+                              "of: string, c-string, unique_ptr<vmhook::object>, object_base-derived, "
+                              "bool, integral (8/16/32/64-bit), float, double.");
             }
         }
 
@@ -10081,6 +10258,16 @@ namespace vmhook
                 @brief Converts the stored value to T via static_cast.
                 Falls back to a default-constructed T for variant alternatives
                 that cannot be cast to the target type (std::monostate, std::string).
+
+                Special-cases:
+                  * `void*` target with a uint32_t stored value (the variant
+                    alternative used for "reference / array (compressed OOP)")
+                    is routed through vmhook::hotspot::decode_oop_pointer so
+                    the caller gets the FULL 64-bit decoded heap pointer.
+                    Without this, the default static_cast<void*>(uint32_t)
+                    would silently produce a truncated 4-byte address - on
+                    every JVM with a non-zero narrow_oop_base, that's not
+                    even a heap address and dereferences immediately.
             */
             template<typename target_type>
             operator target_type() const noexcept
@@ -10088,7 +10275,15 @@ namespace vmhook
                 return std::visit([](auto v) noexcept
                     -> target_type
                     {
-                        if constexpr (requires { static_cast<target_type>(v); })
+                        using stored_type = std::remove_cvref_t<decltype(v)>;
+
+                        // Compressed-OOP -> raw heap pointer conversion.
+                        if constexpr (std::is_same_v<target_type, void*>
+                                   && std::is_same_v<stored_type, std::uint32_t>)
+                        {
+                            return vmhook::hotspot::decode_oop_pointer(v);
+                        }
+                        else if constexpr (requires { static_cast<target_type>(v); })
                         {
                             return static_cast<target_type>(v);
                         }
