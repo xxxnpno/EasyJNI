@@ -9868,7 +9868,28 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            // Return-type char is parsed once from signature_text
+            // Pick the overload whose JVM descriptor actually matches the
+            // C++ arg types.  get_method("name") returns the FIRST method
+            // matched by name only; on OBF builds many methods share a
+            // single-letter name (e.g. on Minecraft 1.8.9 vanilla
+            // EntityPlayerSP both addChatMessage(IChatComponent) and
+            // attackEntityFrom(DamageSource, float) are "a"), so we have
+            // to resolve the real overload here or we end up dispatching
+            // the wrong method ID via JNI and the chat message never
+            // reaches the JVM.  resolve_compatible_method() walks the
+            // class hierarchy and returns the Method* whose descriptor
+            // matches args_t exactly, falling back to this->method when
+            // nothing better is found (preserving old behaviour for
+            // unique method names).
+            vmhook::hotspot::method* const selected_method{
+                this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
+            const std::string& effective_signature{
+                (selected_method && selected_method != this->method)
+                    ? (this->cached_effective_signature = selected_method->get_signature(),
+                       this->cached_effective_signature)
+                    : this->signature_text };
+
+            // Return-type char is parsed once from effective_signature
             // and cached on the proxy.  Skips the rfind() on every
             // call.  The L/[ branch below still needs `rparen` to
             // peek at the full return descriptor for String detection,
@@ -9877,15 +9898,15 @@ namespace vmhook
             char ret_char{ this->cached_ret_char };
             if (!ret_char)
             {
-                rparen = this->signature_text.rfind(')');
+                rparen = effective_signature.rfind(')');
                 if (rparen == std::string::npos)
                 {
                     VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): malformed signature - no ')' found.",
-                               vmhook::error_tag, this->name(), this->signature_text);
+                               vmhook::error_tag, this->name(), effective_signature);
                     return value_t{ std::monostate{} };
                 }
-                ret_char = (rparen + 1 < this->signature_text.size())
-                               ? this->signature_text[rparen + 1]
+                ret_char = (rparen + 1 < effective_signature.size())
+                               ? effective_signature[rparen + 1]
                                : 'V';
                 this->cached_ret_char = ret_char;
             }
@@ -9943,7 +9964,7 @@ namespace vmhook
                     }
                     this->cached_class_handle = class_handle;
                     this->cached_method_id    = vmhook::detail::jni_get_static_method_id(
-                        class_handle, this->name(), this->signature_text);
+                        class_handle, this->name(), effective_signature);
                 }
                 else
                 {
@@ -9956,12 +9977,12 @@ namespace vmhook
                     {
                         VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): GetObjectClass returned null - "
                                    "receiver OOP is invalid or not yet visible to JNI.",
-                                   vmhook::error_tag, this->name(), this->signature_text);
+                                   vmhook::error_tag, this->name(), effective_signature);
                         return value_t{ std::monostate{} };
                     }
                     this->cached_class_handle = class_handle;
                     this->cached_method_id    = vmhook::detail::jni_get_method_id(
-                        class_handle, this->name(), this->signature_text);
+                        class_handle, this->name(), effective_signature);
                 }
 
                 if (!this->cached_method_id)
@@ -10072,7 +10093,7 @@ namespace vmhook
                 VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): dispatching {} receiver_oop=0x{:016X} receiver_klass={} method_id=0x{:016X} args=[{}].",
                            vmhook::info_tag,
                            this->name(),
-                           this->signature_text,
+                           effective_signature,
                            is_static_call ? "static" : "instance",
                            reinterpret_cast<std::uintptr_t>(is_static_call ? nullptr : this->object),
                            klass_name,
@@ -10332,10 +10353,10 @@ namespace vmhook
                     // java.lang.String, return a std::string copy.
                     if (rparen == std::string::npos)
                     {
-                        rparen = this->signature_text.rfind(')');
+                        rparen = effective_signature.rfind(')');
                     }
                     if (rparen != std::string::npos
-                        && std::string_view{ this->signature_text }.substr(rparen + 1) == "Ljava/lang/String;")
+                        && std::string_view{ effective_signature }.substr(rparen + 1) == "Ljava/lang/String;")
                     {
                         return value_t{ vmhook::detail::jni_get_string_utf(result_handle) };
                     }
@@ -10923,6 +10944,11 @@ namespace vmhook
         // Zero means "not yet computed"; the actual chars are all
         // non-zero (`I`, `J`, `V`, ...).
         mutable char  cached_ret_char{ 0 };
+        // When resolve_compatible_method picks a different overload than
+        // the one get_method() initially latched onto, store its descriptor
+        // here so the call_jni dispatch uses the right signature for
+        // GetMethodID / ret-type peek / return-type-string detection.
+        mutable std::string cached_effective_signature{};
     };
 
     // --- Object base class ----------------------------------------------------
