@@ -8070,6 +8070,11 @@ namespace vmhook
 
             call_void_method_a(vmhook::hotspot::current_jni_env, current_thread, set_loader_id, args);
             vmhook::detail::jni_exception_clear();
+
+            VMHOOK_LOG("{} inherit_host_context_classloader_for_current_thread(): installed loader 0x{:016X} on OS thread {}.",
+                       vmhook::info_tag,
+                       reinterpret_cast<std::uintptr_t>(loader_oop),
+                       static_cast<std::uint64_t>(vmhook::os::current_thread_id()));
         }
 
         /*
@@ -8493,13 +8498,30 @@ namespace vmhook
             return nullptr;
         }
 
-        if (!vmhook::detail::find_call_stub_entry())
+        // Always prefer NewObjectA: it lets the JVM allocate the object,
+        // set its mark word + (compressed) klass pointer, AND run the full
+        // constructor chain via the standard interpreter path.  That last
+        // bit matters - the TLAB fallback below dispatches <init> through
+        // method_proxy::call_jni, which uses CallVoidMethodA on <init>;
+        // that is JNI undefined behaviour and on some JDKs (notably JDK
+        // 21+ where StubRoutines::_call_stub_entry is missing from
+        // VMStructs) it skips the constructor body entirely, leaving
+        // super-class fields (e.g. ChatComponentStyle.siblings, .style)
+        // null.  Host code (Lunar's Adventure chat adapter, Forge's
+        // wrapped GuiNewChat) then NPEs / throws when it walks those
+        // fields.  Trying jni_make_unique first removes that whole class
+        // of bug.
+        if (std::unique_ptr<wrapper_type> jni_result{ vmhook::detail::jni_make_unique<wrapper_type>(map_entry->second, std::forward<args_t>(args)...) })
         {
-            if (std::unique_ptr<wrapper_type> jni_result{ vmhook::detail::jni_make_unique<wrapper_type>(map_entry->second, std::forward<args_t>(args)...) })
-            {
-                return jni_result;
-            }
+            VMHOOK_LOG("{} vmhook::make_unique<{}>(): constructed via NewObjectA.",
+                       vmhook::info_tag, typeid(wrapper_type).name());
+            return jni_result;
         }
+
+        VMHOOK_LOG("{} vmhook::make_unique<{}>(): NewObjectA path unavailable - "
+                   "falling back to TLAB + <init>.  Object fields may be only "
+                   "partially initialised on this JDK.",
+                   vmhook::warning_tag, typeid(wrapper_type).name());
 
         vmhook::hotspot::klass* const klass{ vmhook::find_class(map_entry->second) };
         if (!klass)
@@ -10056,6 +10078,33 @@ namespace vmhook
             {
                 case 'V':
                 {
+                    // JNI spec forbids using Call(Static)?VoidMethodA on a
+                    // constructor — the method ID must not be <init> or
+                    // <clinit>.  Some JVMs silently no-op the call (leaving
+                    // the object only partially constructed), others raise
+                    // an internal error.  Dispatch <init> through
+                    // CallNonvirtualVoidMethodA (slot 93) with the
+                    // constructor's declaring klass instead; that is the
+                    // documented way to invoke a constructor on an
+                    // already-allocated receiver via JNI.
+                    const bool is_init_call{ !is_static_call && this->name() == "<init>" && this->cached_class_handle };
+                    if (is_init_call)
+                    {
+                        using nonvirtual_fn_t = void(*)(void*, void*, void*, void*, const vmhook::detail::jni_value*);
+                        constexpr std::size_t nonvirtual_slot{ 93u };
+                        if (auto* const fn{ reinterpret_cast<nonvirtual_fn_t>(table[nonvirtual_slot]) })
+                        {
+                            fn(env_void, receiver, this->cached_class_handle, method_id, values);
+                            check_callee_exception();
+                        }
+                        else
+                        {
+                            VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): JNI CallNonvirtualVoidMethodA slot {} is null.",
+                                       vmhook::error_tag, this->name(), this->signature_text, nonvirtual_slot);
+                        }
+                        return value_t{ std::monostate{} };
+                    }
+
                     using fn_t = void(*)(void*, void*, void*, const vmhook::detail::jni_value*);
                     const std::size_t slot{ is_static_call ? 143u : 63u };
                     if (auto* const fn{ reinterpret_cast<fn_t>(table[slot]) })
