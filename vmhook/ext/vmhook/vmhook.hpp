@@ -391,6 +391,209 @@ namespace vmhook
     };
 
     // -------------------------------------------------------------------------
+    // Cross-thread dispatch
+    //
+    // JNI calls and Java field/method work installed via vmhook must execute on
+    // a thread that the JVM (and any host-application mixins, e.g. Lunar
+    // Client's Adventure-based chat handler) consider "the main client
+    // thread" - i.e. the thread that normally runs Java bytecode for the
+    // host application.  Calls made from a worker thread or the injector
+    // DLL's bootstrap thread can throw, NPE, or silently corrupt host state
+    // even when the calling thread is JNI-attached, because the host's
+    // ThreadLocal / context-classloader state isn't set up there.
+    //
+    // vmhook::dispatch(task) queues a function for later execution on a
+    // "safe" thread.  The queue is drained automatically at the entry of
+    // every installed hook detour - those detours fire on whichever Java
+    // thread invoked the hooked method, which by definition is a thread
+    // the JVM is happy with.  In practice you hook a per-tick method like
+    // Minecraft.runTick and the queue drains every tick.
+    //
+    // Typical use from outside a detour (worker thread, DLL bootstrap):
+    //     vmhook::dispatch([msg]
+    //     {
+    //         player->add_chat_message(
+    //             vmhook::make_unique<chat_component_text>(msg)
+    //         );
+    //     });
+    //
+    // The whole composite operation - allocation, constructor call, void
+    // method call - runs atomically on the detour thread, so no half-built
+    // OOPs leak out and no JNI exception is thrown by the host's mixin.
+    //
+    // detail::in_detour is a thread_local flag that public APIs can read
+    // to decide whether they're already on a detour thread.  It is set
+    // automatically by common_detour and by drain_dispatch_queue.
+    // -------------------------------------------------------------------------
+
+    namespace detail
+    {
+        inline std::mutex                         dispatch_mutex{};
+        inline std::vector<std::function<void()>> dispatch_queue{};
+        inline thread_local bool                  in_detour{ false };
+    }
+
+    /*
+        @brief Queue a task for later execution on a hook-detour thread.
+        @details
+        Thread-safe.  The task is run at the start of the next hook detour
+        invocation on this process (or immediately, if drain_dispatch_queue
+        is called manually from a detour thread).  Use this to defer JNI
+        work originated from background threads (worker threads, the DLL's
+        own bootstrap thread, etc.) onto a thread the JVM accepts.
+
+        If invoked from a thread that is already a detour thread
+        (vmhook::on_detour_thread() == true) the task runs inline so the
+        caller does not have to wait for the next hook firing.
+
+        Exception safety: noexcept.  An exception thrown by `task` is
+        caught and logged when the queue is drained; subsequent tasks in
+        the queue still run.
+
+        @param task  Callable invoked with no arguments and no return value.
+                     A no-op `task` (empty std::function) is accepted but
+                     not queued.
+    */
+    inline auto dispatch(std::function<void()> task) noexcept
+        -> void
+    {
+        if (!task)
+        {
+            return;
+        }
+        if (vmhook::detail::in_detour)
+        {
+            try
+            {
+                task();
+            }
+            catch (const std::exception& exception)
+            {
+                VMHOOK_LOG("{} vmhook::dispatch: inline task threw: {}",
+                           vmhook::error_tag, exception.what());
+            }
+            catch (...)
+            {
+                VMHOOK_LOG("{} vmhook::dispatch: inline task threw an unknown exception.",
+                           vmhook::error_tag);
+            }
+            return;
+        }
+        try
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::detail::dispatch_mutex };
+            vmhook::detail::dispatch_queue.push_back(std::move(task));
+        }
+        catch (const std::exception& exception)
+        {
+            VMHOOK_LOG("{} vmhook::dispatch: failed to enqueue task: {}",
+                       vmhook::error_tag, exception.what());
+        }
+        catch (...)
+        {
+            VMHOOK_LOG("{} vmhook::dispatch: failed to enqueue task: unknown exception",
+                       vmhook::error_tag);
+        }
+    }
+
+    /*
+        @brief Drain all pending tasks queued via dispatch().
+        @details
+        Each task runs synchronously on the calling thread.  Tasks that
+        themselves call dispatch() add to the queue while we drain, and
+        the loop re-checks the queue until it stays empty.  Exceptions
+        thrown by tasks are caught and logged; the next task still runs.
+
+        While draining, detail::in_detour is set to true so that callees
+        (e.g. method_proxy::call_jni) can tell they're now executing on
+        a thread that is safe for JNI work, even if the original detour
+        guard set up by common_detour has unwound.
+
+        Re-entrant calls (drain_dispatch_queue invoked from inside a
+        task) are no-ops to keep iteration linear.
+
+        Called automatically at the entry of every hook detour - you
+        normally do not need to invoke this manually.
+
+        Exception safety: noexcept.
+    */
+    inline auto drain_dispatch_queue() noexcept
+        -> void
+    {
+        static thread_local bool draining{ false };
+        if (draining)
+        {
+            return;
+        }
+        draining = true;
+
+        const bool previous_in_detour{ vmhook::detail::in_detour };
+        vmhook::detail::in_detour = true;
+
+        while (true)
+        {
+            std::vector<std::function<void()>> local;
+            try
+            {
+                std::lock_guard<std::mutex> lock{ vmhook::detail::dispatch_mutex };
+                if (vmhook::detail::dispatch_queue.empty())
+                {
+                    break;
+                }
+                local.swap(vmhook::detail::dispatch_queue);
+            }
+            catch (...)
+            {
+                VMHOOK_LOG("{} vmhook::drain_dispatch_queue: failed to lock the queue.",
+                           vmhook::error_tag);
+                break;
+            }
+
+            for (auto& task : local)
+            {
+                if (!task)
+                {
+                    continue;
+                }
+                try
+                {
+                    task();
+                }
+                catch (const std::exception& exception)
+                {
+                    VMHOOK_LOG("{} vmhook::drain_dispatch_queue: task threw: {}",
+                               vmhook::error_tag, exception.what());
+                }
+                catch (...)
+                {
+                    VMHOOK_LOG("{} vmhook::drain_dispatch_queue: task threw an unknown exception.",
+                               vmhook::error_tag);
+                }
+            }
+        }
+
+        vmhook::detail::in_detour = previous_in_detour;
+        draining = false;
+    }
+
+    /*
+        @brief Reports whether the calling thread is currently inside a hook detour.
+        @details
+        True while common_detour is dispatching to a user detour, and also
+        while drain_dispatch_queue is running tasks.  False otherwise.
+
+        Use this in user code to decide whether a JNI-touching helper can
+        run inline or must be deferred via vmhook::dispatch.
+
+        Exception safety: noexcept.
+    */
+    inline auto on_detour_thread() noexcept
+        -> bool
+    {
+        return vmhook::detail::in_detour;
+    }
+
+    // -------------------------------------------------------------------------
     // OS abstraction layer
     //
     // Wraps Windows-only and POSIX-only primitives behind a portable surface so
@@ -5314,6 +5517,33 @@ namespace vmhook
                         vmhook::hotspot::current_java_thread = this->previous;
                     }
                 } guard{ thread };
+
+                // Mark this thread as "inside a detour" while we dispatch.  This
+                // is the cue that vmhook::on_detour_thread() reads, and it lets
+                // off-thread helpers know it's safe to issue JNI calls inline.
+                struct in_detour_guard
+                {
+                    bool previous;
+
+                    in_detour_guard() noexcept
+                        : previous{ vmhook::detail::in_detour }
+                    {
+                        vmhook::detail::in_detour = true;
+                    }
+
+                    ~in_detour_guard()
+                    {
+                        vmhook::detail::in_detour = previous;
+                    }
+                } detour_marker{};
+
+                // Drain any work queued from off-thread (DLL bootstrap, worker
+                // threads, command handlers, etc.) so it executes on this
+                // detour thread - which the JVM and host mixins are happy
+                // with - rather than on whatever background thread originally
+                // enqueued it.  Runs before the user detour so a user detour
+                // can rely on the queue being empty.
+                vmhook::drain_dispatch_queue();
 
                 for (const vmhook::hotspot::hooked_method& hook : vmhook::hotspot::g_hooked_methods)
                 {
