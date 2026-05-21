@@ -7533,25 +7533,28 @@ namespace vmhook
     }
 
     /*
-        @brief Removes all active interpreter hooks and restores the JVM to its original state.
+        @brief Removes all active interpreter hooks and leaves the JVM in a
+               safe, consistent post-hook state.
         @details
-        Phase 1: Deletes each midi2i_hook instance, restoring original bytes and freeing memory.
-        Phase 2: Clears _dont_inline and NO_COMPILE flags.
-        Phase 3: For methods that were JIT-compiled at hook-install time, restores the original
-                 entry points and re-links _code so the nmethod is active again.
+        Phase 1: Sets g_shutdown_requested so any in-flight common_detour
+                 returns immediately.
+        Phase 2: Deletes each midi2i_hook instance, restoring the original
+                 bytes at the i2i target and freeing the trampoline page.
+        Phase 3: Clears _dont_inline and NO_COMPILE so the JIT can recompile.
 
-        Order within phase 3 matters because another Java thread may
-        observe a partially-restored Method at any safepoint:
-
-          1.  set_code(original_code)            re-link the nmethod first
-          2.  set_from_compiled_entry(original)  compiled callers now reach the nmethod
-          3.  set_from_interpreted_entry(orig)   interpreted callers reach the i2c adapter
-
-        The previous order (entries then _code) opened a window in which
-        _code was still nullptr while _from_compiled_entry already pointed
-        at the old nmethod's verified-entry — the JVM's internal sanity
-        check (nmethod-pointer vs entry-point consistency) trips that
-        window with EXCEPTION_ACCESS_VIOLATION at the next safepoint.
+        Note: hooks that were JIT-compiled at install-time are deliberately
+        NOT re-linked to their original nmethod here.  Earlier versions
+        wrote the saved original_code back into Method::_code, but the
+        nmethod sweeper may have flushed that nmethod during the hook's
+        lifetime, so the restored pointer can be dangling.  Subsequent
+        dispatch hits freed code-cache memory and crashes the JVM (the
+        symptom observed by users on uninject was a cascade of 0xC0000005
+        in the 0x10000000-0x10FFFFFF range, i.e. inside the code cache).
+        Leaving _code = nullptr keeps the method in the
+        installed-but-deopted state, which is identical to a freshly
+        loaded never-compiled method — a configuration HotSpot already
+        handles correctly.  If the method gets hot again the JIT will
+        recompile from scratch.
     */
     static auto shutdown_hooks() noexcept
         -> void
@@ -7583,31 +7586,30 @@ namespace vmhook
                 *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
             }
 
-            if (hooked_method_entry.was_compiled)
-            {
-                // 1. Re-link the nmethod first so _code is consistent with
-                //    whatever _from_compiled_entry was at install time.
-                if (hooked_method_entry.original_code)
-                {
-                    hooked_method_entry.method->set_code(hooked_method_entry.original_code);
-                }
-                // 2. Restore the compiled-side entry so compiled callers
-                //    that were re-routed through the c2i adapter at install
-                //    now hit the original nmethod entry again.
-                if (hooked_method_entry.original_from_compiled_entry)
-                {
-                    hooked_method_entry.method->set_from_compiled_entry(hooked_method_entry.original_from_compiled_entry);
-                }
-                // 3. Restore the interpreted-side entry last; until this
-                //    write completes, interpreted callers still reach our
-                //    patched i2i, which is correct because the trampoline
-                //    has been freed above (any pending in-flight calls
-                //    finish on the old, already-restored bytes).
-                if (hooked_method_entry.original_from_interpreted_entry)
-                {
-                    hooked_method_entry.method->set_from_interpreted_entry(hooked_method_entry.original_from_interpreted_entry);
-                }
-            }
+            // DELIBERATELY no _code / _from_compiled_entry / _from_interpreted_entry
+            // restoration for was_compiled methods.
+            //
+            // The original_code we saved at install time is a pointer to the
+            // nmethod that was active back then.  Once we set _code = nullptr
+            // (the install-time deopt), HotSpot's nmethod sweeper considers
+            // that nmethod unreachable and eventually flushes it - the user
+            // observes "Nmethod flushes (20 events)" in every hs_err log past
+            // a few seconds of runtime.  Writing the now-stale pointer back
+            // into _code and _from_compiled_entry at shutdown gives the JVM
+            // a dangling pointer; any subsequent call into the method (which
+            // happens constantly during JVM teardown - the nmethod sweeper,
+            // safepoint cleanup, finalizer dispatch, etc.) jumps into freed
+            // code-cache memory and access-violates somewhere in the 0x10??????
+            // range.  That was the post-uninject crash cascade.
+            //
+            // Leaving the method in the install-time deopted state instead
+            // (_code = nullptr, _from_interpreted_entry = original i2i now
+            // unpatched by ~midi2i_hook, _from_compiled_entry = c2i adapter
+            // we installed) is internally consistent and safe: the method
+            // looks "not currently compiled" to HotSpot, which is its
+            // earliest steady-state and a configuration the JVM is
+            // already designed to handle for every freshly-loaded method.
+            // If the method gets hot again the JIT will recompile it fresh.
         }
 
         vmhook::hotspot::g_hooked_methods.clear();
@@ -7653,26 +7655,13 @@ namespace vmhook
             {
                 *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
             }
-            if (entry_it->was_compiled)
-            {
-                // Same ordering as shutdown_hooks: re-link _code first so
-                // the JVM never observes a window with _code == nullptr
-                // and a stale _from_compiled_entry pointing into the
-                // (still-resident) nmethod — that combo trips the internal
-                // sanity check at the next safepoint.
-                if (entry_it->original_code)
-                {
-                    entry_it->method->set_code(entry_it->original_code);
-                }
-                if (entry_it->original_from_compiled_entry)
-                {
-                    entry_it->method->set_from_compiled_entry(entry_it->original_from_compiled_entry);
-                }
-                if (entry_it->original_from_interpreted_entry)
-                {
-                    entry_it->method->set_from_interpreted_entry(entry_it->original_from_interpreted_entry);
-                }
-            }
+            // No _code / _from_compiled_entry / _from_interpreted_entry
+            // restoration here either - see the long comment in
+            // shutdown_hooks() for why.  Short version: the nmethod we
+            // captured at install time may have been flushed by the JVM
+            // sweeper in the meantime, so restoring _code to that
+            // pointer hands the JVM a dangling code-cache address and
+            // every subsequent dispatch to the method AVs in 0x10??????.
 
             hooks.erase(entry_it);
         }
