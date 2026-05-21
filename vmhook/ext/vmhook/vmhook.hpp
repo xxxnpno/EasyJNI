@@ -5682,17 +5682,31 @@ namespace vmhook
 
             ~per_method_i2i_stub()
             {
-                // Restore the Method's original interpreted entry FIRST so no
-                // new dispatch lands in our about-to-be-freed page.  Other
+                // Restore the Method's interpreted entry FIRST so no new
+                // dispatch lands in our about-to-be-freed page.  Other
                 // threads currently mid-stub finish executing the bytes we
                 // copied (the prologue) then jump to the still-live shared
                 // i2i continuation, so this restoration is safe even with
-                // concurrent callers - the page must outlive in-flight
+                // concurrent callers — the page must outlive in-flight
                 // execution, but no new entries will occur after the write
                 // below.
-                if (!this->error && this->method_ptr && this->original_from_interpreted_entry)
+                //
+                // We restore to the *shared* i2i (Method::_i2i_entry) rather
+                // than to the original captured value because for methods
+                // that were JIT-compiled at install time, the captured
+                // original was an i2c adapter (interpreter-to-compiled) that
+                // loads Method::_code and jumps - and our shutdown leaves
+                // _code = nullptr.  Restoring the i2c adapter under those
+                // conditions makes the JVM jump-through-null at the next
+                // call.  The shared i2i is always safe (it's the steady-state
+                // for any not-currently-compiled method, which is what we
+                // leave the method as after shutdown).
+                if (!this->error && this->method_ptr)
                 {
-                    this->method_ptr->set_from_interpreted_entry(this->original_from_interpreted_entry);
+                    if (void* const shared_i2i{ this->method_ptr->get_i2i_entry() })
+                    {
+                        this->method_ptr->set_from_interpreted_entry(shared_i2i);
+                    }
                 }
 
                 if (this->trampoline_owner)
@@ -7786,34 +7800,43 @@ namespace vmhook
 
                 if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                 {
-                    // 1. Redirect interpreted callers to the (now-patched) i2i stub.
-                    found_method->set_from_interpreted_entry(i2i);
-                    // 2. Redirect compiled callers through the c2i adapter -> interpreter -> i2i stub.
+                    // Redirect compiled callers through the c2i adapter so they
+                    // transition to interpreter dispatch.  The c2i adapter
+                    // then loads Method::_from_interpreted_entry (which
+                    // per_method_i2i_stub above already pointed at our stub)
+                    // and jumps there.
                     found_method->set_from_compiled_entry(c2i_entry);
-                    // 3. Clear _code last so the above entry-point writes are visible first.
+                    // Clear _code so the JVM treats the method as not
+                    // currently compiled, repairing inline caches at the
+                    // next safepoint.
                     found_method->set_code(nullptr);
+                    // DO NOT touch _from_interpreted_entry here - the
+                    // per_method_i2i_stub we just installed owns that field
+                    // and is pointing it at our redirect stub.  The previous
+                    // line of this block used to overwrite it with the
+                    // *shared* i2i, which silently undid every per-method
+                    // hook on JIT-compiled methods (orientCamera /
+                    // rayTraceBlocks on Lunar 1.8.9 were both compiled by
+                    // injection time, so camera_no_clip never fired).
                     VMHOOK_LOG("{} hook():   deopt complete - _from_compiled_entry -> c2i @ 0x{:016X}, _code cleared.",
                                vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
                 }
                 else
                 {
-                    // c2i adapter unrecoverable.  The upstream-conservative
-                    // policy is to leave _code intact and accept that compiled
-                    // callers bypass the hook, but that defeats the entire
-                    // point of installing the hook in the first place for
-                    // hot methods like runTick.  Match the older vmhook
-                    // behaviour: redirect the interpreted entry to the i2i
-                    // stub and clear _code so subsequent dispatch falls back
-                    // through the interpreter and hits the hook.  Compiled
+                    // c2i adapter unrecoverable.  Clear _code so the JVM
+                    // treats the method as not currently compiled and
+                    // eventually re-resolves the inline caches at the next
+                    // safepoint.  Same _from_interpreted_entry caveat as
+                    // above: it's owned by the per_method_i2i_stub now, do
+                    // NOT clobber it back to the shared i2i.  Compiled
                     // callers with stale inline caches still reach the old
                     // nmethod for one cycle, but the cache is repaired at
                     // the next safepoint when the IC re-resolves and finds
                     // _code == nullptr.
-                    found_method->set_from_interpreted_entry(i2i);
                     found_method->set_code(nullptr);
-                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; forced deopt - _code cleared, "
-                               "_from_interpreted_entry redirected to i2i.  Compiled inline caches will repair "
-                               "themselves at the next safepoint.", vmhook::warning_tag, method_name);
+                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; forced deopt - _code cleared.  "
+                               "Compiled inline caches will repair themselves at the next safepoint.",
+                               vmhook::warning_tag, method_name);
                 }
             }
 
