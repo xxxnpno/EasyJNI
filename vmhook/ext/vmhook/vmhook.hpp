@@ -5166,6 +5166,7 @@ namespace vmhook
                 : target{ target }
                 , allocated{ nullptr }
                 , allocated_size{ 0 }
+                , current_chain_resume{ const_cast<void*>(chain_resume) }
                 , error{ true }
             {
 #if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
@@ -5458,10 +5459,143 @@ namespace vmhook
                 return this->error;
             }
 
+            /*
+                @brief Re-applies our 5-byte JMP at the injection point.  If the
+                       bytes there look like a JMP into another DLL's trampoline
+                       (overwritten since install), re-do chain detection and
+                       update our trampoline's resume target to chain to it.
+                @details
+                Called by vmhook::verify_hooks() to recover from another hooker
+                stomping our patch in the shared HotSpot i2i stub.  Returns
+                true if the patch was already intact, false if we had to
+                re-write it.  Logs every re-write.
+
+                Race: re-writing 5 bytes while a Java thread is mid-instruction
+                at those bytes can in theory tear an instruction.  In practice
+                byte 0 is always 0xE9 (JMP opcode) both before and after, and
+                the rel32 (bytes 1-4) is replaced by a memcpy.  The CPU never
+                sees a non-JMP opcode, only a possibly-wrong rel32 destination
+                for the few-nanosecond window during the write.  Tolerable
+                given the alternative (giving up scenario-1 recovery entirely).
+            */
+            auto verify_and_repair() noexcept -> bool
+            {
+                if (this->error || !this->target || !this->allocated)
+                {
+                    return true;
+                }
+
+                static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+                static constexpr std::int32_t JMP_SIZE{ 5 };
+
+                // Expected: 0xE9 + rel32 to our trampoline (this->allocated).
+                const std::int32_t expected_rel{ static_cast<std::int32_t>(
+                    this->allocated - (this->target + JMP_SIZE)) };
+                std::uint8_t expected[JMP_SIZE]{};
+                expected[0] = JMP_OPCODE;
+                std::memcpy(expected + 1, &expected_rel, sizeof(expected_rel));
+
+                if (std::memcmp(this->target, expected, JMP_SIZE) == 0)
+                {
+                    return true;  // hook intact, nothing to do
+                }
+
+                // Patch is gone.  If a different JMP is there, follow it -
+                // someone else hooked the stub after us; chain to their
+                // trampoline so both hooks fire after we re-install.
+                void* new_chain{ this->current_chain_resume };
+                if (this->target[0] == JMP_OPCODE)
+                {
+                    std::int32_t rel{};
+                    std::memcpy(&rel, this->target + 1, sizeof(rel));
+                    std::uint8_t* const prior_trampoline{ this->target + JMP_SIZE + rel };
+                    if (prior_trampoline != this->allocated  // not pointing at ourselves
+                        && vmhook::hotspot::is_valid_pointer(prior_trampoline))
+                    {
+                        new_chain = prior_trampoline;
+                    }
+                }
+
+                // If the chain target changed, update our trampoline's resume
+                // JMP delta so it lands on the new chain target after our
+                // detour returns "don't cancel".
+                if (new_chain != this->current_chain_resume)
+                {
+                    this->rewrite_chain_resume(new_chain);
+                    this->current_chain_resume = new_chain;
+                }
+
+                // Re-write the 5-byte JMP at the injection point.
+                std::uint32_t old_protect{};
+                if (!vmhook::os::protect(this->target, JMP_SIZE,
+                                         vmhook::os::memory_protection::execute_rw, &old_protect))
+                {
+                    return false;
+                }
+                std::memcpy(this->target, expected, JMP_SIZE);
+                vmhook::os::protect(this->target, JMP_SIZE,
+                                    vmhook::os::memory_protection::execute_read, &old_protect);
+                vmhook::os::flush_instruction_cache(this->target, JMP_SIZE);
+
+                VMHOOK_LOG("{} midi2i_hook::verify_and_repair: re-applied JMP at 0x{:016X} -> 0x{:016X}, "
+                           "chain resume = 0x{:016X}.",
+                           vmhook::info_tag,
+                           reinterpret_cast<std::uintptr_t>(this->target),
+                           reinterpret_cast<std::uintptr_t>(this->allocated),
+                           reinterpret_cast<std::uintptr_t>(this->current_chain_resume));
+
+                return false;
+            }
+
+        private:
+            // Updates the rel32 inside the resume-JMP instruction at the end
+            // of our trampoline so it points at new_target instead of the
+            // previously-cached chain_resume (or target + HOOK_SIZE).  Only
+            // called by verify_and_repair() when another hooker has changed
+            // the chain since install.
+            //
+            // The offsets here MUST stay in sync with the assembly array in
+            // the ctor.  We keep two sets of constants - one per ABI - so
+            // both build paths get the right values.
+            auto rewrite_chain_resume(void* const new_target) noexcept -> void
+            {
+#if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
+                (void)new_target;
+                return;
+#else
+                static constexpr std::int32_t HOOK_SIZE{ 8 };
+#if VMHOOK_OS_WINDOWS
+                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x73 };
+                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
+#else
+                static constexpr std::int32_t RESUME_JMP_OFFSET{ 0x74 };
+                static constexpr std::int32_t RESUME_JMP_SIZE{ 5 };
+#endif
+                std::uint8_t* const resume_rel_addr{
+                    this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + 1 };
+                const std::uint8_t* const next_instruction_addr{
+                    this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE };
+                const std::int32_t new_rel{ static_cast<std::int32_t>(
+                    static_cast<const std::uint8_t*>(new_target) - next_instruction_addr) };
+
+                std::uint32_t old_protect{};
+                if (!vmhook::os::protect(this->allocated, this->allocated_size,
+                                         vmhook::os::memory_protection::execute_rw, &old_protect))
+                {
+                    return;
+                }
+                std::memcpy(resume_rel_addr, &new_rel, sizeof(new_rel));
+                vmhook::os::protect(this->allocated, this->allocated_size,
+                                    vmhook::os::memory_protection::execute_read, &old_protect);
+                vmhook::os::flush_instruction_cache(resume_rel_addr, sizeof(new_rel));
+#endif
+            }
+
         private:
             std::uint8_t* target{ nullptr };
             std::uint8_t* allocated{ nullptr };
             std::size_t   allocated_size{ 0 };
+            void*         current_chain_resume{ nullptr };
             bool          error{ true };
         };
 
@@ -7641,6 +7775,55 @@ namespace vmhook
         handles correctly.  If the method gets hot again the JIT will
         recompile from scratch.
     */
+    /*
+        @brief Verifies every installed hook's 5-byte JMP is still at the
+               injection point; re-installs any that have been overwritten.
+        @details
+        Call this from your main loop on a sane cadence (e.g. every 100 ms).
+        It detects the case where another i2i-patching DLL was injected
+        AFTER us and stomped our patch in the shared HotSpot interpreter
+        stub, then re-applies our JMP — with chain detection, so if their
+        new JMP is still there we now chain in front of theirs and both
+        hooks fire.
+
+        Returns the number of hooks that needed repair.  Returns 0 on the
+        common path (everything intact); a non-zero value means one or
+        more hooks were overwritten and just got restored.
+
+        Designed for low cost when everything is fine: a memcmp of 5 bytes
+        per installed hook plus the mutex acquire.  Only does writes when
+        a hook is actually broken.
+
+        Race: the re-write is not atomic across the 5 bytes.  See
+        midi2i_hook::verify_and_repair for the analysis - in short, byte 0
+        stays 0xE9 (JMP opcode) before and after, so the worst case is
+        a wrong-rel32 destination for a few-nanosecond window.  In practice
+        the only time this matters is if some other hooker is rewriting
+        the same bytes simultaneously, in which case you're already in
+        a war and tearing is the least of your problems.
+    */
+    static auto verify_hooks() noexcept
+        -> std::size_t
+    {
+        std::size_t repaired{ 0 };
+        try
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::hotspot::g_hooked_methods_mutex };
+            for (const vmhook::hotspot::i2i_hook_data& entry : vmhook::hotspot::g_hooked_i2i_entries)
+            {
+                if (entry.hook && !entry.hook->verify_and_repair())
+                {
+                    ++repaired;
+                }
+            }
+        }
+        catch (...)
+        {
+            // No-throw contract: callers run this from hot loops.
+        }
+        return repaired;
+    }
+
     static auto shutdown_hooks() noexcept
         -> void
     {
