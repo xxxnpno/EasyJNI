@@ -7851,6 +7851,102 @@ namespace vmhook
                 }
             }
 
+            // Re-install a hooked_method whose Method* has gone stale.
+            // The shared-i2i patch we put in at install time is still in
+            // place and still routes calls to common_detour; the only
+            // broken link is that common_detour compares the live
+            // frame.method against our stored hm.method, and our stored
+            // pointer is now pointing at freed-or-aliased memory.  Look
+            // up the *current* Method on its class by name+signature and
+            // swap our pointer.  Re-apply the JIT inhibitors so the new
+            // Method doesn't get re-compiled out from under us.
+            //
+            // The shared-i2i patch is per-i2i-stub (one trampoline serves
+            // every method routed through that stub), so no allocation
+            // happens here - pointer update + flag bits only.
+            const auto try_reinstall = [](vmhook::hotspot::hooked_method& hm_to_repair) noexcept -> bool
+            {
+                try
+                {
+                    vmhook::hotspot::klass* const new_klass{ vmhook::find_class(hm_to_repair.expected_class_name) };
+                    if (!new_klass)
+                    {
+                        return false;
+                    }
+
+                    const std::int32_t method_count{ new_klass->get_methods_count() };
+                    vmhook::hotspot::method** const methods_array{ new_klass->get_methods_ptr() };
+                    if (!methods_array || method_count <= 0)
+                    {
+                        return false;
+                    }
+
+                    vmhook::hotspot::method* new_method{ nullptr };
+                    for (std::int32_t i{ 0 }; i < method_count; ++i)
+                    {
+                        vmhook::hotspot::method* const m{ methods_array[i] };
+                        if (m && vmhook::hotspot::is_valid_pointer(m)
+                            && m->get_name() == hm_to_repair.expected_method_name
+                            && (hm_to_repair.expected_signature.empty()
+                                || m->get_signature() == hm_to_repair.expected_signature))
+                        {
+                            new_method = m;
+                            break;
+                        }
+                    }
+                    if (!new_method)
+                    {
+                        return false;
+                    }
+
+                    // Pointer assignment is atomic on x86_64; common_detour's
+                    // lock-free read picks up the new value next dispatch.
+                    const vmhook::hotspot::method* const old_method{ hm_to_repair.method };
+                    hm_to_repair.method = new_method;
+
+                    // Re-apply the JIT inhibitors so the new Method holds.
+                    vmhook::hotspot::set_dont_inline(new_method, true);
+                    if (std::uint32_t* const flags{ new_method->get_access_flags() })
+                    {
+                        *flags |= vmhook::hotspot::NO_COMPILE;
+                    }
+
+                    // If the new method is already JIT-compiled, deopt it
+                    // the same way the install path does.  c2i recovery is
+                    // best-effort; on failure we still clear _code so the
+                    // method falls back to interpreted dispatch through
+                    // the (still-patched) shared i2i.
+                    void* const code_now{ new_method->get_code() };
+                    if (code_now != nullptr && vmhook::hotspot::is_valid_pointer(code_now))
+                    {
+                        void* const adapter{ new_method->get_adapter() };
+                        void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                        if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
+                        {
+                            new_method->set_from_compiled_entry(c2i_entry);
+                        }
+                        new_method->set_code(nullptr);
+                    }
+
+                    // Re-arm drift detection so the next time anything
+                    // changes we notice and log again.
+                    hm_to_repair.drift_logged = false;
+
+                    VMHOOK_LOG("{} verify_hooks: re-installed hook for '{}.{}{}': old Method* 0x{:016X} -> 0x{:016X}.",
+                               vmhook::info_tag,
+                               hm_to_repair.expected_class_name,
+                               hm_to_repair.expected_method_name,
+                               hm_to_repair.expected_signature,
+                               reinterpret_cast<std::uintptr_t>(old_method),
+                               reinterpret_cast<std::uintptr_t>(new_method));
+                    return true;
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            };
+
             // Per-Method drift detector.  Three distinct "hook silently
             // stopped firing" failure modes that we surface here, in
             // order of severity:
@@ -7890,13 +7986,16 @@ namespace vmhook
                 {
                     VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' has been FREED - the JVM unloaded "
                                "the class that owned this Method (typically caused by another DLL "
-                               "calling JVMTI RedefineClasses / RetransformClasses).  Hook will not "
-                               "fire again unless re-installed against the new Method.",
+                               "calling JVMTI RedefineClasses / RetransformClasses).",
                                vmhook::error_tag,
                                hm.expected_class_name,
                                hm.expected_method_name,
                                hm.expected_signature);
                     hm.drift_logged = true;
+                    if (try_reinstall(hm))
+                    {
+                        ++repaired;
+                    }
                     continue;
                 }
 
@@ -7906,14 +8005,17 @@ namespace vmhook
                 {
                     VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' now points at a DIFFERENT method "
                                "named '{}' - the original Method was freed by class redefinition and "
-                               "the allocator reused the address.  common_detour will fire on the "
-                               "wrong method (or not at all) until re-installation.",
+                               "the allocator reused the address.",
                                vmhook::error_tag,
                                hm.expected_class_name,
                                hm.expected_method_name,
                                hm.expected_signature,
                                current_name);
                     hm.drift_logged = true;
+                    if (try_reinstall(hm))
+                    {
+                        ++repaired;
+                    }
                     continue;
                 }
 
