@@ -5149,10 +5149,20 @@ namespace vmhook
         public:
             /*
                 @brief Installs the hook on the given target address.
-                @param target  Pointer to the injection point within the i2i stub.
-                @param detour  The C++ function to call when the hook fires.
+                @param target         Pointer to the injection point within the i2i stub.
+                @param detour         The C++ function to call when the hook fires.
+                @param chain_resume   Optional address to jump to after our detour returns
+                                      "don't cancel".  Defaults to `target + HOOK_SIZE`
+                                      (resume the original i2i past the patched window),
+                                      but the install site can pass another DLL's trampoline
+                                      entry here to chain hooks: our detour runs, then we
+                                      jmp into their trampoline, which runs their detour
+                                      and itself resumes at `target + HOOK_SIZE`.  Both
+                                      hooks fire, no cross-DLL conflict.
             */
-            midi2i_hook(std::uint8_t* const target, const vmhook::hotspot::detour_function_t detour)
+            midi2i_hook(std::uint8_t* const target,
+                        const vmhook::hotspot::detour_function_t detour,
+                        const void* const chain_resume = nullptr)
                 : target{ target }
                 , allocated{ nullptr }
                 , allocated_size{ 0 }
@@ -5372,8 +5382,22 @@ namespace vmhook
                 const std::int32_t je_delta{ RESUME_OFFSET - (JE_OFFSET + JE_SIZE) };
                 *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
 
+                // Where to resume after the detour returns "don't cancel".
+                // Default: `target + HOOK_SIZE` (continue past the patched window
+                // in the same stub).  When chain_resume is non-null we point at
+                // another hooker's trampoline instead, so vmhook coexists with
+                // any prior i2i-patching DLL: we run our detour, then JMP into
+                // their trampoline, which runs its detour and resumes at the
+                // original `target + HOOK_SIZE` from its own copy of the saved
+                // bytes.  Both hooks fire, neither overwrites the other.
+                const std::uint8_t* const effective_resume{
+                    chain_resume
+                        ? static_cast<const std::uint8_t*>(chain_resume)
+                        : target + HOOK_SIZE
+                };
+
                 const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
-                    target + HOOK_SIZE - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
+                    effective_resume - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(assembly + RESUME_JMP_OFFSET + 1) = resume_jmp_delta;
 
                 *reinterpret_cast<vmhook::hotspot::detour_function_t*>(assembly + DETOUR_ADDRESS_OFFSET) = detour;
@@ -7474,7 +7498,50 @@ namespace vmhook
                     throw vmhook::exception{ "Failed to find hook location in i2i stub." };
                 }
 
-                vmhook::hotspot::midi2i_hook* const hook_instance{ new vmhook::hotspot::midi2i_hook(target, vmhook::hotspot::common_detour) };
+                // -- Hook chaining: detect prior i2i-patching DLLs --------------
+                // HotSpot's i2i stub is shared across many Methods, so any other
+                // DLL that patches it at the same find_hook_location injection
+                // point will end up writing a 5-byte JMP (0xE9 + rel32) over
+                // ours and we go silent.  If we see that JMP already in place
+                // before our install, we follow the rel32 to compute the prior
+                // hook's trampoline entry and pass it as our chain_resume:
+                // our trampoline will run our detour, then JMP into the prior
+                // hooker's trampoline, which finishes its work and resumes at
+                // `target + HOOK_SIZE`.  Both hooks fire; neither is lost.
+                //
+                // This handles the "other DLL was injected first" case.  The
+                // reverse case ("other DLL injects after us") is not solved
+                // here - they'd just overwrite our JMP unless they also do
+                // chain detection.  See the README compatibility note for a
+                // discussion of options if you hit that.
+                void* chain_resume{ nullptr };
+                constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+                if (target[0] == JMP_OPCODE)
+                {
+                    const std::int32_t rel{ *reinterpret_cast<const std::int32_t*>(target + 1) };
+                    std::uint8_t* const prior_trampoline{ target + 5 + rel };
+                    if (vmhook::hotspot::is_valid_pointer(prior_trampoline))
+                    {
+                        chain_resume = prior_trampoline;
+                        VMHOOK_LOG("{} hook(): injection point at 0x{:016X} already JMP'd by another hooker "
+                                   "to 0x{:016X}; chaining our hook in front of theirs.",
+                                   vmhook::info_tag,
+                                   reinterpret_cast<std::uintptr_t>(target),
+                                   reinterpret_cast<std::uintptr_t>(prior_trampoline));
+                    }
+                    else
+                    {
+                        VMHOOK_LOG("{} hook(): injection point at 0x{:016X} starts with JMP but the target "
+                                   "0x{:016X} doesn't pass is_valid_pointer - installing without chain (the "
+                                   "other hooker's hook will be lost).",
+                                   vmhook::warning_tag,
+                                   reinterpret_cast<std::uintptr_t>(target),
+                                   reinterpret_cast<std::uintptr_t>(prior_trampoline));
+                    }
+                }
+
+                vmhook::hotspot::midi2i_hook* const hook_instance{
+                    new vmhook::hotspot::midi2i_hook(target, vmhook::hotspot::common_detour, chain_resume) };
                 if (hook_instance->has_error())
                 {
                     delete hook_instance;
