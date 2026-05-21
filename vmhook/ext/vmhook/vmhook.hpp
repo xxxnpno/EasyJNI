@@ -6117,7 +6117,44 @@ namespace vmhook
             const auto cache_entry{ vmhook::klass_lookup_cache.find(std::string{ class_name }) };
             if (cache_entry != vmhook::klass_lookup_cache.end())
             {
-                return cache_entry->second;
+                vmhook::hotspot::klass* const cached_klass{ cache_entry->second };
+
+                // Stale-cache check.  Class redefinition (JVMTI
+                // RedefineClasses / RetransformClasses, or class
+                // unloading + reload) can free the klass we cached.  A
+                // subsequent find_class hit would return that dangling
+                // pointer and every downstream consumer (get_field walks
+                // for the SDK, Method* iteration for hook re-install, the
+                // ClassLoaderDataGraph capture) would silently read
+                // garbage and bail.  Cheap validation: read the klass's
+                // own name symbol and compare to the requested name.
+                // If they match, the klass is still the one we cached;
+                // if they don't, the klass was replaced and we need to
+                // re-resolve.
+                //
+                // klass::get_name and symbol::to_string both already
+                // gate every dereference behind is_valid_pointer +
+                // try/catch, so a hit on freed memory returns "" or
+                // nullptr rather than AV-ing.
+                if (cached_klass && vmhook::hotspot::is_valid_pointer(cached_klass))
+                {
+                    const vmhook::hotspot::symbol* const name_sym{ cached_klass->get_name() };
+                    if (name_sym && vmhook::hotspot::is_valid_pointer(name_sym))
+                    {
+                        const std::string actual_name{ name_sym->to_string() };
+                        if (actual_name == class_name)
+                        {
+                            return cached_klass;
+                        }
+                    }
+                }
+
+                // Cached klass is stale - evict and fall through to the
+                // fresh ClassLoaderDataGraph walk below.
+                vmhook::klass_lookup_cache.erase(cache_entry);
+                VMHOOK_LOG("{} find_class: cached klass for '{}' is stale (likely class "
+                           "redefinition or unload); evicting and re-resolving.",
+                           vmhook::warning_tag, class_name);
             }
         }
 
