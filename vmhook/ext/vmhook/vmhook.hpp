@@ -5612,7 +5612,12 @@ namespace vmhook
             void* original_code{ nullptr };
             void* original_from_interpreted_entry{ nullptr };
             void* original_from_compiled_entry{ nullptr };
-            bool     was_compiled{ false };
+            bool  was_compiled{ false };
+
+            // Set the first time verify_hooks() notices the Method's _code
+            // or NO_COMPILE flag has drifted from install-time state, so
+            // subsequent passes don't re-log the same warning every tick.
+            bool  drift_logged{ false };
         };
 
         /*
@@ -7814,6 +7819,51 @@ namespace vmhook
                 if (entry.hook && !entry.hook->verify_and_repair())
                 {
                     ++repaired;
+                }
+            }
+
+            // Per-Method drift detector for the "our shared-i2i patch is
+            // intact but the hook still doesn't fire" symptom.  Happens
+            // when another DLL bypasses our hook without overwriting it -
+            // typically by clearing our NO_COMPILE flag and letting the
+            // JIT re-compile the method into a fresh nmethod that no
+            // longer routes through the patched interpreter stub.  We
+            // can't safely auto-repair (re-clearing _code while another
+            // hooker is also touching it ping-pongs and risks tearing the
+            // nmethod's saved-state structure), but logging it loudly
+            // tells the user what their other DLL is doing.
+            //
+            // One-shot per hook to keep the log readable.
+            for (vmhook::hotspot::hooked_method& hm : vmhook::hotspot::g_hooked_methods)
+            {
+                if (!hm.method || hm.drift_logged)
+                {
+                    continue;
+                }
+                const void* const code_now{ hm.method->get_code() };
+                const std::uint32_t* const flags_now{ hm.method->get_access_flags() };
+                const bool no_compile_set{ flags_now && (*flags_now & vmhook::hotspot::NO_COMPILE) != 0 };
+
+                if (code_now != nullptr)
+                {
+                    VMHOOK_LOG("{} verify_hooks: hook method 0x{:016X} has Method::_code = 0x{:016X} "
+                               "(was nullptr at install) - something re-JIT'd the method or cleared "
+                               "our deopt.  Hook will NOT fire for compiled callers until the inline "
+                               "cache repairs at the next safepoint.",
+                               vmhook::warning_tag,
+                               reinterpret_cast<std::uintptr_t>(hm.method),
+                               reinterpret_cast<std::uintptr_t>(code_now));
+                    hm.drift_logged = true;
+                }
+                else if (!no_compile_set)
+                {
+                    VMHOOK_LOG("{} verify_hooks: hook method 0x{:016X} no longer has NO_COMPILE set - "
+                               "something cleared the JIT-inhibitor flag we installed.  The method "
+                               "is currently un-compiled (_code == nullptr) so the hook still fires, "
+                               "but the JIT may recompile it at any moment.",
+                               vmhook::warning_tag,
+                               reinterpret_cast<std::uintptr_t>(hm.method));
+                    hm.drift_logged = true;
                 }
             }
         }
