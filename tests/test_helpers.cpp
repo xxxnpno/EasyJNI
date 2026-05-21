@@ -600,6 +600,35 @@ static auto test_return_value_sign_extension() -> void
     check("return_value_set_sets_cancel_flag", slot.cancel == true);
 }
 
+// ---------------------------------------------------------------------------
+// 14. return_value::set<wrapper_type>(nullptr) overload — sets cancel + writes
+//     a zero OOP to the retval slot, regardless of any garbage previously in
+//     the slot.  Selected via requires-clause on wrapper_type deriving from
+//     object_base, so primitive set<int>(...) calls are unaffected.
+// ---------------------------------------------------------------------------
+static auto test_return_value_set_nullptr_for_wrapper() -> void
+{
+    struct fake_wrapper : public vmhook::object_base {};
+
+    vmhook::hotspot::return_slot slot{};
+    vmhook::return_value rv{ &slot };
+
+    // Pre-fill the slot with garbage so we can prove set() zeroes it.
+    slot.retval = static_cast<std::int64_t>(0xDEADBEEFCAFEBABEull);
+    slot.cancel = false;
+
+    rv.set<fake_wrapper>(nullptr);
+
+    check("return_value_set_wrapper_nullptr_writes_zero_oop", slot.retval == 0);
+    check("return_value_set_wrapper_nullptr_sets_cancel_flag", slot.cancel == true);
+
+    // Sanity: primitive path still picks the integer overload (no ambiguity).
+    slot.retval = 0; slot.cancel = false;
+    rv.set(std::int32_t{ -1 });
+    check("return_value_set_primitive_unaffected_by_wrapper_overload",
+          slot.retval == static_cast<std::int64_t>(-1));
+}
+
 static auto test_jni_namespace_signature_for_arg() -> void
 {
     check("jni::signature_for_arg<bool> == 'Z'",
@@ -697,6 +726,7 @@ int main()
     test_jni_namespace_signature_for_arg();
     test_is_valid_pointer_rejects_sentinels();
     test_return_value_sign_extension();
+    test_return_value_set_nullptr_for_wrapper();
 
     if (failures == 0)
     {

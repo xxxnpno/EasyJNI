@@ -1131,6 +1131,33 @@ namespace vmhook
             }
         }
 
+        /*
+            @brief Typed null-return overload for hooks on methods that return a
+                   Java reference type.
+            @details
+            Equivalent to set<vmhook::oop_t>(nullptr) but documents the slot's
+            Java type at the call site:
+
+                // Before - works but says nothing about what null means
+                ret.set<vmhook::oop_t>(nullptr);
+
+                // After - reads as "return null MovingObjectPosition"
+                ret.set<sdk::moving_object_position>(nullptr);
+
+            The wrapper_type template argument is documentation only - we never
+            touch an instance, just write a null OOP into the 64-bit retval slot.
+            Selected only when wrapper_type derives from vmhook::object_base, so
+            primitive set<int32_t>(...) calls remain on the integer path above.
+        */
+        template<typename wrapper_type>
+            requires std::is_base_of_v<vmhook::object_base, wrapper_type>
+        auto set(std::nullptr_t) noexcept
+            -> void
+        {
+            this->return_slot->cancel = true;
+            this->return_slot->retval = 0;
+        }
+
         auto cancel() noexcept
             -> void
         {
