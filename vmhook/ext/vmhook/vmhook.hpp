@@ -5472,6 +5472,68 @@ namespace vmhook
         inline std::mutex g_hooked_methods_mutex{};
 
         /*
+            @brief Set by shutdown_hooks() before it starts unpatching, so any
+                   detour fire that races shutdown returns immediately.
+            @details
+            Without this flag, the sequence
+              1. Java thread enters patched i2i, jumps into trampoline
+              2. Trampoline calls common_detour (lock-free read of
+                 g_hooked_methods)
+              3. shutdown_hooks() acquires g_hooked_methods_mutex,
+                 deletes trampolines, restores entries, clears the vector
+              4. common_detour iterates a vector that's mid-clear
+            can use-after-free in the detour cell.  Flipping the flag at the
+            top of shutdown_hooks() — before taking the mutex — makes step 2
+            return early and keeps the detour off the doomed vector.
+        */
+        inline std::atomic<bool> g_shutdown_requested{ false };
+
+        /*
+            @brief SEH wrapper around a single user detour invocation.
+            @details
+            Hooks run against live JVM state — the detour might receive a
+            stale OOP (page unmapped after GC + class unload), null receiver,
+            or hit some other access violation chasing a half-initialised
+            wrapper.  Without this wrapper, an SEH exception (0xC0000005)
+            tears the JVM down because vmhook's surrounding try/catch only
+            catches C++ exceptions.
+
+            __try / __except must live in a function with NO automatic
+            objects that need C++ unwinding, which is why this is split
+            out from common_detour.  Returns true on clean completion,
+            false if SEH fired — caller logs and falls through to the
+            original method body.
+        */
+        inline auto seh_invoke_detour(const std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*)>& detour_fn,
+                                      vmhook::hotspot::frame* const frame_pointer,
+                                      vmhook::hotspot::java_thread* const thread,
+                                      vmhook::hotspot::return_slot* const slot) noexcept
+            -> bool
+        {
+#if defined(_MSC_VER) && !defined(__clang__)
+            __try
+            {
+                detour_fn(frame_pointer, thread, slot);
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+#else
+            try
+            {
+                detour_fn(frame_pointer, thread, slot);
+                return true;
+            }
+            catch (...)
+            {
+                return false;
+            }
+#endif
+        }
+
+        /*
             @brief Global list of all i2i entry points that have been patched and their hooks.
 
             Shares g_hooked_methods_mutex - the two vectors are always mutated
@@ -5498,6 +5560,15 @@ namespace vmhook
         static auto common_detour(vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread* const thread, vmhook::hotspot::return_slot* const slot)
             -> void
         {
+            // Race-free shutdown: shutdown_hooks() flips this BEFORE acquiring
+            // the install mutex and clearing g_hooked_methods, so any detour
+            // that fires concurrently with teardown sees the flag and bails
+            // before iterating the about-to-be-cleared vector.
+            if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire))
+            {
+                return;
+            }
+
             try
             {
                 if (!thread || !vmhook::hotspot::is_valid_pointer(thread))
@@ -5527,7 +5598,20 @@ namespace vmhook
                 {
                     if (hook.method == current_method)
                     {
-                        hook.detour(frame_pointer, thread, slot);
+                        // SEH guard: a stale OOP / null-receiver deref inside
+                        // the user detour throws an SEH access violation, not
+                        // a C++ exception - our outer try/catch wouldn't catch
+                        // it and the JVM would tear down.  seh_invoke_detour
+                        // converts the AV to a false return so we log and
+                        // fall through to the original Java method body.
+                        if (!vmhook::hotspot::seh_invoke_detour(hook.detour, frame_pointer, thread, slot))
+                        {
+                            VMHOOK_LOG("{} common_detour(): detour for method 0x{:016X} raised "
+                                       "SEH/AV - skipping this invocation, original method body "
+                                       "will run.",
+                                       vmhook::warning_tag,
+                                       reinterpret_cast<std::uintptr_t>(hook.method));
+                        }
                         // Ensure the thread state is _thread_in_Java after the detour
                         // so the bytecode dispatcher finds a consistent state.
                         thread->set_thread_state(vmhook::hotspot::java_thread_state::_thread_in_Java);
@@ -7472,6 +7556,12 @@ namespace vmhook
     static auto shutdown_hooks() noexcept
         -> void
     {
+        // Flip the shutdown flag BEFORE taking the install mutex.  Any
+        // common_detour that fires between here and the lock-acquire below
+        // observes the flag and returns immediately - so we won't iterate
+        // g_hooked_methods while it's being cleared further down.
+        vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
+
         // Lock for the whole tear-down so no in-flight vmhook::hook<T>() call
         // can push a new entry between our trampoline-delete loop and our
         // entry-restore loop.  Once the lock is released, common_detour
