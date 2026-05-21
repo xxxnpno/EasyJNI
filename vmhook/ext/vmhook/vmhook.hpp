@@ -5614,8 +5614,23 @@ namespace vmhook
             void* original_from_compiled_entry{ nullptr };
             bool  was_compiled{ false };
 
-            // Set the first time verify_hooks() notices the Method's _code
-            // or NO_COMPILE flag has drifted from install-time state, so
+            // Captured at install time so verify_hooks can detect Method*
+            // identity drift caused by class redefinition / unload.  When
+            // the JVM frees the original Method (because EntityRenderer or
+            // World got redefined by another DLL via JVMTI RedefineClasses)
+            // the allocator may hand the same address back out for an
+            // unrelated method - our stored `method` pointer then points
+            // at e.g. "bridge$getMainHandItemRenderState" instead of
+            // "orientCamera", and common_detour stops matching the new
+            // (live) orientCamera Method*.  Comparing method->get_name()
+            // against expected_name surfaces the drift; comparing
+            // method->get_const_method() against null surfaces the harder
+            // case where the Method was freed and the slot is now garbage.
+            std::string expected_class_name{};
+            std::string expected_method_name{};
+            std::string expected_signature{};
+
+            // Set the first time verify_hooks() notices any drift, so
             // subsequent passes don't re-log the same warning every tick.
             bool  drift_logged{ false };
         };
@@ -7616,7 +7631,21 @@ namespace vmhook
                     invoke(std::make_index_sequence<std::tuple_size_v<method_arg_tuple_t>>{});
                 };
 
-            vmhook::hotspot::g_hooked_methods.push_back({ found_method, std::move(wrapper_detour), original_code, original_from_interpreted, original_from_compiled, was_compiled });
+            // Snapshot the method's identity for verify_hooks' drift detector.
+            // Stored as std::string (owned) so we can compare against
+            // current method->get_name() etc. without worrying about the
+            // backing JVM symbols outliving the hook.
+            vmhook::hotspot::hooked_method hm_entry{
+                found_method,
+                std::move(wrapper_detour),
+                original_code,
+                original_from_interpreted,
+                original_from_compiled,
+                was_compiled };
+            hm_entry.expected_class_name = type_map_entry->second;
+            hm_entry.expected_method_name = std::string{ method_name };
+            hm_entry.expected_signature = found_method->get_signature();
+            vmhook::hotspot::g_hooked_methods.push_back(std::move(hm_entry));
 
             // -- Install (or reuse) the i2i stub patch ---------------------------
             bool i2i_already_patched{ false };
@@ -7822,55 +7851,100 @@ namespace vmhook
                 }
             }
 
-            // Per-Method drift detector for the "our shared-i2i patch is
-            // intact but the hook still doesn't fire" symptom.  Happens
-            // when another DLL bypasses our hook without overwriting it -
-            // typically by clearing our NO_COMPILE flag and letting the
-            // JIT re-compile the method into a fresh nmethod that no
-            // longer routes through the patched interpreter stub.  We
-            // can't safely auto-repair (re-clearing _code while another
-            // hooker is also touching it ping-pongs and risks tearing the
-            // nmethod's saved-state structure), but logging it loudly
-            // tells the user what their other DLL is doing.
+            // Per-Method drift detector.  Three distinct "hook silently
+            // stopped firing" failure modes that we surface here, in
+            // order of severity:
             //
-            // One-shot per hook to keep the log readable.
+            //   1. Method freed (ConstMethod null).  The JVM unloaded the
+            //      class that owned this Method; our stored Method*
+            //      points at uninitialised slab memory.  Hook is dead.
+            //   2. Method aliased (name differs from install-time name).
+            //      The JVM freed the original Method and reused the same
+            //      address for an unrelated method (Lunar / Forge with
+            //      JVMTI RedefineClasses does this a lot).  common_detour
+            //      now matches calls to the WRONG Java method, or - more
+            //      commonly - never matches the new live Method at all.
+            //      Hook is dead in both cases.
+            //   3. NO_COMPILE cleared or _code repopulated.  The JVM
+            //      JIT-recompiled our hooked method behind our back.
+            //      Hook still fires for interpreted callers but compiled
+            //      callers bypass it.
+            //
+            // One-shot per hook (drift_logged) to keep the log readable,
+            // and we read the captured expected_* fields for the log so
+            // even mode-1 freed-Method cases can name the original hook
+            // ("orientCamera" vs the unhelpful raw pointer).
             for (vmhook::hotspot::hooked_method& hm : vmhook::hotspot::g_hooked_methods)
             {
                 if (!hm.method || hm.drift_logged)
                 {
                     continue;
                 }
+
+                // Mode 1: ConstMethod gone -> Method was freed.  Skip
+                // get_name() (which would log "ConstMethod is nullptr"
+                // every tick from inside its try/catch) and report from
+                // the captured names instead.
+                const vmhook::hotspot::const_method* const const_method{ hm.method->get_const_method() };
+                if (!const_method || !vmhook::hotspot::is_valid_pointer(const_method))
+                {
+                    VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' has been FREED - the JVM unloaded "
+                               "the class that owned this Method (typically caused by another DLL "
+                               "calling JVMTI RedefineClasses / RetransformClasses).  Hook will not "
+                               "fire again unless re-installed against the new Method.",
+                               vmhook::error_tag,
+                               hm.expected_class_name,
+                               hm.expected_method_name,
+                               hm.expected_signature);
+                    hm.drift_logged = true;
+                    continue;
+                }
+
+                // Mode 2: Method* address aliased with a different Method.
+                const std::string current_name{ hm.method->get_name() };
+                if (!current_name.empty() && current_name != hm.expected_method_name)
+                {
+                    VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' now points at a DIFFERENT method "
+                               "named '{}' - the original Method was freed by class redefinition and "
+                               "the allocator reused the address.  common_detour will fire on the "
+                               "wrong method (or not at all) until re-installation.",
+                               vmhook::error_tag,
+                               hm.expected_class_name,
+                               hm.expected_method_name,
+                               hm.expected_signature,
+                               current_name);
+                    hm.drift_logged = true;
+                    continue;
+                }
+
+                // Mode 3: same Method, but JIT state drifted.
                 const void* const code_now{ hm.method->get_code() };
                 const std::uint32_t* const flags_now{ hm.method->get_access_flags() };
                 const bool no_compile_set{ flags_now && (*flags_now & vmhook::hotspot::NO_COMPILE) != 0 };
 
-                // method->get_name() does its own validation + try/catch;
-                // returns "" on any failure.  Cheap enough to call once
-                // per drift-detected method (we only enter this block when
-                // we're about to log anyway).
-                const std::string method_name{ hm.method->get_name() };
-
                 if (code_now != nullptr)
                 {
-                    VMHOOK_LOG("{} verify_hooks: hook method '{}' (0x{:016X}) has Method::_code = "
+                    VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' has Method::_code = "
                                "0x{:016X} (was nullptr at install) - something re-JIT'd the method "
                                "or cleared our deopt.  Hook will NOT fire for compiled callers until "
                                "the inline cache repairs at the next safepoint.",
                                vmhook::warning_tag,
-                               method_name,
-                               reinterpret_cast<std::uintptr_t>(hm.method),
+                               hm.expected_class_name,
+                               hm.expected_method_name,
+                               hm.expected_signature,
                                reinterpret_cast<std::uintptr_t>(code_now));
                     hm.drift_logged = true;
                 }
                 else if (!no_compile_set)
                 {
-                    VMHOOK_LOG("{} verify_hooks: hook method '{}' (0x{:016X}) no longer has "
-                               "NO_COMPILE set - something cleared the JIT-inhibitor flag we "
-                               "installed.  The method is currently un-compiled (_code == nullptr) "
-                               "so the hook still fires, but the JIT may recompile it at any moment.",
+                    VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' no longer has NO_COMPILE set - "
+                               "something cleared the JIT-inhibitor flag we installed.  Currently "
+                               "un-compiled (_code == nullptr) so the hook still fires, but the JIT "
+                               "may recompile it at any moment.",
                                vmhook::warning_tag,
-                               method_name,
-                               reinterpret_cast<std::uintptr_t>(hm.method));
+                               hm.expected_class_name,
+                               hm.expected_method_name,
+                               hm.expected_signature);
                     hm.drift_logged = true;
                 }
             }
