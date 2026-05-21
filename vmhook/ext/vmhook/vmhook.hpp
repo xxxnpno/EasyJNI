@@ -1306,8 +1306,8 @@ namespace vmhook
         struct java_thread;
         struct frame;
         class  midi2i_hook;
-        class  per_method_i2i_stub;
         struct hooked_method;
+        struct i2i_hook_data;
         struct field_entry_t;
 
         /*
@@ -5149,44 +5149,13 @@ namespace vmhook
         public:
             /*
                 @brief Installs the hook on the given target address.
-                @param target                  Pointer to the injection point.
-                @param detour                  The C++ function to call when the hook fires.
-                @param resume_target           Optional override for the post-detour resume
-                                               address.  Defaults to `target + HOOK_SIZE`,
-                                               which is the right value when target is in
-                                               HotSpot's shared i2i stub.  per_method_i2i_stub
-                                               passes the *original* i2i continuation here so
-                                               execution returns to the untouched shared stub
-                                               instead of garbage past the per-method copy.
-                @param target_in_owned_memory  If true, the destructor skips restoring the
-                                               5 patched bytes at target — the owner (e.g.
-                                               per_method_i2i_stub) is about to free the
-                                               whole page, making restoration both pointless
-                                               and an access-violation risk if the page has
-                                               already been protected back to RX-only.
-                @param preallocated_buffer     Optional RWX buffer for the trampoline.  If
-                                               null, midi2i_hook allocates its own page via
-                                               allocate_nearby_memory.  per_method_i2i_stub
-                                               passes a slice of its own already-allocated
-                                               page here so we don't burn a second 64 KB
-                                               allocation per hook — which on densely-loaded
-                                               address spaces (Lunar) was reliably failing
-                                               after the per-method stub took the first one
-                                               nearby.
-                @param preallocated_size       Size of preallocated_buffer.  Must be at least
-                                               HOOK_SIZE + sizeof(trampoline assembly).
+                @param target  Pointer to the injection point within the i2i stub.
+                @param detour  The C++ function to call when the hook fires.
             */
-            midi2i_hook(std::uint8_t* const target,
-                        const vmhook::hotspot::detour_function_t detour,
-                        const void* const resume_target = nullptr,
-                        const bool target_in_owned_memory = false,
-                        std::uint8_t* const preallocated_buffer = nullptr,
-                        const std::size_t preallocated_size = 0)
+            midi2i_hook(std::uint8_t* const target, const vmhook::hotspot::detour_function_t detour)
                 : target{ target }
                 , allocated{ nullptr }
                 , allocated_size{ 0 }
-                , owns_allocated{ true }
-                , target_in_owned_memory{ target_in_owned_memory }
                 , error{ true }
             {
 #if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
@@ -5384,23 +5353,8 @@ namespace vmhook
 #endif
 
                 const std::size_t total_size{ static_cast<std::size_t>(HOOK_SIZE) + sizeof(assembly) };
-
-                // Caller-provided buffer: per_method_i2i_stub allocates ONE
-                // page big enough for both its prologue copy and our
-                // trampoline, then slices the trampoline portion to us.  We
-                // don't own it and must not release it in the destructor.
-                if (preallocated_buffer && preallocated_size >= total_size)
-                {
-                    this->allocated = preallocated_buffer;
-                    this->allocated_size = preallocated_size;
-                    this->owns_allocated = false;
-                }
-                else
-                {
-                    this->allocated = vmhook::hotspot::allocate_nearby_memory(target, total_size);
-                    this->allocated_size = total_size;
-                    this->owns_allocated = true;
-                }
+                this->allocated = vmhook::hotspot::allocate_nearby_memory(target, total_size);
+                this->allocated_size = total_size;
 
                 try
                 {
@@ -5418,18 +5372,8 @@ namespace vmhook
                 const std::int32_t je_delta{ RESUME_OFFSET - (JE_OFFSET + JE_SIZE) };
                 *reinterpret_cast<std::int32_t*>(assembly + JE_OFFSET + 2) = je_delta;
 
-                // Where to resume after the detour returns "don't cancel".  Default is
-                // target+HOOK_SIZE (continue at the next instruction in the same stub);
-                // per_method_i2i_stub overrides this with the address of the original
-                // unmodified i2i continuation so the per-method copy isn't entered twice.
-                const std::uint8_t* const effective_resume{
-                    resume_target
-                        ? static_cast<const std::uint8_t*>(resume_target)
-                        : target + HOOK_SIZE
-                };
-
                 const std::int32_t resume_jmp_delta{ static_cast<std::int32_t>(
-                    effective_resume - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
+                    target + HOOK_SIZE - (this->allocated + HOOK_SIZE + RESUME_JMP_OFFSET + RESUME_JMP_SIZE)) };
                 *reinterpret_cast<std::int32_t*>(assembly + RESUME_JMP_OFFSET + 1) = resume_jmp_delta;
 
                 *reinterpret_cast<vmhook::hotspot::detour_function_t*>(assembly + DETOUR_ADDRESS_OFFSET) = detour;
@@ -5469,33 +5413,20 @@ namespace vmhook
                     return;
                 }
 
-                // target_in_owned_memory means target lives inside a page the
-                // caller (per_method_i2i_stub) is about to free.  Restoring
-                // the bytes is pointless and would crash if the page is
-                // already RX-only or already gone.
-                if (!this->target_in_owned_memory)
-                {
-                    static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
+                static constexpr std::uint8_t JMP_OPCODE{ 0xE9 };
 
-                    std::uint32_t old_protect{};
-                    if (this->target[0] == JMP_OPCODE
-                        && vmhook::os::protect(this->target, 5,
-                                               vmhook::os::memory_protection::execute_rw, &old_protect))
-                    {
-                        std::memcpy(this->target, this->allocated, 5);
-                        vmhook::os::protect(this->target, 5,
-                                            vmhook::os::memory_protection::execute_read, &old_protect);
-                        vmhook::os::flush_instruction_cache(this->target, 5);
-                    }
+                std::uint32_t old_protect{};
+                if (this->target[0] == JMP_OPCODE
+                    && vmhook::os::protect(this->target, 5,
+                                           vmhook::os::memory_protection::execute_rw, &old_protect))
+                {
+                    std::memcpy(this->target, this->allocated, 5);
+                    vmhook::os::protect(this->target, 5,
+                                        vmhook::os::memory_protection::execute_read, &old_protect);
+                    vmhook::os::flush_instruction_cache(this->target, 5);
                 }
 
-                // Only release if WE allocated the buffer.  When
-                // per_method_i2i_stub passes its own slice as
-                // preallocated_buffer, it owns the page and will free it itself.
-                if (this->owns_allocated)
-                {
-                    vmhook::os::release(this->allocated, this->allocated_size);
-                }
+                vmhook::os::release(this->allocated, this->allocated_size);
             }
 
             inline auto has_error() const noexcept -> bool
@@ -5507,243 +5438,7 @@ namespace vmhook
             std::uint8_t* target{ nullptr };
             std::uint8_t* allocated{ nullptr };
             std::size_t   allocated_size{ 0 };
-            bool          owns_allocated{ true };
-            bool          target_in_owned_memory{ false };
             bool          error{ true };
-        };
-
-        /*
-            @brief Per-method redirect stub that bypasses HotSpot's shared i2i.
-            @details
-            HotSpot doesn't allocate one i2i interpreter stub per Method - it
-            generates a handful of shared stubs (generic, native, accessor, ...)
-            and points every Method's `_i2i_entry` at the matching one.  The
-            "patch the shared i2i at the find_hook_location injection point"
-            approach in midi2i_hook works fine while vmhook is the only thing
-            mutating that page, but breaks the moment a second i2i-patching DLL
-            (Spark, OptiFine, another cheat / hook lib) shares the JVM with us:
-            whichever DLL writes last wins the 5-byte slot, and the loser's
-            hook silently goes dark.
-
-            per_method_i2i_stub fixes this by leaving the shared i2i untouched.
-            For each hooked Method we:
-
-              1. Allocate a fresh RWX page (near the original i2i so 32-bit
-                 rel JMPs back to it still work).
-              2. Memcpy the original i2i prologue bytes
-                 `[i2i_origin, i2i_origin + injection_offset)` into our page.
-                 These bytes do the interpreter-frame setup the trampoline
-                 relies on (RBP / RSP / R14 / R15 are register-relative and
-                 stay valid no matter where the code lives).
-              3. Install a midi2i_hook ON OUR PAGE at offset injection_offset,
-                 with `resume_target = original_i2i + injection_offset +
-                 HOOK_SIZE` so after the detour returns "don't cancel" we
-                 jump back into the *unmodified* shared i2i to finish dispatch.
-              4. Repoint Method::_from_interpreted_entry at our page.
-
-            The shared i2i is read but never written.  Hooks installed by
-            other DLLs against the shared page no longer overwrite ours, and
-            ours no longer affect any method we didn't explicitly hook.
-
-            Methods we do not hook keep using the shared i2i directly, so if
-            another DLL has patched it their hook still fires for those
-            methods - that's their behaviour, not ours.
-
-            Caveat: the prologue copy assumes the bytes `[0..injection_offset)`
-            are position-independent (no RIP-relative loads, no near jumps).
-            HotSpot's `TemplateInterpreterGenerator::generate_normal_entry`
-            satisfies this for every JDK we've tested (8 / 17 / 21 / 24) -
-            the bytes ahead of the thread-state write are RSP/R15-relative
-            arg spills and frame setup.  If a future JDK changes that the
-            construction will fail validation (check below) and we fall back
-            to leaving the method unhooked rather than corrupting it.
-        */
-        class per_method_i2i_stub final
-        {
-        public:
-            per_method_i2i_stub(vmhook::hotspot::method* const method_ptr,
-                                const vmhook::hotspot::detour_function_t detour)
-                : method_ptr{ method_ptr }
-                , original_from_interpreted_entry{ nullptr }
-                , stub_page{ nullptr }
-                , stub_page_size{ 0 }
-                , trampoline_owner{ nullptr }
-                , error{ true }
-            {
-#if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
-                (void)method_ptr;
-                (void)detour;
-                return;
-#else
-                if (!method_ptr || !vmhook::hotspot::is_valid_pointer(method_ptr))
-                {
-                    return;
-                }
-
-                void* const i2i_origin{ method_ptr->get_i2i_entry() };
-                if (!i2i_origin || !vmhook::hotspot::is_valid_pointer(i2i_origin))
-                {
-                    return;
-                }
-
-                std::uint8_t* const injection_in_shared{
-                    reinterpret_cast<std::uint8_t*>(vmhook::hotspot::find_hook_location(i2i_origin)) };
-                if (!injection_in_shared)
-                {
-                    return;
-                }
-
-                std::uint8_t* const i2i_bytes{ static_cast<std::uint8_t*>(i2i_origin) };
-                const std::size_t injection_offset{
-                    static_cast<std::size_t>(injection_in_shared - i2i_bytes) };
-
-                // HOOK_SIZE matches midi2i_hook's constant: the 8 bytes at the
-                // injection point that get replaced by our 5-byte JMP plus 3
-                // bytes of straddled instruction that get skipped past on
-                // resume.  We need to reserve the same 8 bytes in our stub so
-                // midi2i_hook's JMP and the resume offset land on the same
-                // boundary as in the shared-stub layout.
-                constexpr std::size_t HOOK_SIZE{ 8 };
-
-                // Cap on the trampoline assembly size, large enough for both
-                // the Microsoft x64 and System V variants midi2i_hook emits
-                // (the actual sizes are ~125 and ~129 bytes).  Allocating a
-                // bit extra is free - VirtualAlloc rounds up to 64 KB anyway.
-                constexpr std::size_t MIDI2I_TRAMPOLINE_CAP{ 256 };
-
-                // ONE allocation for the whole stub.  Earlier versions
-                // allocated the prologue here and let midi2i_hook allocate
-                // its own trampoline page near our stub, but on densely-
-                // loaded address spaces (Lunar Client) the second
-                // allocate_nearby_memory reliably failed - "Failed to
-                // allocate memory for hook" on every single hook.  Coalescing
-                // both into a single page sidesteps the problem entirely.
-                this->stub_page_size = injection_offset + HOOK_SIZE + MIDI2I_TRAMPOLINE_CAP;
-
-                this->stub_page = vmhook::hotspot::allocate_nearby_memory(
-                    i2i_bytes, this->stub_page_size);
-                if (!this->stub_page)
-                {
-                    return;
-                }
-
-                // Copy the interpreter prologue.  These bytes will execute
-                // out of our page; everything they do is RSP / R15 / RBP
-                // relative so the copy behaves identically to the original.
-                std::memcpy(this->stub_page, i2i_bytes, injection_offset);
-
-                this->original_from_interpreted_entry = method_ptr->get_from_interpreted_entry();
-
-                // Plant the trampoline at the same offset in our stub as the
-                // original injection point.  resume_target jumps back into
-                // the *original* untouched shared i2i so dispatch continues
-                // normally past the patched window.  The trampoline buffer
-                // sits in our page right after the patched 8 bytes; we hand
-                // midi2i_hook this slice via preallocated_buffer so it
-                // doesn't try to allocate its own page nearby.
-                std::uint8_t* const target_in_stub{ this->stub_page + injection_offset };
-                void* const resume_target{ i2i_bytes + injection_offset + HOOK_SIZE };
-                std::uint8_t* const trampoline_slice{ target_in_stub + HOOK_SIZE };
-                const std::size_t trampoline_slice_size{
-                    this->stub_page_size - injection_offset - HOOK_SIZE };
-
-                this->trampoline_owner = new vmhook::hotspot::midi2i_hook(
-                    target_in_stub, detour, resume_target,
-                    /*target_in_owned_memory=*/true,
-                    trampoline_slice, trampoline_slice_size);
-                if (this->trampoline_owner->has_error())
-                {
-                    delete this->trampoline_owner;
-                    this->trampoline_owner = nullptr;
-                    vmhook::os::release(this->stub_page, this->stub_page_size);
-                    this->stub_page = nullptr;
-                    this->stub_page_size = 0;
-                    return;
-                }
-
-                // Re-protect the prologue portion as execute_read.  The
-                // injection point + trampoline portion was protected back
-                // to RX by midi2i_hook's ctor; the prologue (above
-                // injection_offset) is still RWX from VirtualAlloc.
-                // Tighten it for consistency with HotSpot's own code pages.
-                std::uint32_t old_protect{};
-                vmhook::os::protect(this->stub_page, injection_offset,
-                                    vmhook::os::memory_protection::execute_read, &old_protect);
-                vmhook::os::flush_instruction_cache(this->stub_page, this->stub_page_size);
-
-                // Last: repoint the Method at our stub.  Until this write
-                // commits the method still dispatches through the original
-                // shared i2i, so the change is atomic from the JVM's POV.
-                method_ptr->set_from_interpreted_entry(this->stub_page);
-
-                this->error = false;
-#endif  // VMHOOK_RUNTIME_HOOKING_AVAILABLE
-            }
-
-            ~per_method_i2i_stub()
-            {
-                // Restore the Method's interpreted entry FIRST so no new
-                // dispatch lands in our about-to-be-freed page.  Other
-                // threads currently mid-stub finish executing the bytes we
-                // copied (the prologue) then jump to the still-live shared
-                // i2i continuation, so this restoration is safe even with
-                // concurrent callers — the page must outlive in-flight
-                // execution, but no new entries will occur after the write
-                // below.
-                //
-                // We restore to the *shared* i2i (Method::_i2i_entry) rather
-                // than to the original captured value because for methods
-                // that were JIT-compiled at install time, the captured
-                // original was an i2c adapter (interpreter-to-compiled) that
-                // loads Method::_code and jumps - and our shutdown leaves
-                // _code = nullptr.  Restoring the i2c adapter under those
-                // conditions makes the JVM jump-through-null at the next
-                // call.  The shared i2i is always safe (it's the steady-state
-                // for any not-currently-compiled method, which is what we
-                // leave the method as after shutdown).
-                if (!this->error && this->method_ptr)
-                {
-                    if (void* const shared_i2i{ this->method_ptr->get_i2i_entry() })
-                    {
-                        this->method_ptr->set_from_interpreted_entry(shared_i2i);
-                    }
-                }
-
-                if (this->trampoline_owner)
-                {
-                    delete this->trampoline_owner;
-                    this->trampoline_owner = nullptr;
-                }
-
-                if (this->stub_page)
-                {
-                    vmhook::os::release(this->stub_page, this->stub_page_size);
-                    this->stub_page = nullptr;
-                }
-            }
-
-            per_method_i2i_stub(const per_method_i2i_stub&) = delete;
-            auto operator=(const per_method_i2i_stub&) -> per_method_i2i_stub& = delete;
-            per_method_i2i_stub(per_method_i2i_stub&&) = delete;
-            auto operator=(per_method_i2i_stub&&) -> per_method_i2i_stub& = delete;
-
-            inline auto has_error() const noexcept -> bool
-            {
-                return this->error;
-            }
-
-            inline auto get_method() const noexcept -> vmhook::hotspot::method*
-            {
-                return this->method_ptr;
-            }
-
-        private:
-            vmhook::hotspot::method* method_ptr{ nullptr };
-            void*                    original_from_interpreted_entry{ nullptr };
-            std::uint8_t*            stub_page{ nullptr };
-            std::size_t              stub_page_size{ 0 };
-            vmhook::hotspot::midi2i_hook* trampoline_owner{ nullptr };
-            bool                     error{ true };
         };
 
         /*
@@ -5762,6 +5457,17 @@ namespace vmhook
             bool     was_compiled{ false };
         };
 
+        /*
+            @brief Stores the association between an i2i entry point and its installed midi2i_hook.
+            @details
+            Since multiple Java methods can share the same i2i stub, only one trampoline
+            is allocated per unique i2i entry point.
+        */
+        struct i2i_hook_data
+        {
+            void* i2i_entry{ nullptr };
+            vmhook::hotspot::midi2i_hook* hook{ nullptr };
+        };
 
         /*
             @brief Global list of all currently hooked Java methods and their detour functions.
@@ -5846,18 +5552,12 @@ namespace vmhook
         }
 
         /*
-            @brief Global list of per-method i2i redirect stubs.
-
-            Replaces the old g_hooked_i2i_entries (which stored one
-            midi2i_hook per shared i2i_entry and was the source of the
-            cross-DLL hook-collision bug — see per_method_i2i_stub above).
-            Now every hooked Method owns its own stub; install pushes one
-            entry, shutdown / hook_handle::stop deletes the matching one.
+            @brief Global list of all i2i entry points that have been patched and their hooks.
 
             Shares g_hooked_methods_mutex - the two vectors are always mutated
-            together.
+            together (install / uninstall both touch the matching entries).
         */
-        inline std::vector<vmhook::hotspot::per_method_i2i_stub*> g_per_method_stubs{};
+        inline std::vector<vmhook::hotspot::i2i_hook_data> g_hooked_i2i_entries{};
 
         /*
             @brief Common detour function invoked by the trampoline stub for every intercepted method call.
@@ -7603,18 +7303,17 @@ namespace vmhook
         3. Disable JIT compilation by setting NO_COMPILE in Method._access_flags
            and _dont_inline in Method._flags.
         4. Register the method and its detour in g_hooked_methods for dispatch by common_detour.
-        5. If the method is already compiled, clear Method._code and route compiled
-           callers through the c2i adapter so dispatch goes through the interpreter.
-        6. Allocate a per_method_i2i_stub: a private copy of the i2i prologue with our
-           trampoline planted inside it, then repoint Method::_from_interpreted_entry at
-           the copy.  The shared HotSpot i2i stub is NEVER modified, so other DLLs that
-           patch it cannot overwrite our hook (and vice versa).
+        5. If the method is already compiled, clear Method._code and restore the
+           interpreted entry so future dispatch reaches the interpreter hook.
+        6. Check whether the i2i entry point has already been patched; if so, reuse it.
+        7. If the i2i entry is new, locate the injection point via find_hook_location(),
+           allocate a trampoline via midi2i_hook, and register it in g_hooked_i2i_entries.
 
         @note Unlike the JNI/JVMTI version, this implementation does not force a class
               retransformation to flush existing inline caches. Hooking early is still best:
               compiled callers that already cached an nmethod can keep bypassing the hook
               until HotSpot repairs that call site at a safepoint.
-        @see midi2i_hook, per_method_i2i_stub, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
+        @see midi2i_hook, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
     */
     template<class wrapper_type>
     static auto hook(const std::string_view method_name,
@@ -7756,23 +7455,34 @@ namespace vmhook
 
             vmhook::hotspot::g_hooked_methods.push_back({ found_method, std::move(wrapper_detour), original_code, original_from_interpreted, original_from_compiled, was_compiled });
 
-            // -- Install a per-method i2i redirect stub --------------------------
-            // Used to patch the shared HotSpot i2i stub in place and reuse one
-            // midi2i_hook per i2i_entry; that's the pre-fix behaviour that
-            // collided with any other DLL also patching the shared stub - last
-            // writer wins, and silent hook loss for the loser.  Now every
-            // hooked Method owns its own copy of the i2i prologue with the
-            // trampoline plant inside the copy; Method::_from_interpreted_entry
-            // is redirected to that copy.  See per_method_i2i_stub's
-            // class-level comment for the full design.
-            vmhook::hotspot::per_method_i2i_stub* const stub{
-                new vmhook::hotspot::per_method_i2i_stub(found_method, vmhook::hotspot::common_detour) };
-            if (stub->has_error())
+            // -- Install (or reuse) the i2i stub patch ---------------------------
+            bool i2i_already_patched{ false };
+            for (const vmhook::hotspot::i2i_hook_data& hook_data_entry : vmhook::hotspot::g_hooked_i2i_entries)
             {
-                delete stub;
-                throw vmhook::exception{ "per_method_i2i_stub installation failed." };
+                if (hook_data_entry.i2i_entry == i2i)
+                {
+                    i2i_already_patched = true;
+                    break;
+                }
             }
-            vmhook::hotspot::g_per_method_stubs.push_back(stub);
+
+            if (!i2i_already_patched)
+            {
+                std::uint8_t* const target{ reinterpret_cast<std::uint8_t*>(vmhook::hotspot::find_hook_location(i2i)) };
+                if (!target)
+                {
+                    throw vmhook::exception{ "Failed to find hook location in i2i stub." };
+                }
+
+                vmhook::hotspot::midi2i_hook* const hook_instance{ new vmhook::hotspot::midi2i_hook(target, vmhook::hotspot::common_detour) };
+                if (hook_instance->has_error())
+                {
+                    delete hook_instance;
+                    throw vmhook::exception{ "midi2i_hook installation failed." };
+                }
+
+                vmhook::hotspot::g_hooked_i2i_entries.push_back({ i2i, hook_instance });
+            }
 
             // -- Deoptimise JIT-compiled methods ---------------------------------
             // Problem:  when _code != nullptr, _from_interpreted_entry points to the i2c
@@ -7800,43 +7510,34 @@ namespace vmhook
 
                 if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                 {
-                    // Redirect compiled callers through the c2i adapter so they
-                    // transition to interpreter dispatch.  The c2i adapter
-                    // then loads Method::_from_interpreted_entry (which
-                    // per_method_i2i_stub above already pointed at our stub)
-                    // and jumps there.
+                    // 1. Redirect interpreted callers to the (now-patched) i2i stub.
+                    found_method->set_from_interpreted_entry(i2i);
+                    // 2. Redirect compiled callers through the c2i adapter -> interpreter -> i2i stub.
                     found_method->set_from_compiled_entry(c2i_entry);
-                    // Clear _code so the JVM treats the method as not
-                    // currently compiled, repairing inline caches at the
-                    // next safepoint.
+                    // 3. Clear _code last so the above entry-point writes are visible first.
                     found_method->set_code(nullptr);
-                    // DO NOT touch _from_interpreted_entry here - the
-                    // per_method_i2i_stub we just installed owns that field
-                    // and is pointing it at our redirect stub.  The previous
-                    // line of this block used to overwrite it with the
-                    // *shared* i2i, which silently undid every per-method
-                    // hook on JIT-compiled methods (orientCamera /
-                    // rayTraceBlocks on Lunar 1.8.9 were both compiled by
-                    // injection time, so camera_no_clip never fired).
                     VMHOOK_LOG("{} hook():   deopt complete - _from_compiled_entry -> c2i @ 0x{:016X}, _code cleared.",
                                vmhook::info_tag, reinterpret_cast<std::uintptr_t>(c2i_entry));
                 }
                 else
                 {
-                    // c2i adapter unrecoverable.  Clear _code so the JVM
-                    // treats the method as not currently compiled and
-                    // eventually re-resolves the inline caches at the next
-                    // safepoint.  Same _from_interpreted_entry caveat as
-                    // above: it's owned by the per_method_i2i_stub now, do
-                    // NOT clobber it back to the shared i2i.  Compiled
+                    // c2i adapter unrecoverable.  The upstream-conservative
+                    // policy is to leave _code intact and accept that compiled
+                    // callers bypass the hook, but that defeats the entire
+                    // point of installing the hook in the first place for
+                    // hot methods like runTick.  Match the older vmhook
+                    // behaviour: redirect the interpreted entry to the i2i
+                    // stub and clear _code so subsequent dispatch falls back
+                    // through the interpreter and hits the hook.  Compiled
                     // callers with stale inline caches still reach the old
                     // nmethod for one cycle, but the cache is repaired at
                     // the next safepoint when the IC re-resolves and finds
                     // _code == nullptr.
+                    found_method->set_from_interpreted_entry(i2i);
                     found_method->set_code(nullptr);
-                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; forced deopt - _code cleared.  "
-                               "Compiled inline caches will repair themselves at the next safepoint.",
-                               vmhook::warning_tag, method_name);
+                    VMHOOK_LOG("{} hook():   c2i adapter unrecoverable for '{}'; forced deopt - _code cleared, "
+                               "_from_interpreted_entry redirected to i2i.  Compiled inline caches will repair "
+                               "themselves at the next safepoint.", vmhook::warning_tag, method_name);
                 }
             }
 
@@ -7888,15 +7589,9 @@ namespace vmhook
         // observes an empty list and stops dispatching.
         std::lock_guard<std::mutex> shutdown_lock{ vmhook::hotspot::g_hooked_methods_mutex };
 
-        // Delete every per-method i2i stub.  Each stub's destructor restores
-        // Method::_from_interpreted_entry to its original value (typically the
-        // shared HotSpot i2i) BEFORE freeing the stub page, so no in-flight
-        // dispatch lands in freed memory once the destructor returns.  The
-        // trampoline page each stub owns is freed by midi2i_hook's destructor
-        // in the same call chain.
-        for (vmhook::hotspot::per_method_i2i_stub* const stub : vmhook::hotspot::g_per_method_stubs)
+        for (const vmhook::hotspot::i2i_hook_data& hook_data_entry : vmhook::hotspot::g_hooked_i2i_entries)
         {
-            delete stub;
+            delete hook_data_entry.hook;
         }
 
         for (const vmhook::hotspot::hooked_method& hooked_method_entry : vmhook::hotspot::g_hooked_methods)
@@ -7936,7 +7631,7 @@ namespace vmhook
         }
 
         vmhook::hotspot::g_hooked_methods.clear();
-        vmhook::hotspot::g_per_method_stubs.clear();
+        vmhook::hotspot::g_hooked_i2i_entries.clear();
     }
 
     inline auto hook_handle::stop() noexcept -> void
@@ -7968,32 +7663,23 @@ namespace vmhook
             }
 
             // Restore the method's original behaviour.  Mirrors
-            // shutdown_hooks() but for one entry.
+            // shutdown_hooks() but for one entry.  Leaving the
+            // midi2i_hook trampoline installed is deliberate — other
+            // hooks may still share the same i2i entry point, and
+            // common_detour will simply skip over methods missing
+            // from g_hooked_methods.
             vmhook::hotspot::set_dont_inline(entry_it->method, false);
             if (std::uint32_t* const flags{ entry_it->method->get_access_flags() })
             {
                 *flags &= static_cast<std::uint32_t>(~vmhook::hotspot::NO_COMPILE);
             }
-            // No _code / _from_compiled_entry restoration - see the long
-            // comment in shutdown_hooks() for why.  Short version: the
-            // nmethod we captured at install time may have been flushed by
-            // the JVM sweeper in the meantime, so restoring _code to that
-            // pointer hands the JVM a dangling code-cache address.
-
-            // Find and delete the per-method i2i stub for this method.  The
-            // stub's destructor restores Method::_from_interpreted_entry to
-            // its original value and frees the stub page.
-            auto& stubs{ vmhook::hotspot::g_per_method_stubs };
-            const auto stub_it{ std::find_if(stubs.begin(), stubs.end(),
-                [target](const vmhook::hotspot::per_method_i2i_stub* const s) noexcept
-                {
-                    return s && s->get_method() == target;
-                }) };
-            if (stub_it != stubs.end())
-            {
-                delete *stub_it;
-                stubs.erase(stub_it);
-            }
+            // No _code / _from_compiled_entry / _from_interpreted_entry
+            // restoration here either - see the long comment in
+            // shutdown_hooks() for why.  Short version: the nmethod we
+            // captured at install time may have been flushed by the JVM
+            // sweeper in the meantime, so restoring _code to that
+            // pointer hands the JVM a dangling code-cache address and
+            // every subsequent dispatch to the method AVs in 0x10??????.
 
             hooks.erase(entry_it);
         }
