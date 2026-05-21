@@ -2387,18 +2387,36 @@ namespace vmhook
                         + exported_entry->offset);
                 }
 
-                // Slow path: JDK 9+ — heuristic detection cached after first success.
-                // 0 means "not yet detected"; SIZE_MAX means "detection failed".
+                // Slow path: JDK 9+ — heuristic detection, cached on success
+                // only.  Used to also cache the failure case as SIZE_MAX,
+                // but that was disastrous on Forge 1.8.9 / JDK 17: the
+                // first JIT-compiled method we probe (runTick) sometimes
+                // has its _adapter slot in an in-flight state where
+                // validation fails, which locked the cache to "failed"
+                // forever and made every later c2i lookup return nullptr.
+                // Downstream that bumped every JIT-compiled hook
+                // (orientCamera, rayTraceBlocks, ...) into the
+                // forced-deopt fallback - compiled callers kept bypassing
+                // the hook and e.g. camera_no_clip never fired.
+                //
+                // Retrying on every call until one Method validates lets a
+                // later, well-initialised Method (rayTraceBlocks, etc.)
+                // discover the offset, after which the cache is set and
+                // every subsequent call is a fast read.  get_adapter() is
+                // only invoked from hook install / shutdown, never from
+                // the hot detour path, so the per-call probe is cheap.
                 static std::atomic<std::size_t> cached_offset{ 0 };
                 std::size_t offset{ cached_offset.load(std::memory_order_acquire) };
                 if (offset == 0)
                 {
                     offset = vmhook::hotspot::detect_adapter_offset_from_method(
                         const_cast<vmhook::hotspot::method*>(this));
-                    cached_offset.store(offset == 0 ? static_cast<std::size_t>(-1) : offset,
-                                        std::memory_order_release);
+                    if (offset != 0)
+                    {
+                        cached_offset.store(offset, std::memory_order_release);
+                    }
                 }
-                if (offset == 0 || offset == static_cast<std::size_t>(-1))
+                if (offset == 0)
                 {
                     return nullptr;
                 }
