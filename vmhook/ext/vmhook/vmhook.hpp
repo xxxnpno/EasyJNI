@@ -5164,14 +5164,28 @@ namespace vmhook
                                                whole page, making restoration both pointless
                                                and an access-violation risk if the page has
                                                already been protected back to RX-only.
+                @param preallocated_buffer     Optional RWX buffer for the trampoline.  If
+                                               null, midi2i_hook allocates its own page via
+                                               allocate_nearby_memory.  per_method_i2i_stub
+                                               passes a slice of its own already-allocated
+                                               page here so we don't burn a second 64 KB
+                                               allocation per hook — which on densely-loaded
+                                               address spaces (Lunar) was reliably failing
+                                               after the per-method stub took the first one
+                                               nearby.
+                @param preallocated_size       Size of preallocated_buffer.  Must be at least
+                                               HOOK_SIZE + sizeof(trampoline assembly).
             */
             midi2i_hook(std::uint8_t* const target,
                         const vmhook::hotspot::detour_function_t detour,
                         const void* const resume_target = nullptr,
-                        const bool target_in_owned_memory = false)
+                        const bool target_in_owned_memory = false,
+                        std::uint8_t* const preallocated_buffer = nullptr,
+                        const std::size_t preallocated_size = 0)
                 : target{ target }
                 , allocated{ nullptr }
                 , allocated_size{ 0 }
+                , owns_allocated{ true }
                 , target_in_owned_memory{ target_in_owned_memory }
                 , error{ true }
             {
@@ -5370,8 +5384,23 @@ namespace vmhook
 #endif
 
                 const std::size_t total_size{ static_cast<std::size_t>(HOOK_SIZE) + sizeof(assembly) };
-                this->allocated = vmhook::hotspot::allocate_nearby_memory(target, total_size);
-                this->allocated_size = total_size;
+
+                // Caller-provided buffer: per_method_i2i_stub allocates ONE
+                // page big enough for both its prologue copy and our
+                // trampoline, then slices the trampoline portion to us.  We
+                // don't own it and must not release it in the destructor.
+                if (preallocated_buffer && preallocated_size >= total_size)
+                {
+                    this->allocated = preallocated_buffer;
+                    this->allocated_size = preallocated_size;
+                    this->owns_allocated = false;
+                }
+                else
+                {
+                    this->allocated = vmhook::hotspot::allocate_nearby_memory(target, total_size);
+                    this->allocated_size = total_size;
+                    this->owns_allocated = true;
+                }
 
                 try
                 {
@@ -5460,7 +5489,13 @@ namespace vmhook
                     }
                 }
 
-                vmhook::os::release(this->allocated, this->allocated_size);
+                // Only release if WE allocated the buffer.  When
+                // per_method_i2i_stub passes its own slice as
+                // preallocated_buffer, it owns the page and will free it itself.
+                if (this->owns_allocated)
+                {
+                    vmhook::os::release(this->allocated, this->allocated_size);
+                }
             }
 
             inline auto has_error() const noexcept -> bool
@@ -5472,6 +5507,7 @@ namespace vmhook
             std::uint8_t* target{ nullptr };
             std::uint8_t* allocated{ nullptr };
             std::size_t   allocated_size{ 0 };
+            bool          owns_allocated{ true };
             bool          target_in_owned_memory{ false };
             bool          error{ true };
         };
@@ -5568,7 +5604,21 @@ namespace vmhook
                 // midi2i_hook's JMP and the resume offset land on the same
                 // boundary as in the shared-stub layout.
                 constexpr std::size_t HOOK_SIZE{ 8 };
-                this->stub_page_size = injection_offset + HOOK_SIZE;
+
+                // Cap on the trampoline assembly size, large enough for both
+                // the Microsoft x64 and System V variants midi2i_hook emits
+                // (the actual sizes are ~125 and ~129 bytes).  Allocating a
+                // bit extra is free - VirtualAlloc rounds up to 64 KB anyway.
+                constexpr std::size_t MIDI2I_TRAMPOLINE_CAP{ 256 };
+
+                // ONE allocation for the whole stub.  Earlier versions
+                // allocated the prologue here and let midi2i_hook allocate
+                // its own trampoline page near our stub, but on densely-
+                // loaded address spaces (Lunar Client) the second
+                // allocate_nearby_memory reliably failed - "Failed to
+                // allocate memory for hook" on every single hook.  Coalescing
+                // both into a single page sidesteps the problem entirely.
+                this->stub_page_size = injection_offset + HOOK_SIZE + MIDI2I_TRAMPOLINE_CAP;
 
                 this->stub_page = vmhook::hotspot::allocate_nearby_memory(
                     i2i_bytes, this->stub_page_size);
@@ -5587,12 +5637,20 @@ namespace vmhook
                 // Plant the trampoline at the same offset in our stub as the
                 // original injection point.  resume_target jumps back into
                 // the *original* untouched shared i2i so dispatch continues
-                // normally past the patched window.
+                // normally past the patched window.  The trampoline buffer
+                // sits in our page right after the patched 8 bytes; we hand
+                // midi2i_hook this slice via preallocated_buffer so it
+                // doesn't try to allocate its own page nearby.
                 std::uint8_t* const target_in_stub{ this->stub_page + injection_offset };
                 void* const resume_target{ i2i_bytes + injection_offset + HOOK_SIZE };
+                std::uint8_t* const trampoline_slice{ target_in_stub + HOOK_SIZE };
+                const std::size_t trampoline_slice_size{
+                    this->stub_page_size - injection_offset - HOOK_SIZE };
 
                 this->trampoline_owner = new vmhook::hotspot::midi2i_hook(
-                    target_in_stub, detour, resume_target, /*target_in_owned_memory=*/true);
+                    target_in_stub, detour, resume_target,
+                    /*target_in_owned_memory=*/true,
+                    trampoline_slice, trampoline_slice_size);
                 if (this->trampoline_owner->has_error())
                 {
                     delete this->trampoline_owner;
@@ -5604,10 +5662,10 @@ namespace vmhook
                 }
 
                 // Re-protect the prologue portion as execute_read.  The
-                // injection point itself was protected back to RX by
-                // midi2i_hook's ctor; the rest of our page (the copied
-                // prologue) is still RWX from VirtualAlloc.  Tighten it
-                // for safety / consistency with HotSpot's own code pages.
+                // injection point + trampoline portion was protected back
+                // to RX by midi2i_hook's ctor; the prologue (above
+                // injection_offset) is still RWX from VirtualAlloc.
+                // Tighten it for consistency with HotSpot's own code pages.
                 std::uint32_t old_protect{};
                 vmhook::os::protect(this->stub_page, injection_offset,
                                     vmhook::os::memory_protection::execute_read, &old_protect);
