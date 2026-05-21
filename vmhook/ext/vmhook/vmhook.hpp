@@ -10595,62 +10595,42 @@ namespace vmhook
 
             // Diagnostic: dump receiver + args + method id so we can tell at
             // a glance whether we are handing the JVM what we think we are.
-            // Reads each .l slot via the same indirection pattern the JVM uses
-            // (jobject is jobject* under the hood).
+            //
+            // We deliberately do NOT decode the klass name by reading the OOP
+            // header at +8 anymore - those reads faulted during world unload
+            // on every host where vmhook's hooked detours fire on objects
+            // whose backing storage the JVM had already freed.  The address
+            // passed is_valid_pointer's range check but the page was
+            // unmapped, so the load at +8 took a SEH access violation that
+            // tore the whole JVM down.  Raw addresses are cheap, never
+            // fault, and are still enough to correlate calls in the trace
+            // (or paste into a debugger to inspect manually).
             {
-                std::string klass_name{ "<unresolved>" };
-                if (!is_static_call && this->object && vmhook::hotspot::is_valid_pointer(this->object))
-                {
-                    const std::uint32_t narrow_klass{ *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(this->object) + 8) };
-                    void* const decoded_klass{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
-                    if (decoded_klass && vmhook::hotspot::is_valid_pointer(decoded_klass))
-                    {
-                        auto* const k{ reinterpret_cast<vmhook::hotspot::klass*>(decoded_klass) };
-                        if (auto* const sym{ k->get_name() }; sym && vmhook::hotspot::is_valid_pointer(sym))
-                        {
-                            klass_name = sym->to_string();
-                        }
-                    }
-                }
                 std::string args_dump{};
                 for (std::size_t i{ 0 }; i < sizeof...(args_t); ++i)
                 {
                     if (i > 0) { args_dump += ", "; }
                     if (values[i].l)
                     {
+                        // values[i].l is `jobject` == pointer-to-OOP-slot.
+                        // Reading the slot is one indirection of a known
+                        // stack address we just wrote, never a faulting
+                        // load - safe to do unconditionally.
                         void* const arg_oop{ *reinterpret_cast<void**>(values[i].l) };
-                        std::string arg_klass{ "<not-oop>" };
-                        if (arg_oop && vmhook::hotspot::is_valid_pointer(arg_oop))
-                        {
-                            const std::uint32_t arg_narrow{ *reinterpret_cast<const std::uint32_t*>(
-                                reinterpret_cast<const std::uint8_t*>(arg_oop) + 8) };
-                            void* const arg_decoded{ vmhook::hotspot::decode_klass_pointer(arg_narrow) };
-                            if (arg_decoded && vmhook::hotspot::is_valid_pointer(arg_decoded))
-                            {
-                                auto* const k{ reinterpret_cast<vmhook::hotspot::klass*>(arg_decoded) };
-                                if (auto* const sym{ k->get_name() }; sym && vmhook::hotspot::is_valid_pointer(sym))
-                                {
-                                    arg_klass = sym->to_string();
-                                }
-                            }
-                        }
-                        args_dump += std::format("oop=0x{:016X} klass={}",
-                                                  reinterpret_cast<std::uintptr_t>(arg_oop),
-                                                  arg_klass);
+                        args_dump += std::format("oop=0x{:016X}",
+                                                  reinterpret_cast<std::uintptr_t>(arg_oop));
                     }
                     else
                     {
                         args_dump += std::format("raw=0x{:016X}", values[i].j);
                     }
                 }
-                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): dispatching {} receiver_oop=0x{:016X} receiver_klass={} method_id=0x{:016X} args=[{}].",
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): dispatching {} receiver_oop=0x{:016X} method_id=0x{:016X} args=[{}].",
                            vmhook::info_tag,
                            this->name(),
                            effective_signature,
                            is_static_call ? "static" : "instance",
                            reinterpret_cast<std::uintptr_t>(is_static_call ? nullptr : this->object),
-                           klass_name,
                            reinterpret_cast<std::uintptr_t>(method_id),
                            args_dump);
             }
