@@ -7844,24 +7844,32 @@ namespace vmhook
                 const std::uint32_t* const flags_now{ hm.method->get_access_flags() };
                 const bool no_compile_set{ flags_now && (*flags_now & vmhook::hotspot::NO_COMPILE) != 0 };
 
+                // method->get_name() does its own validation + try/catch;
+                // returns "" on any failure.  Cheap enough to call once
+                // per drift-detected method (we only enter this block when
+                // we're about to log anyway).
+                const std::string method_name{ hm.method->get_name() };
+
                 if (code_now != nullptr)
                 {
-                    VMHOOK_LOG("{} verify_hooks: hook method 0x{:016X} has Method::_code = 0x{:016X} "
-                               "(was nullptr at install) - something re-JIT'd the method or cleared "
-                               "our deopt.  Hook will NOT fire for compiled callers until the inline "
-                               "cache repairs at the next safepoint.",
+                    VMHOOK_LOG("{} verify_hooks: hook method '{}' (0x{:016X}) has Method::_code = "
+                               "0x{:016X} (was nullptr at install) - something re-JIT'd the method "
+                               "or cleared our deopt.  Hook will NOT fire for compiled callers until "
+                               "the inline cache repairs at the next safepoint.",
                                vmhook::warning_tag,
+                               method_name,
                                reinterpret_cast<std::uintptr_t>(hm.method),
                                reinterpret_cast<std::uintptr_t>(code_now));
                     hm.drift_logged = true;
                 }
                 else if (!no_compile_set)
                 {
-                    VMHOOK_LOG("{} verify_hooks: hook method 0x{:016X} no longer has NO_COMPILE set - "
-                               "something cleared the JIT-inhibitor flag we installed.  The method "
-                               "is currently un-compiled (_code == nullptr) so the hook still fires, "
-                               "but the JIT may recompile it at any moment.",
+                    VMHOOK_LOG("{} verify_hooks: hook method '{}' (0x{:016X}) no longer has "
+                               "NO_COMPILE set - something cleared the JIT-inhibitor flag we "
+                               "installed.  The method is currently un-compiled (_code == nullptr) "
+                               "so the hook still fires, but the JIT may recompile it at any moment.",
                                vmhook::warning_tag,
+                               method_name,
                                reinterpret_cast<std::uintptr_t>(hm.method));
                     hm.drift_logged = true;
                 }
