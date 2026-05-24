@@ -66,7 +66,7 @@
 // ---------------------------------------------------------------------------
 #define VMHOOK_VERSION_MAJOR 0
 #define VMHOOK_VERSION_MINOR 4
-#define VMHOOK_VERSION_PATCH 2
+#define VMHOOK_VERSION_PATCH 3
 
 #define VMHOOK_MAKE_VERSION(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
@@ -8809,6 +8809,37 @@ namespace vmhook
                 return nullptr;
             }
 
+            // Small RAII helper: every JNI local ref we acquire during the
+            // class-loader walk lands in this vector; on return the dtor
+            // DeleteLocalRef's each one.  Previously this function leaked
+            // 4-8 local refs per successful call (thread_class,
+            // current_thread, context_loader, name_string, class_mirror,
+            // class_loader_class, system_loader, launch_class,
+            // launch_loader).  find_class caches the resulting klass so
+            // the leak was bounded by distinct class names, but every
+            // brand-new class still ate one ref per intermediate handle -
+            // detour threads that look up many classes (Minecraft + Forge
+            // + Lunar mods) eventually trip the local-ref table.
+            struct local_ref_bag
+            {
+                std::vector<void*> handles;
+                ~local_ref_bag() noexcept
+                {
+                    for (void* const handle : handles)
+                    {
+                        vmhook::detail::jni_delete_local_ref(handle);
+                    }
+                }
+                auto track(void* const handle) noexcept -> void*
+                {
+                    if (handle)
+                    {
+                        this->handles.push_back(handle);
+                    }
+                    return handle;
+                }
+            } bag;
+
             auto load_with_loader = [&](void* const class_loader) noexcept
                 -> vmhook::hotspot::klass*
             {
@@ -8817,7 +8848,7 @@ namespace vmhook
                     return nullptr;
                 }
 
-                void* const class_loader_class{ vmhook::detail::jni_find_class("java/lang/ClassLoader") };
+                void* const class_loader_class{ bag.track(vmhook::detail::jni_find_class("java/lang/ClassLoader")) };
                 if (!class_loader_class)
                 {
                     vmhook::detail::jni_exception_clear();
@@ -8833,7 +8864,7 @@ namespace vmhook
 
                 std::string dotted_name{ class_name };
                 std::replace(dotted_name.begin(), dotted_name.end(), '/', '.');
-                void* const name_string{ vmhook::detail::jni_new_string_utf(dotted_name) };
+                void* const name_string{ bag.track(vmhook::detail::jni_new_string_utf(dotted_name)) };
                 if (!name_string)
                 {
                     vmhook::detail::jni_exception_clear();
@@ -8843,21 +8874,21 @@ namespace vmhook
                 vmhook::detail::jni_value args[1]{};
                 args[0].l = name_string;
 
-                void* const class_mirror{ vmhook::detail::jni_call_object_method(class_loader, load_class_id, args) };
+                void* const class_mirror{ bag.track(vmhook::detail::jni_call_object_method(class_loader, load_class_id, args)) };
                 vmhook::hotspot::klass* const klass{ vmhook::detail::jni_klass_from_class_mirror(class_mirror) };
                 vmhook::detail::jni_exception_clear();
                 return klass;
             };
 
-            void* const thread_class{ vmhook::detail::jni_find_class("java/lang/Thread") };
+            void* const thread_class{ bag.track(vmhook::detail::jni_find_class("java/lang/Thread")) };
             if (thread_class)
             {
                 void* const current_thread_id{ vmhook::detail::jni_get_static_method_id(thread_class, "currentThread", "()Ljava/lang/Thread;") };
                 void* const get_context_loader_id{ vmhook::detail::jni_get_method_id(thread_class, "getContextClassLoader", "()Ljava/lang/ClassLoader;") };
                 if (current_thread_id && get_context_loader_id)
                 {
-                    void* const current_thread{ vmhook::detail::jni_call_static_object_method(thread_class, current_thread_id) };
-                    void* const context_loader{ current_thread ? vmhook::detail::jni_call_object_method(current_thread, get_context_loader_id) : nullptr };
+                    void* const current_thread{ bag.track(vmhook::detail::jni_call_static_object_method(thread_class, current_thread_id)) };
+                    void* const context_loader{ current_thread ? bag.track(vmhook::detail::jni_call_object_method(current_thread, get_context_loader_id)) : nullptr };
                     if (vmhook::hotspot::klass* const klass{ load_with_loader(context_loader) })
                     {
                         return klass;
@@ -8866,11 +8897,11 @@ namespace vmhook
             }
             vmhook::detail::jni_exception_clear();
 
-            void* const class_loader_class{ vmhook::detail::jni_find_class("java/lang/ClassLoader") };
+            void* const class_loader_class{ bag.track(vmhook::detail::jni_find_class("java/lang/ClassLoader")) };
             if (class_loader_class)
             {
                 void* const get_system_loader_id{ vmhook::detail::jni_get_static_method_id(class_loader_class, "getSystemClassLoader", "()Ljava/lang/ClassLoader;") };
-                void* const system_loader{ get_system_loader_id ? vmhook::detail::jni_call_static_object_method(class_loader_class, get_system_loader_id) : nullptr };
+                void* const system_loader{ get_system_loader_id ? bag.track(vmhook::detail::jni_call_static_object_method(class_loader_class, get_system_loader_id)) : nullptr };
                 if (vmhook::hotspot::klass* const klass{ load_with_loader(system_loader) })
                 {
                     return klass;
@@ -8878,7 +8909,7 @@ namespace vmhook
             }
             vmhook::detail::jni_exception_clear();
 
-            void* const launch_class{ vmhook::detail::jni_find_class("net/minecraft/launchwrapper/Launch") };
+            void* const launch_class{ bag.track(vmhook::detail::jni_find_class("net/minecraft/launchwrapper/Launch")) };
             if (!launch_class)
             {
                 vmhook::detail::jni_exception_clear();
@@ -8890,7 +8921,7 @@ namespace vmhook
             }
 
             void* const class_loader_field{ vmhook::detail::jni_get_static_field_id(launch_class, "classLoader", "Lnet/minecraft/launchwrapper/LaunchClassLoader;") };
-            void* const launch_loader{ class_loader_field ? vmhook::detail::jni_get_static_object_field(launch_class, class_loader_field) : nullptr };
+            void* const launch_loader{ class_loader_field ? bag.track(vmhook::detail::jni_get_static_object_field(launch_class, class_loader_field)) : nullptr };
             if (vmhook::hotspot::klass* const klass{ load_with_loader(launch_loader) })
             {
                 return klass;
@@ -9518,6 +9549,44 @@ namespace vmhook
             std::vector<void*> object_handles{};
             std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, std::forward<args_t>(args)...) };
 
+            // RAII release of any JNI local refs picked up by make_jni_args
+            // (string-typed args go through jni_new_string_utf which returns a
+            // local ref; object args store an indirect handle that points
+            // INTO object_handles).  The discriminator is "value.l falls
+            // outside the object_handles storage range" - those are string
+            // refs that need DeleteLocalRef.  object_handle from NewObjectA
+            // is also a JNI local ref; release it after we decode the OOP
+            // (the OOP itself is a GC root via the wrapper_type unique_ptr
+            // we hand back, so dropping the local ref does not lose the
+            // object).
+            struct jni_arg_cleanup
+            {
+                const std::vector<void*>* obj_handles;
+                std::vector<vmhook::detail::jni_value>* values_vec;
+                void* object_handle{ nullptr };
+
+                ~jni_arg_cleanup() noexcept
+                {
+                    const void* const begin{ obj_handles->data() };
+                    const void* const end{ obj_handles->data() + obj_handles->size() };
+                    for (auto& v : *values_vec)
+                    {
+                        if (!v.l)
+                        {
+                            continue;
+                        }
+                        if (v.l < begin || v.l >= end)
+                        {
+                            vmhook::detail::jni_delete_local_ref(v.l);
+                        }
+                    }
+                    if (object_handle)
+                    {
+                        vmhook::detail::jni_delete_local_ref(object_handle);
+                    }
+                }
+            } cleanup{ &object_handles, &values, nullptr };
+
             std::string signature{ "(" };
             ((signature += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
             signature += ")V";
@@ -9549,6 +9618,7 @@ namespace vmhook
                        static_cast<std::uint64_t>(values.size()));
 
             void* const object_handle{ new_object_a(vmhook::hotspot::current_jni_env, klass, method_id, values.data()) };
+            cleanup.object_handle = object_handle;  // release at scope exit alongside the arg refs
             void* const oop{ vmhook::detail::jni_decode_object(object_handle) };
             if (!oop)
             {
@@ -11333,6 +11403,41 @@ namespace vmhook
               ++arg_index), ...);
             (void)arg_index;
 
+            // RAII cleanup of JNI local references created during arg packing.
+            //
+            // write_jni_arg_to_slot maps strings to NewStringUTF (returns a
+            // JNI local ref) and object args to `&storage[i]` (synthetic
+            // stack handle).  Without this cleanup, every string arg leaks
+            // one local ref per call - HotSpot's default local-ref table
+            // holds 16 entries and our long-lived attached detour threads
+            // never see a JNI frame-pop to release them, so a tight call
+            // loop with string args eventually trips "local reference
+            // table overflow" warnings and starts losing object identity.
+            //
+            // The discriminator `values[i].l != &handle_storage[i]`
+            // distinguishes "real JNI local ref" from "synthetic stack
+            // handle"; only the former needs DeleteLocalRef.  Null slots
+            // (primitive args, or string args where NewStringUTF failed)
+            // are skipped by jni_delete_local_ref's null guard.
+            struct string_handle_cleanup
+            {
+                vmhook::detail::jni_value*  values_ptr;
+                void**                      storage_ptr;
+                std::size_t                 count;
+
+                ~string_handle_cleanup() noexcept
+                {
+                    for (std::size_t i{ 0 }; i < this->count; ++i)
+                    {
+                        void* const candidate{ this->values_ptr[i].l };
+                        if (candidate && candidate != &this->storage_ptr[i])
+                        {
+                            vmhook::detail::jni_delete_local_ref(candidate);
+                        }
+                    }
+                }
+            } cleanup{ values, handle_storage, sizeof...(args_t) };
+
             void** const table{ *reinterpret_cast<void***>(env_void) };
             void* const  method_id{ this->cached_method_id };
 
@@ -11652,13 +11757,25 @@ namespace vmhook
                     if (rparen != std::string::npos
                         && std::string_view{ effective_signature }.substr(rparen + 1) == "Ljava/lang/String;")
                     {
-                        return value_t{ vmhook::detail::jni_get_string_utf(result_handle) };
+                        // Extract the UTF-8 contents into an owned std::string,
+                        // then release the JNI local ref - skipping the release
+                        // leaked one local per Object-returning call on the
+                        // detour thread (16-entry default table fills fast).
+                        std::string utf{ vmhook::detail::jni_get_string_utf(result_handle) };
+                        vmhook::detail::jni_delete_local_ref(result_handle);
+                        return value_t{ std::move(utf) };
                     }
                     // Any other reference type: best-effort return
                     // the handle's truncated value so callers know it
-                    // was non-null.
-                    return value_t{
+                    // was non-null.  Truncated-uint32 already loses the
+                    // upper bits of the handle, so releasing the local
+                    // ref doesn't make the return value any less usable -
+                    // and stops the per-call leak that previously
+                    // accumulated one local per Object-returning call.
+                    const std::uint32_t truncated_handle{
                         static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(result_handle)) };
+                    vmhook::detail::jni_delete_local_ref(result_handle);
+                    return value_t{ truncated_handle };
                 }
                 default:
                     VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): unhandled return type char '{}' "
@@ -14368,6 +14485,14 @@ namespace vmhook
         inline std::mutex   dr_mutex{};
         inline dr_slot      dr_slots[4]{};
         inline PVOID        dr_veh_handle{ nullptr };
+        // Refcount of currently-armed watches.  When this transitions
+        // from 0 -> 1 we AddVectoredExceptionHandler; from 1 -> 0 we
+        // RemoveVectoredExceptionHandler.  Previously the VEH was
+        // installed once and never removed, so a process that briefly
+        // used a watch then dropped it kept the handler in the kernel's
+        // dispatch list for the rest of its lifetime.  Both reads and
+        // writes are gated by dr_mutex so we don't need an atomic.
+        inline int          dr_armed_count{ 0 };
 
         inline auto find_free_slot() -> int
         {
@@ -14450,19 +14575,35 @@ namespace vmhook
             {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
-            dr_slot* slot_ptr{ nullptr };
+            // Take a LOCAL COPY of the callback and address under the lock.
+            // Previously we kept slot_ptr and dereferenced it after releasing
+            // the mutex - which raced with watch_handle's destructor clearing
+            // dr_slots[slot].callback = nullptr.  Two failure modes:
+            //   1. Destructor wins between our "if (slot_ptr->callback)"
+            //      and "slot_ptr->callback(...)" - operator() on an empty
+            //      std::function throws std::bad_function_call.
+            //   2. Destructor wins MID-CALL - the callback's stored lambda
+            //      target gets destructed while it's executing, taking out
+            //      anything the lambda captured by value (use-after-free
+            //      on any heap-allocated captures).
+            // Copying the std::function bumps the target's refcount-equivalent
+            // and keeps it alive until our local goes out of scope, no matter
+            // what the destructor does to the slot.
+            std::function<void(const void*)> callback_copy;
+            void* address_copy{ nullptr };
             {
                 std::lock_guard<std::mutex> guard{ dr_mutex };
                 if (dr_slots[slot].in_use.load(std::memory_order_relaxed))
                 {
-                    slot_ptr = &dr_slots[slot];
+                    callback_copy = dr_slots[slot].callback;
+                    address_copy = dr_slots[slot].address;
                 }
             }
-            if (slot_ptr && slot_ptr->callback)
+            if (callback_copy)
             {
                 try
                 {
-                    slot_ptr->callback(slot_ptr->address);
+                    callback_copy(address_copy);
                 }
                 catch (...)
                 {
@@ -14476,13 +14617,57 @@ namespace vmhook
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
-        inline auto ensure_dr_handler_installed() -> void
+        /*
+            @brief Increments the armed-watch refcount; installs the VEH on the
+                   0 -> 1 transition.
+            @details
+            Must be called with dr_mutex held.  ensure_dr_handler_installed used
+            to install the VEH on first call and never remove it; pair this
+            with dr_unarm_one (called from the watch_handle destructor) so the
+            handler is unregistered once the last watch goes away.
+        */
+        inline auto dr_arm_one() -> void
         {
-            if (dr_veh_handle != nullptr)
+            if (dr_armed_count == 0)
+            {
+                dr_veh_handle = ::AddVectoredExceptionHandler(1, &dr_exception_handler);
+            }
+            ++dr_armed_count;
+        }
+
+        /*
+            @brief Decrements the armed-watch refcount; removes the VEH on the
+                   1 -> 0 transition.
+            @details
+            Must be called with dr_mutex held.  Safe to call when the count
+            is already 0 (no-op) so double-stop on a handle doesn't
+            misbalance the count or crash on a stale VEH handle.
+        */
+        inline auto dr_unarm_one() -> void
+        {
+            if (dr_armed_count <= 0)
             {
                 return;
             }
-            dr_veh_handle = ::AddVectoredExceptionHandler(1, &dr_exception_handler);
+            --dr_armed_count;
+            if (dr_armed_count == 0 && dr_veh_handle != nullptr)
+            {
+                ::RemoveVectoredExceptionHandler(dr_veh_handle);
+                dr_veh_handle = nullptr;
+            }
+        }
+
+        /*
+            @brief Legacy alias retained for source compatibility.
+            @details
+            ensure_dr_handler_installed used to be the public entry point.
+            New code should call dr_arm_one() so the unregister path
+            stays balanced.  Kept here so external consumers that might
+            have built on the old name don't break at upgrade time.
+        */
+        inline auto ensure_dr_handler_installed() -> void
+        {
+            dr_arm_one();
         }
     } // namespace detail
 #endif // VMHOOK_HAS_HW_DATA_BREAKPOINTS
@@ -14549,7 +14734,11 @@ namespace vmhook
                        vmhook::error_tag);
             return watch_handle{};
         }
-        detail::ensure_dr_handler_installed();
+        // Refcount the install so the VEH is uninstalled when the last
+        // watch_handle drops its on_stop callback.  Previously this called
+        // ensure_dr_handler_installed() which installed the handler once
+        // and never removed it.
+        detail::dr_arm_one();
 
         constexpr auto length{
             sizeof(field_type) == 1 ? vmhook::os::data_breakpoint_length::one_byte    :
@@ -14599,6 +14788,10 @@ namespace vmhook
             detail::dr_slots[slot].address  = nullptr;
             detail::dr_slots[slot].callback = nullptr;
             detail::dr_slots[slot].dr7_bits = 0;
+            // Balance the dr_arm_one() in watch_static_field below.  When
+            // the last live watch_handle goes away the VEH is uninstalled
+            // by the dr_armed_count 1 -> 0 transition.
+            detail::dr_unarm_one();
         };
         return watch_handle{ std::move(block) };
 #else

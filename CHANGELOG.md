@@ -7,6 +7,47 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- `watch_static_field` dr-slot use-after-free.  The VEH handler used to read
+  the slot's `std::function` callback under the mutex, release the mutex,
+  then call it - racing with `watch_handle::stop()` which clears the slot's
+  callback under the same mutex.  In the lose-the-race window the VEH
+  invoked an empty `std::function` (throws `bad_function_call`) or, worse,
+  was mid-call when the destructor destructed the stored lambda's captures
+  (use-after-free on any heap-held capture).  Fix: copy the `std::function`
+  AND the address under the lock and call the local copy outside.
+- VEH handler leak in the hardware-data-breakpoint path.  Previously
+  `ensure_dr_handler_installed` called `AddVectoredExceptionHandler` once
+  and never removed it - dropping the last `watch_handle` left the
+  handler in the kernel's dispatch list for the rest of the process
+  lifetime, costing one extra dispatch per future exception forever.
+  Replaced with a refcounted `dr_arm_one` / `dr_unarm_one` pair so the
+  handler is uninstalled on the 1 -> 0 transition (the watch_handle
+  destructor's on_stop now invokes the unarm).
+- `method_proxy::call_jni` leaked one JNI local reference per string-
+  argument per call (jstring handles from `NewStringUTF` were never
+  `DeleteLocalRef`'d) AND one local reference per `L/[`-returning call
+  (the result handle).  Hot-path tight loops would eventually trip
+  "JNI local reference table overflow" warnings and lose the receiver
+  identity.  Added a RAII `string_handle_cleanup` struct that runs at
+  scope exit and releases every `values[i].l` that isn't the synthetic
+  `&handle_storage[i]` stack indirection; the result-handle release
+  is inline in the `'L'/'['` case after the value has been extracted.
+- `vmhook::detail::jni_make_unique` leaked 1 + N local refs per call
+  (the `NewObjectA` result handle and every string-typed constructor
+  arg).  Same fix pattern as `call_jni`: a scope-exit cleanup that
+  walks `values[]`, distinguishes synthetic handles by checking the
+  pointer against `object_handles.data()`'s range, and releases the
+  rest plus the result handle.
+- `vmhook::detail::jni_find_class_with_context_loader` leaked 4-8
+  local refs per call (`thread_class`, `current_thread`,
+  `context_loader`, `name_string`, `class_mirror`,
+  `class_loader_class`, `system_loader`, `launch_class`,
+  `launch_loader`).  The result was cached by upstream `find_class`,
+  so the absolute leak was bounded by distinct class names - but
+  detour threads that look up many classes (Minecraft + Forge + Lunar
+  mods) eventually fill the local-ref table.  Centralised release
+  through a small RAII `local_ref_bag` whose destructor walks every
+  tracked handle.
 - `return_value::set_arg(index, ...)`: enforce the JVM spec's `max_locals`
   upper bound (u2 = 65535).  Previously only `index < 0` was rejected, so a
   caller passing e.g. `index = 1'000'000` would write to `locals[-1000000]`,
@@ -41,6 +82,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
+- `vmhook::detail::dr_arm_one` / `dr_unarm_one` — refcounted VEH lifecycle
+  helpers for the hardware-data-breakpoint path.  `ensure_dr_handler_installed`
+  is now a thin alias that calls `dr_arm_one()`; consumers don't need to
+  change.  See the watch_handle change above.
 - `vmhook::detail::jni_delete_local_ref(handle)` — releases a JNI local
   reference via JNIEnv table slot 23.  Null-handle safe, no-JVM safe, used
   by the set_arg string fix described above.

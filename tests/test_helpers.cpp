@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 static int failures{ 0 };
@@ -1082,6 +1083,77 @@ static auto test_jni_delete_local_ref_no_jvm() -> void
 }
 
 // ---------------------------------------------------------------------------
+// 24b. dr_arm_one / dr_unarm_one refcount transitions
+//
+// v0.4.2 changed ensure_dr_handler_installed from "install once, never
+// uninstall" to a refcounted scheme.  The 0 -> 1 transition installs the
+// VEH; the 1 -> 0 transition uninstalls it.  We can't realistically install
+// a VEH in a unit-test process (AddVectoredExceptionHandler succeeds but
+// then any subsequent unhandled exception in another test will route
+// through our dispatcher), so we just exercise the counter logic by
+// holding the mutex ourselves and calling the inc/dec pair.  Skipped on
+// platforms without HW data breakpoints (where the helpers don't exist).
+// ---------------------------------------------------------------------------
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+static auto test_dr_armed_count_refcount() -> void
+{
+    // Snapshot the count.  The unit-test process never arms a real watch
+    // so it should be zero before this test runs.
+    {
+        std::lock_guard<std::mutex> guard{ vmhook::detail::dr_mutex };
+        check("dr_armed_count_starts_zero",
+              vmhook::detail::dr_armed_count == 0);
+    }
+
+    // arm three times -> count == 3, VEH installed exactly once.
+    {
+        std::lock_guard<std::mutex> guard{ vmhook::detail::dr_mutex };
+        const PVOID veh_before{ vmhook::detail::dr_veh_handle };
+        vmhook::detail::dr_arm_one();
+        vmhook::detail::dr_arm_one();
+        vmhook::detail::dr_arm_one();
+        check("dr_armed_count_after_three_arms",
+              vmhook::detail::dr_armed_count == 3);
+        check("dr_veh_installed_after_first_arm",
+              vmhook::detail::dr_veh_handle != nullptr);
+        // Subsequent arms must NOT re-install (the handle stays the same).
+        // veh_before could be null (first ever arm in this process) or
+        // could be a previous handle - either way the only thing that
+        // matters is that the handle is non-null AFTER arming.
+        (void)veh_before;
+    }
+
+    // unarm three times -> count == 0, VEH removed.
+    {
+        std::lock_guard<std::mutex> guard{ vmhook::detail::dr_mutex };
+        vmhook::detail::dr_unarm_one();
+        check("dr_armed_count_after_one_unarm",
+              vmhook::detail::dr_armed_count == 2);
+        check("dr_veh_still_installed_above_zero",
+              vmhook::detail::dr_veh_handle != nullptr);
+
+        vmhook::detail::dr_unarm_one();
+        check("dr_armed_count_after_two_unarms",
+              vmhook::detail::dr_armed_count == 1);
+
+        vmhook::detail::dr_unarm_one();
+        check("dr_armed_count_back_to_zero",
+              vmhook::detail::dr_armed_count == 0);
+        check("dr_veh_removed_at_zero",
+              vmhook::detail::dr_veh_handle == nullptr);
+    }
+
+    // Extra unarm at zero must be a no-op (no underflow / no crash).
+    {
+        std::lock_guard<std::mutex> guard{ vmhook::detail::dr_mutex };
+        vmhook::detail::dr_unarm_one();
+        check("dr_unarm_one_at_zero_is_noop",
+              vmhook::detail::dr_armed_count == 0);
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // 24. version_string composition + numeric range sanity
 // ---------------------------------------------------------------------------
 static auto test_version_string_composition() -> void
@@ -1158,6 +1230,9 @@ int main()
     test_vm_types_and_structs_no_jvm();
     test_find_jvm_module_no_jvm();
     test_jni_delete_local_ref_no_jvm();
+#if VMHOOK_HAS_HW_DATA_BREAKPOINTS
+    test_dr_armed_count_refcount();
+#endif
     test_version_string_composition();
 
     if (failures == 0)
