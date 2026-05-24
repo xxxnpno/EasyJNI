@@ -707,10 +707,394 @@ static auto test_write_jni_arg_to_slot_primitive_branches() -> void
     }
 }
 
+// ---------------------------------------------------------------------------
+// 15. iterate_struct_entries / iterate_type_entries hardening
+//
+// These walk gHotSpotVMStructs / gHotSpotVMTypes.  In a no-JVM unit test the
+// underlying global pointers are null, so the loop must terminate immediately
+// and return nullptr rather than crashing.  Also exercises the defensive
+// null-arg guards: both functions now reject null type_name / field_name
+// up-front so callers passing through user-controlled symbol strings can't
+// accidentally hand strcmp a nullptr.
+// ---------------------------------------------------------------------------
+static auto test_iterate_entries_no_jvm() -> void
+{
+    // No JVM is loaded in the test process, so the static lookups must
+    // return nullptr without faulting on strcmp(nullptr, ...).
+    check("iterate_struct_entries_no_jvm_returns_null",
+          vmhook::hotspot::iterate_struct_entries("Symbol", "_length") == nullptr);
+    check("iterate_type_entries_no_jvm_returns_null",
+          vmhook::hotspot::iterate_type_entries("Symbol") == nullptr);
+
+    // Null arg guards: both functions must short-circuit to nullptr when
+    // any of their string arguments is null, NOT call strcmp on it.
+    check("iterate_struct_entries_null_type_name",
+          vmhook::hotspot::iterate_struct_entries(nullptr, "_length") == nullptr);
+    check("iterate_struct_entries_null_field_name",
+          vmhook::hotspot::iterate_struct_entries("Symbol", nullptr) == nullptr);
+    check("iterate_struct_entries_both_null",
+          vmhook::hotspot::iterate_struct_entries(nullptr, nullptr) == nullptr);
+    check("iterate_type_entries_null_type_name",
+          vmhook::hotspot::iterate_type_entries(nullptr) == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 16. get_vm_types / get_vm_structs in a no-JVM process
+//
+// The first call resolves gHotSpotVMTypes / gHotSpotVMStructs from the JVM
+// module via dlsym/GetProcAddress.  Without a JVM the module handle is null,
+// the symbol resolves to nullptr, and the cached value stays nullptr forever.
+// Two consecutive calls must return identical nullptr (proves the static
+// caching path runs without a crash).
+// ---------------------------------------------------------------------------
+static auto test_vm_types_and_structs_no_jvm() -> void
+{
+    auto* const types_first{ vmhook::hotspot::get_vm_types() };
+    auto* const types_second{ vmhook::hotspot::get_vm_types() };
+    check("get_vm_types_no_jvm_returns_null", types_first == nullptr);
+    check("get_vm_types_cache_stable", types_first == types_second);
+
+    auto* const structs_first{ vmhook::hotspot::get_vm_structs() };
+    auto* const structs_second{ vmhook::hotspot::get_vm_structs() };
+    check("get_vm_structs_no_jvm_returns_null", structs_first == nullptr);
+    check("get_vm_structs_cache_stable", structs_first == structs_second);
+}
+
+// ---------------------------------------------------------------------------
+// 17. get_jvm_module no-JVM behaviour
+//
+// In a unit test process, no JVM library is loaded.  find_jvm_module() must
+// walk every candidate name (jvm.dll / libjvm.so / libjvm.dylib) and return
+// nullptr without ever calling GetProcAddress / dlsym on a null handle.
+// Cached after first call, so two queries return the same value.
+// ---------------------------------------------------------------------------
+static auto test_find_jvm_module_no_jvm() -> void
+{
+    auto const first{ vmhook::hotspot::get_jvm_module() };
+    auto const second{ vmhook::hotspot::get_jvm_module() };
+    check("get_jvm_module_no_jvm_returns_null", first == nullptr);
+    check("get_jvm_module_cache_stable", first == second);
+}
+
+// ---------------------------------------------------------------------------
+// 18. return_value::set on non-integer trivially-copyable values
+//
+// The sign-extension branch only fires for signed integer types < 8 bytes.
+// float, double, and pointer types must take the memcpy path and land in
+// the slot with their bit pattern intact (no spurious sign extension).
+// ---------------------------------------------------------------------------
+static auto test_return_value_set_non_integer_types() -> void
+{
+    vmhook::hotspot::return_slot slot{};
+    vmhook::return_value rv{ &slot };
+
+    // float - 4 bytes, NOT a signed integer, so memcpy path.  Bit pattern
+    // of 3.14f is 0x4048F5C3 - the upper 32 bits of the slot must stay zero.
+    rv.set(3.14f);
+    check("return_value_set_float_cancel", slot.cancel == true);
+    {
+        float roundtrip{};
+        std::memcpy(&roundtrip, &slot.retval, sizeof(roundtrip));
+        check("return_value_set_float_roundtrip", roundtrip == 3.14f);
+    }
+    check("return_value_set_float_upper_bits_zero",
+          (static_cast<std::uint64_t>(slot.retval) >> 32) == 0u);
+
+    // double - 8 bytes, memcpy path fills the whole slot.
+    slot.retval = 0;
+    slot.cancel = false;
+    rv.set(2.71828);
+    check("return_value_set_double_cancel", slot.cancel == true);
+    {
+        double roundtrip{};
+        std::memcpy(&roundtrip, &slot.retval, sizeof(roundtrip));
+        check("return_value_set_double_roundtrip", roundtrip == 2.71828);
+    }
+
+    // void* - 8 bytes on x86_64, memcpy path.  No sign-extension even though
+    // the high bit is set: a kernel-space-looking pointer must round-trip
+    // bit-for-bit.
+    slot.retval = 0;
+    slot.cancel = false;
+    void* const sentinel{ reinterpret_cast<void*>(
+        static_cast<std::uintptr_t>(0xCAFEBABEDEADBEEFull)) };
+    rv.set<void*>(sentinel);
+    check("return_value_set_pointer_cancel", slot.cancel == true);
+    {
+        void* roundtrip{};
+        std::memcpy(&roundtrip, &slot.retval, sizeof(roundtrip));
+        check("return_value_set_pointer_roundtrip", roundtrip == sentinel);
+    }
+
+    // uint32_t - unsigned, NO sign extension even if high bit is set.
+    slot.retval = 0;
+    slot.cancel = false;
+    rv.set(std::uint32_t{ 0x80000000u });
+    check("return_value_set_uint32_high_bit_no_sign_extend",
+          slot.retval == static_cast<std::int64_t>(0x80000000u));
+
+    // bool - 1 byte, but NOT signed integer (the requires-clause keys on
+    // is_signed && is_integral; bool is integral and signed-ness depends
+    // on the platform, but std::is_signed_v<bool> is false).
+    // Must round-trip without garbage in the upper bytes.
+    slot.retval = static_cast<std::int64_t>(0xFFFFFFFFFFFFFF00ull);
+    slot.cancel = false;
+    rv.set(true);
+    check("return_value_set_bool_true_clears_upper_bytes",
+          slot.retval == 1);
+    slot.retval = static_cast<std::int64_t>(0xFFFFFFFFFFFFFFFFull);
+    rv.set(false);
+    check("return_value_set_bool_false_clears_slot",
+          slot.retval == 0);
+}
+
+// ---------------------------------------------------------------------------
+// 19. return_value::cancel / caller / stack_trace with no frame
+//
+// Construct a return_value with a null frame_pointer.  cancel() must
+// flip slot.cancel; set() with no value can't be tested via the public
+// API for void returns, but caller() and stack_trace() must each return
+// the documented empty defaults rather than crashing.
+// ---------------------------------------------------------------------------
+static auto test_return_value_no_frame_helpers() -> void
+{
+    vmhook::hotspot::return_slot slot{};
+    vmhook::return_value rv{ &slot, /*frame=*/nullptr };
+
+    // cancel() always succeeds; just records the flag on the slot.
+    rv.cancel();
+    check("return_value_cancel_sets_flag", slot.cancel == true);
+
+    // No frame -> caller() returns empty caller_info with valid() == false.
+    const auto caller{ rv.caller() };
+    check("return_value_caller_no_frame_invalid", !caller.valid());
+    check("return_value_caller_no_frame_method_null", caller.method == nullptr);
+    check("return_value_caller_no_frame_class_empty", caller.class_name.empty());
+    check("return_value_caller_no_frame_method_name_empty", caller.method_name.empty());
+    check("return_value_caller_no_frame_signature_empty", caller.signature.empty());
+
+    // No frame -> stack_trace() returns an empty vector.
+    const auto frames_default{ rv.stack_trace() };
+    check("return_value_stack_trace_no_frame_empty",
+          frames_default.empty());
+
+    // max_depth = 0 must promote to the default 64 internally, but with
+    // no frame still returns empty.
+    const auto frames_zero{ rv.stack_trace(0) };
+    check("return_value_stack_trace_zero_depth_empty",
+          frames_zero.empty());
+
+    // Even a small explicit depth returns empty with no frame.
+    const auto frames_small{ rv.stack_trace(4) };
+    check("return_value_stack_trace_small_depth_empty",
+          frames_small.empty());
+
+    // frame() exposes the raw pointer the constructor was given.
+    check("return_value_frame_accessor_returns_null", rv.frame() == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 20. return_value::set_arg short-circuits on bad inputs
+//
+// The wrapper short-circuits to false (and logs) when the underlying frame
+// is null or the index is negative.  No JVM is needed to hit either path -
+// the early returns happen before any HotSpot read.
+// ---------------------------------------------------------------------------
+static auto test_return_value_set_arg_guards() -> void
+{
+    vmhook::hotspot::return_slot slot{};
+    vmhook::return_value rv{ &slot, /*frame=*/nullptr };
+
+    check("return_value_set_arg_no_frame_returns_false",
+          rv.set_arg(0, std::int32_t{ 42 }) == false);
+    check("return_value_set_arg_no_frame_returns_false_neg_idx",
+          rv.set_arg(-1, std::int32_t{ 42 }) == false);
+    check("return_value_set_arg_no_frame_returns_false_large_idx",
+          rv.set_arg(1000, std::int32_t{ 42 }) == false);
+}
+
+// ---------------------------------------------------------------------------
+// 21. is_valid_pointer alignment + boundary cases
+//
+// is_valid_pointer rejects:
+//   - addresses at or below user_address_floor (low sentinels)
+//   - addresses at or above user_address_ceiling (kernel / non-canonical)
+//   - odd low-bit addresses (HotSpot pointers are at least 2-byte aligned)
+//   - well-known debug-poison patterns
+// Exercise each boundary explicitly to catch off-by-one regressions in the
+// comparison operators (e.g. `< floor` instead of `<= floor`).
+// ---------------------------------------------------------------------------
+static auto test_is_valid_pointer_boundaries() -> void
+{
+    using vmhook::hotspot::is_valid_pointer;
+
+    // Exactly at user_address_floor must be REJECTED (the function uses <=).
+    check("is_valid_pointer_at_floor_rejected",
+          !is_valid_pointer(reinterpret_cast<void*>(vmhook::os::user_address_floor)));
+
+    // Just below the floor: rejected.
+    check("is_valid_pointer_below_floor_rejected",
+          !is_valid_pointer(reinterpret_cast<void*>(
+              vmhook::os::user_address_floor - 1)));
+
+    // Just above the floor (and 2-byte aligned): accepted.  The floor
+    // sentinel itself is 0xFFFF which is odd, so floor+1 = 0x10000 is the
+    // first 2-byte-aligned address that clears both the range and the
+    // alignment checks.
+    {
+        const std::uintptr_t addr{ vmhook::os::user_address_floor + 1 };
+        check("is_valid_pointer_just_above_floor_accepted",
+              is_valid_pointer(reinterpret_cast<void*>(addr)));
+    }
+
+    // Exactly at user_address_ceiling must be REJECTED (the function uses >=).
+    check("is_valid_pointer_at_ceiling_rejected",
+          !is_valid_pointer(reinterpret_cast<void*>(vmhook::os::user_address_ceiling)));
+
+    // Just above the ceiling: rejected.
+    check("is_valid_pointer_above_ceiling_rejected",
+          !is_valid_pointer(reinterpret_cast<void*>(
+              vmhook::os::user_address_ceiling + 1)));
+
+    // 2-byte alignment is the documented minimum requirement; 4- and 8-byte
+    // alignment must both pass.
+    int locals_for_alignment[4]{};  // stack array, naturally aligned
+    void* const aligned_4{ &locals_for_alignment[1] };
+    void* const aligned_8{ &locals_for_alignment[0] };
+    check("is_valid_pointer_4byte_aligned_accepted", is_valid_pointer(aligned_4));
+    check("is_valid_pointer_8byte_aligned_accepted", is_valid_pointer(aligned_8));
+}
+
+// ---------------------------------------------------------------------------
+// 22. decode_u5 multi-byte boundary
+//
+// Validates the UNSIGNED5 decoder at the boundaries that the existing test
+// did not exercise: a 3-byte encoding and a near-maximum-value 5-byte one.
+// Encoder spec from src/hotspot/share/utilities/unsigned5.hpp:
+//   for value v in [L, L + L*H), 2 bytes  (L = 191, H = 64)
+//   for value v in [L + L*H, L + L*H + L*H*H), 3 bytes
+// 3-byte boundary: value = 191 + 64*191 = 12415 maps to [192, 192, 1].
+//   First two bytes are continuation (>= 192), final byte is low (=1).
+// ---------------------------------------------------------------------------
+static auto test_decode_u5_multi_byte() -> void
+{
+    // 3-byte encoding: 12415 = (192-1) + (192-1)*64 + (1-1)*64*64
+    //                       = 191 + 12224 + 0 = 12415
+    int pos_3byte{ 0 };
+    std::array<std::uint8_t, 8> buf_3byte{ 192, 192, 1, 0, 0, 0, 0, 0 };
+    const std::uint32_t v_3byte{
+        vmhook::hotspot::klass::decode_u5(buf_3byte.data(), pos_3byte) };
+    check("decode_u5_3byte_value", v_3byte == 12415u);
+    check("decode_u5_3byte_pos", pos_3byte == 3);
+
+    // After a value-decode, the next call must continue from the new
+    // stream position (no reset).  Encode value 5 in the byte that
+    // immediately follows our 3-byte sequence.
+    std::array<std::uint8_t, 8> buf_sequence{ 192, 192, 1, 6, 0, 0, 0, 0 };
+    int seq_pos{ 0 };
+    const std::uint32_t first{
+        vmhook::hotspot::klass::decode_u5(buf_sequence.data(), seq_pos) };
+    const std::uint32_t second{
+        vmhook::hotspot::klass::decode_u5(buf_sequence.data(), seq_pos) };
+    check("decode_u5_sequence_first_12415", first == 12415u);
+    check("decode_u5_sequence_second_5", second == 5u);
+    check("decode_u5_sequence_pos_advanced", seq_pos == 4);
+
+    // 4-byte encoding stress: every byte must be checked.  Build
+    // value (b0 - 1) + (b1 - 1)*64 + (b2 - 1)*64*64 + (b3 - 1)*64*64*64
+    // with b0 = b1 = b2 = 192 (highest continuation) and b3 = 2
+    // (terminator) - that resolves to 191 + 191*64 + 191*64*64 + 64^3
+    // = 191 + 12224 + 782336 + 262144 = 1056895.
+    int pos_4byte{ 0 };
+    std::array<std::uint8_t, 8> buf_4byte{ 192, 192, 192, 2, 0, 0, 0, 0 };
+    const std::uint32_t v_4byte{
+        vmhook::hotspot::klass::decode_u5(buf_4byte.data(), pos_4byte) };
+    check("decode_u5_4byte_pos", pos_4byte == 4);
+    check("decode_u5_4byte_value",
+          v_4byte == (191u + 191u * 64u + 191u * 64u * 64u + 64u * 64u * 64u));
+}
+
+// ---------------------------------------------------------------------------
+// 23. format_log positive path - when std::format is available the helper
+//     must actually expand the placeholders, not return the raw template.
+//     The fallback path is exercised by test_format_log_safe_on_bad_pattern.
+// ---------------------------------------------------------------------------
+static auto test_format_log_positive() -> void
+{
+#if VMHOOK_HAS_STD_FORMAT
+    // Well-formed pattern with one substitution.
+    const std::string result{ vmhook::detail::format_log("answer={}", 42) };
+    check("format_log_substitutes_int", result == "answer=42");
+
+    // Two substitutions of different types.
+    const std::string result_two{
+        vmhook::detail::format_log("{} = {}", "pi", 3.14) };
+    check("format_log_substitutes_two", !result_two.empty()
+          && result_two.find("pi") != std::string::npos
+          && result_two.find("3.14") != std::string::npos);
+
+    // No substitutions - format string passes through unchanged.
+    const std::string result_none{ vmhook::detail::format_log("hello") };
+    check("format_log_no_placeholders_passthrough", result_none == "hello");
+#else
+    // Fallback path: the helper returns the raw template - that's the
+    // documented behaviour, and the existing bad-pattern test covers it.
+    std::printf("[INFO] test_format_log_positive: skipped (no <format>)\n");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 24. version_string composition + numeric range sanity
+// ---------------------------------------------------------------------------
+static auto test_version_string_composition() -> void
+{
+    constexpr std::string_view v{ VMHOOK_VERSION_STRING };
+    // Components are non-negative and fit in the documented widths.
+    static_assert(VMHOOK_VERSION_MAJOR >= 0 && VMHOOK_VERSION_MAJOR < 1000,
+                  "VMHOOK_VERSION_MAJOR must fit in the packed integer's MAJOR slot");
+    static_assert(VMHOOK_VERSION_MINOR >= 0 && VMHOOK_VERSION_MINOR < 1000,
+                  "VMHOOK_VERSION_MINOR must fit in the packed integer's MINOR slot");
+    static_assert(VMHOOK_VERSION_PATCH >= 0 && VMHOOK_VERSION_PATCH < 1000,
+                  "VMHOOK_VERSION_PATCH must fit in the packed integer's PATCH slot");
+
+    // Every character is a digit or a dot, and there are no leading dots
+    // or empty components.
+    bool every_char_valid{ true };
+    bool seen_dot{ false };
+    char last_char{ 'x' };
+    for (const char c : v)
+    {
+        if (c != '.' && (c < '0' || c > '9'))
+        {
+            every_char_valid = false;
+            break;
+        }
+        if (c == '.' && last_char == '.')
+        {
+            every_char_valid = false;
+            break;
+        }
+        if (c == '.')
+        {
+            seen_dot = true;
+        }
+        last_char = c;
+    }
+    check("version_string_only_digits_and_dots", every_char_valid);
+    check("version_string_contains_a_dot", seen_dot);
+    check("version_string_does_not_start_with_dot", !v.empty() && v.front() != '.');
+    check("version_string_does_not_end_with_dot", !v.empty() && v.back() != '.');
+
+    // The packed integer must agree with the components for inequality
+    // gates downstream code might use ("#if VMHOOK_VERSION >= 4_001").
+    static_assert(VMHOOK_VERSION > 0, "VMHOOK_VERSION must be a positive integer");
+}
+
 int main()
 {
     test_version_macros();
     test_decode_u5();
+    test_decode_u5_multi_byte();
     test_valid_pointer_filters();
     test_untag_pointer();
     test_sig_char_to_basic_type();
@@ -720,13 +1104,22 @@ int main()
 #endif
     test_array_helpers();
     test_format_log_safe_on_bad_pattern();
+    test_format_log_positive();
     test_write_jni_arg_to_slot_unique_ptr_branch();
     test_write_jni_arg_to_slot_null_unique_ptr();
     test_write_jni_arg_to_slot_primitive_branches();
     test_jni_namespace_signature_for_arg();
     test_is_valid_pointer_rejects_sentinels();
+    test_is_valid_pointer_boundaries();
     test_return_value_sign_extension();
     test_return_value_set_nullptr_for_wrapper();
+    test_return_value_set_non_integer_types();
+    test_return_value_no_frame_helpers();
+    test_return_value_set_arg_guards();
+    test_iterate_entries_no_jvm();
+    test_vm_types_and_structs_no_jvm();
+    test_find_jvm_module_no_jvm();
+    test_version_string_composition();
 
     if (failures == 0)
     {

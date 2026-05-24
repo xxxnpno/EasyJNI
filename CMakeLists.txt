@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(vmhook
-    VERSION 0.4.0
+    VERSION 0.4.1
     DESCRIPTION "Single-header HotSpot JVM hooking library"
     LANGUAGES CXX)
 

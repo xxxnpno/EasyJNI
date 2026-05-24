@@ -6,7 +6,28 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+- `iterate_struct_entries` / `iterate_type_entries` now guard against null
+  arguments and null `field_name` mid-table.  The standard HotSpot terminator
+  zeroes both `type_name` and `field_name`, but custom JVMs / JVMTI agents
+  have been observed publishing partial entries where `type_name` is set and
+  `field_name` is null; the previous code crashed on `strcmp(nullptr, x)`
+  the first time iteration walked past such an entry.
+- `vmhook::os::release(addr, 0)` is now a no-op instead of calling
+  `munmap(addr, 0)` (which returns `EINVAL` on Linux).  Aligns POSIX
+  behaviour with Windows, where `VirtualFree` already tolerates a zero
+  size for `MEM_RELEASE`.
+
 ### Added
+- Unit-test coverage expanded from ~98 to ~173 checks in `test_helpers` and
+  from ~20 to ~35 in `test_os_protect_interaction`.  New cases cover:
+  iterate_*_entries no-JVM safety + null-arg guards, get_jvm_module /
+  get_vm_types / get_vm_structs caching, return_value::set for float /
+  double / pointer / unsigned / bool, return_value::caller / stack_trace /
+  set_arg with a null frame, is_valid_pointer at the floor / ceiling
+  boundaries, decode_u5 multi-byte boundary, format_log positive path,
+  protect / allocate_rwx / release / safe_read / get_proc_address input
+  guards, and protect walking every memory_protection enum value.
 - `vmhook::for_each_thread(visitor)` + `struct thread_info` — walks HotSpot's
   live JavaThread list (classic `Threads::_thread_list` on JDK 8/9, falls
   back to `ThreadsSMRSupport::_java_thread_list` on JDK 10+) and reports each

@@ -66,7 +66,7 @@
 // ---------------------------------------------------------------------------
 #define VMHOOK_VERSION_MAJOR 0
 #define VMHOOK_VERSION_MINOR 4
-#define VMHOOK_VERSION_PATCH 0
+#define VMHOOK_VERSION_PATCH 1
 
 #define VMHOOK_MAKE_VERSION(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
@@ -487,7 +487,12 @@ namespace vmhook
 #if VMHOOK_OS_WINDOWS
             return ::GetModuleHandleA(name);
 #else
-            // RTLD_NOLOAD: only return handle if already loaded.
+            // RTLD_NOLOAD: only return handle if already loaded.  glibc
+            // increments the soname refcount on a successful RTLD_NOLOAD probe.
+            // We deliberately do NOT dlclose the result here: that would
+            // dangle the handle if we ever happen to hold the last ref.
+            // The JVM lives for the process lifetime in every supported use
+            // case, so the per-call refcount bump is a benign no-op.
             return ::dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
 #endif
         }
@@ -670,10 +675,15 @@ namespace vmhook
 
         /*
             @brief Releases memory previously returned by allocate_rwx.
+            @details
+            size is ignored on Windows (VirtualFree releases the whole reservation),
+            but Linux munmap returns EINVAL for size == 0.  Returning early on a
+            zero size keeps the cross-platform behaviour symmetric and avoids the
+            useless syscall on POSIX.
         */
         inline auto release(void* address, std::size_t size) noexcept -> void
         {
-            if (!address)
+            if (!address || size == 0)
             {
                 return;
             }
@@ -1630,6 +1640,10 @@ namespace vmhook
         static auto iterate_type_entries(const char* const type_name) noexcept
             -> vmhook::hotspot::vm_type_entry_t*
         {
+            if (!type_name)
+            {
+                return nullptr;
+            }
             for (vmhook::hotspot::vm_type_entry_t* entry{ vmhook::hotspot::get_vm_types() }; entry && entry->type_name; ++entry)
             {
                 if (!std::strcmp(entry->type_name, type_name))
@@ -1642,12 +1656,26 @@ namespace vmhook
 
         /*
             @brief Searches the gHotSpotVMStructs array for a field entry by type and field name.
+            @details
+            Defensively skips any entry whose field_name is null - the standard HotSpot
+            terminator zeroes both type_name and field_name, but custom JVMs / JVMTI
+            agents have been observed to publish partial entries where type_name is set
+            and field_name is null.  Without the guard, strcmp(nullptr, x) is UB and
+            crashes the host process on the first lookup that walks past such an entry.
         */
         static auto iterate_struct_entries(const char* const type_name, const char* const field_name) noexcept
             -> vmhook::hotspot::vm_struct_entry_t*
         {
+            if (!type_name || !field_name)
+            {
+                return nullptr;
+            }
             for (vmhook::hotspot::vm_struct_entry_t* entry{ vmhook::hotspot::get_vm_structs() }; entry && entry->type_name; ++entry)
             {
+                if (!entry->field_name)
+                {
+                    continue;
+                }
                 if (!std::strcmp(entry->type_name, type_name) && !std::strcmp(entry->field_name, field_name))
                 {
                     return entry;
