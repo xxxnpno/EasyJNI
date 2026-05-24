@@ -36,22 +36,49 @@ static auto log_line(args_t&&... parts) -> void
 }
 
 // std::println has no formatter<wchar_t> for narrow output; convert manually.
+// Use WideCharToMultiByte with CP_UTF8 so paths containing non-ASCII characters
+// (very common on Windows - any user with a non-Latin-1 username, any program
+// installed under "Program Files\...\<accented dirname>\...") render correctly
+// in the diagnostic logs.  The previous `static_cast<char>(c)` truncation
+// silently corrupted every wide character above U+007F.
 static auto wstr_to_str(const std::wstring& ws)
     -> std::string
 {
-    std::string result{};
-    result.reserve(ws.size());
-    for (const wchar_t c : ws) result += static_cast<char>(c);
+    if (ws.empty())
+    {
+        return {};
+    }
+    const int needed{
+        ::WideCharToMultiByte(CP_UTF8, 0,
+                              ws.data(), static_cast<int>(ws.size()),
+                              nullptr, 0, nullptr, nullptr) };
+    if (needed <= 0)
+    {
+        return {};
+    }
+    std::string result(static_cast<std::size_t>(needed), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0,
+                          ws.data(), static_cast<int>(ws.size()),
+                          result.data(), needed, nullptr, nullptr);
     return result;
 }
 
 static auto resolve_dll_path()
     -> std::wstring
 {
+    // GetModuleFileNameW can fail (returns 0) or truncate when the path
+    // exceeds MAX_PATH (returns MAX_PATH with no null terminator AND sets
+    // GetLastError() to ERROR_INSUFFICIENT_BUFFER).  Either case leaves the
+    // buffer's tail in an indeterminate state; using it as a wide string
+    // gives us a path that's missing characters or has garbage at the end.
+    // Return an empty path so main() reports "vmhook.dll not found" instead
+    // of trying to inject a bogus path.
     wchar_t executable_path_buffer[MAX_PATH]{};
-
-    GetModuleFileNameW(nullptr, executable_path_buffer, MAX_PATH);
-
+    const DWORD len{ ::GetModuleFileNameW(nullptr, executable_path_buffer, MAX_PATH) };
+    if (len == 0 || len >= MAX_PATH)
+    {
+        return {};
+    }
     return (std::filesystem::path{ executable_path_buffer }.parent_path() / L"vmhook.dll").wstring();
 }
 
@@ -169,7 +196,7 @@ auto main(std::int32_t argc, char** argv)
 
     log_line("[INFO] dll_path : ", wstr_to_str(dll_path), ".");
 
-    if (!std::filesystem::exists(dll_path))
+    if (dll_path.empty() || !std::filesystem::exists(dll_path))
     {
         log_line("[ERROR] vmhook.dll not found.");
 
@@ -182,6 +209,13 @@ auto main(std::int32_t argc, char** argv)
 
     if (argc >= 2)
     {
+        // Explicit PID path: skip the JVM process scan and inject directly.
+        // The previous flow parsed argv[1] into target_pid and THEN scanned
+        // and unconditionally overrode target_pid with the single-JVM
+        // result (or aborted on multi-JVM) - which both ignored the user's
+        // explicit choice and refused valid invocations when more than one
+        // JVM was running.  Honor the user's PID without any further
+        // discovery.
         try
         {
             target_pid = static_cast<DWORD>(std::stoul(argv[1]));
@@ -189,7 +223,6 @@ auto main(std::int32_t argc, char** argv)
         catch (...)
         {
             log_line("[ERROR] Invalid PID provided.");
-
             return EXIT_FAILURE;
         }
 
@@ -198,33 +231,31 @@ auto main(std::int32_t argc, char** argv)
     else
     {
         log_line("[INFO] No PID provided. Scanning for JVM processes...");
-    }
 
-    std::vector<process_entry> processes{ find_processes(L"javaw.exe") };
+        std::vector<process_entry> processes{ find_processes(L"javaw.exe") };
 
-    if (processes.empty())
-    {
-        processes = find_processes(L"java.exe");
-    }
+        if (processes.empty())
+        {
+            processes = find_processes(L"java.exe");
+        }
 
-    if (processes.empty())
-    {
-        log_line("[ERROR] No running JVM processes found.");
+        if (processes.empty())
+        {
+            log_line("[ERROR] No running JVM processes found.");
+            return EXIT_FAILURE;
+        }
 
-        return EXIT_FAILURE;
-    }
-
-    if (processes.size() == 1)
-    {
-        target_pid = processes[0].pid;
-
-        log_line("[INFO] Found 1 process: ", target_pid, ", injecting automatically.");
-    }
-    else
-    {
-        log_line("[ERROR] Multiple JVM processes found, aborting automatic injection.");
-
-        return EXIT_FAILURE;
+        if (processes.size() == 1)
+        {
+            target_pid = processes[0].pid;
+            log_line("[INFO] Found 1 process: ", target_pid, ", injecting automatically.");
+        }
+        else
+        {
+            log_line("[ERROR] Multiple JVM processes found, aborting automatic injection. ",
+                     "Re-run with an explicit PID: injector.exe <pid>");
+            return EXIT_FAILURE;
+        }
     }
 
     log_line("[INFO] Injecting into process ", target_pid);

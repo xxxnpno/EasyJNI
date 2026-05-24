@@ -12,6 +12,7 @@
 
 #include <vmhook/vmhook.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdint>
@@ -1060,6 +1061,135 @@ static auto test_format_log_positive() -> void
 }
 
 // ---------------------------------------------------------------------------
+// 24Z. jvm_primitive_byte_width - introduced in v0.4.4 to size-check
+//      field_proxy::set against the JVM field width.
+// ---------------------------------------------------------------------------
+static auto test_jvm_primitive_byte_width() -> void
+{
+    using vmhook::detail::jvm_primitive_byte_width;
+
+    // Single-character primitive descriptors map to their JVM spec widths.
+    check("jvm_primitive_byte_width_Z", jvm_primitive_byte_width("Z") == 1);
+    check("jvm_primitive_byte_width_B", jvm_primitive_byte_width("B") == 1);
+    check("jvm_primitive_byte_width_S", jvm_primitive_byte_width("S") == 2);
+    check("jvm_primitive_byte_width_C", jvm_primitive_byte_width("C") == 2);
+    check("jvm_primitive_byte_width_I", jvm_primitive_byte_width("I") == 4);
+    check("jvm_primitive_byte_width_F", jvm_primitive_byte_width("F") == 4);
+    check("jvm_primitive_byte_width_J", jvm_primitive_byte_width("J") == 8);
+    check("jvm_primitive_byte_width_D", jvm_primitive_byte_width("D") == 8);
+
+    // Reference / array / void all return 0 (skip size validation upstream).
+    check("jvm_primitive_byte_width_L_is_0",
+          jvm_primitive_byte_width("Ljava/lang/String;") == 0);
+    check("jvm_primitive_byte_width_array_is_0",
+          jvm_primitive_byte_width("[I") == 0);
+    check("jvm_primitive_byte_width_V_is_0",
+          jvm_primitive_byte_width("V") == 0);
+
+    // Empty / unknown signatures also return 0.
+    check("jvm_primitive_byte_width_empty_is_0",
+          jvm_primitive_byte_width("") == 0);
+    check("jvm_primitive_byte_width_unknown_is_0",
+          jvm_primitive_byte_width("?") == 0);
+    check("jvm_primitive_byte_width_multichar_is_0",
+          jvm_primitive_byte_width("Ix") == 0);
+}
+
+// ---------------------------------------------------------------------------
+// 24Y. field_proxy::set size-mismatch guard
+//
+// The set() implementation now refuses to memcpy a value when the C++
+// type's size doesn't match the JVM field width.  Previously,
+// `field.set(int64_t{x})` on an "I" field wrote 8 bytes into a 4-byte
+// slot, clobbering whatever came next in the heap object's layout.
+// We exercise the guard on a stack buffer with sentinel bytes after the
+// field; a successful guard leaves those sentinel bytes intact.
+// ---------------------------------------------------------------------------
+static auto test_field_proxy_set_size_guard() -> void
+{
+    // Layout:
+    //   [0..3]   the field's storage (4-byte "I")
+    //   [4..7]   sentinel guard bytes (0xAB) - the test verifies these
+    //            stay 0xAB after a malformed set() call
+    std::array<std::uint8_t, 8> storage{};
+    storage.fill(std::uint8_t{ 0xAB });
+
+    vmhook::field_proxy proxy_int{ storage.data(), "I", false };
+
+    // Right-sized: int32_t into an "I" field writes 4 bytes, sentinels stay.
+    proxy_int.set(std::int32_t{ 0x11223344 });
+    {
+        std::int32_t read_back{};
+        std::memcpy(&read_back, storage.data(), sizeof(read_back));
+        check("field_proxy_set_int32_into_I_writes_correctly",
+              read_back == 0x11223344);
+        check("field_proxy_set_int32_into_I_preserves_sentinels",
+              storage[4] == 0xAB && storage[5] == 0xAB
+              && storage[6] == 0xAB && storage[7] == 0xAB);
+    }
+
+    // Refill sentinels after a clean reset.
+    storage.fill(std::uint8_t{ 0xAB });
+
+    // Mismatch: int64_t into "I" field would previously have written 8 bytes
+    // and clobbered the sentinels.  Guard now refuses the write entirely.
+    proxy_int.set(static_cast<std::int64_t>(0xDEADBEEFCAFEBABEull));
+    check("field_proxy_set_int64_into_I_does_NOT_clobber_sentinels",
+          storage[4] == 0xAB && storage[5] == 0xAB
+          && storage[6] == 0xAB && storage[7] == 0xAB);
+    // The field bytes are unchanged from their pre-set state (still 0xAB).
+    check("field_proxy_set_int64_into_I_leaves_field_unchanged",
+          storage[0] == 0xAB && storage[1] == 0xAB
+          && storage[2] == 0xAB && storage[3] == 0xAB);
+
+    // Inverse mismatch: int32_t into a "J" (8-byte long) field also refused.
+    storage.fill(std::uint8_t{ 0xAB });
+    vmhook::field_proxy proxy_long{ storage.data(), "J", false };
+    proxy_long.set(std::int32_t{ 0x11223344 });
+    check("field_proxy_set_int32_into_J_leaves_field_unchanged",
+          std::all_of(storage.begin(), storage.end(),
+                      [](std::uint8_t b) { return b == 0xAB; }));
+
+    // Reference / array signatures bypass the size guard (size==0 -> skip).
+    // The trivially_copyable branch should still run for those, but in
+    // practice users go through the unique_ptr or string branches.  Just
+    // verify the helper doesn't accidentally crash for a reference-typed
+    // proxy when set() is called with an int (which would route to the
+    // trivially_copyable branch and write 4 bytes into a 4-byte compressed
+    // OOP slot - that's an OOP-shaped write, semantically wrong but not
+    // crash-y).
+    storage.fill(std::uint8_t{ 0 });
+    vmhook::field_proxy proxy_ref{ storage.data(), "Ljava/lang/String;", false };
+    proxy_ref.set(std::uint32_t{ 0xCAFEBABE });
+    {
+        std::uint32_t read_back{};
+        std::memcpy(&read_back, storage.data(), sizeof(read_back));
+        check("field_proxy_set_uint32_into_ref_writes_4_bytes",
+              read_back == 0xCAFEBABE);
+    }
+
+    // The "C" -> char widening special case still works.
+    storage.fill(std::uint8_t{ 0xCC });
+    vmhook::field_proxy proxy_char{ storage.data(), "C", false };
+    proxy_char.set(char{ 'A' });
+    {
+        std::uint16_t read_back{};
+        std::memcpy(&read_back, storage.data(), sizeof(read_back));
+        check("field_proxy_set_char_into_C_widens_to_uint16",
+              read_back == static_cast<std::uint16_t>(
+                  static_cast<unsigned char>('A')));
+        // Following bytes untouched.
+        check("field_proxy_set_char_into_C_preserves_remaining_bytes",
+              storage[2] == 0xCC && storage[3] == 0xCC);
+    }
+
+    // Null field_pointer: set() must short-circuit, not deref the null.
+    vmhook::field_proxy proxy_null{ nullptr, "I", false };
+    proxy_null.set(std::int32_t{ 999 });
+    check("field_proxy_set_null_field_pointer_is_safe", true);  // no crash
+}
+
+// ---------------------------------------------------------------------------
 // 24a. jni_delete_local_ref - new helper added in v0.4.1 to release jstring
 //      locals from set_arg's string path.  Must be a safe no-op in the
 //      no-JVM unit test: null current_jni_env means jni_function returns
@@ -1230,6 +1360,8 @@ int main()
     test_vm_types_and_structs_no_jvm();
     test_find_jvm_module_no_jvm();
     test_jni_delete_local_ref_no_jvm();
+    test_jvm_primitive_byte_width();
+    test_field_proxy_set_size_guard();
 #if VMHOOK_HAS_HW_DATA_BREAKPOINTS
     test_dr_armed_count_refcount();
 #endif

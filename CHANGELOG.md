@@ -7,6 +7,37 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- `field_proxy::set` silently corrupted adjacent fields when the C++ value
+  type was wider than the JVM field.  Writing `int64_t{...}` to an `"I"`
+  field memcpy'd 8 bytes into a 4-byte slot, trampling the next 4 bytes
+  of the object layout (whatever field came next in the class).  Added a
+  `vmhook::detail::jvm_primitive_byte_width` helper that returns the
+  JVM-spec width of each primitive signature, and `set()` now rejects
+  the write with a diagnostic when the value size doesn't match.  The
+  `'C' + 1-byte char` widening shortcut is preserved.
+- `vmhook::for_each_thread` Path 1 had no cycle detection in the
+  intrusive `Threads::_thread_list` walk.  A corrupted list (e.g. a JVMTI
+  agent stitching `_next` during `RedefineClasses`) could form a cycle;
+  with only the hard cap at 4096 entries, the visitor was invoked on the
+  same JavaThread up to 4096 times.  Now tracks visited pointers in a
+  small `unordered_set` and breaks out at the first repeat.
+- Injector silently ignored the user-provided PID when more than one JVM
+  was running.  The flow parsed `argv[1]` into `target_pid` and then
+  unconditionally scanned for JVM processes, overriding the user's
+  choice on a single-match scan and refusing to inject on multi-match.
+  Now: if a PID is provided, skip the scan entirely.
+- Injector's `wstr_to_str` truncated non-ASCII characters via
+  `static_cast<char>(wchar_t)`.  Paths under user directories with
+  accented characters (very common on non-English Windows installs)
+  rendered as garbage in the diagnostic log.  Replaced with a proper
+  `WideCharToMultiByte` UTF-8 conversion.
+- Injector's `resolve_dll_path` didn't check `GetModuleFileNameW`'s
+  return value.  On failure (returns 0) or truncation (returns MAX_PATH
+  with no null terminator) the buffer's tail was indeterminate; the
+  injector then constructed a bogus path and only failed at the
+  `std::filesystem::exists` check rather than logging the underlying
+  cause.  Now: return an empty path so the "vmhook.dll not found"
+  diagnostic fires immediately and clearly.
 - `watch_static_field` dr-slot use-after-free.  The VEH handler used to read
   the slot's `std::function` callback under the mutex, release the mutex,
   then call it - racing with `watch_handle::stop()` which clears the slot's
@@ -82,6 +113,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
+- `vmhook::detail::jvm_primitive_byte_width(signature)` — JVM-spec byte
+  width of a primitive type descriptor (Z/B=1, S/C=2, I/F=4, J/D=8;
+  references / arrays / void return 0).  Used by `field_proxy::set`'s
+  new size-mismatch guard.
 - `vmhook::detail::dr_arm_one` / `dr_unarm_one` — refcounted VEH lifecycle
   helpers for the hardware-data-breakpoint path.  `ensure_dr_handler_installed`
   is now a thin alias that calls `dr_arm_one()`; consumers don't need to

@@ -66,7 +66,7 @@
 // ---------------------------------------------------------------------------
 #define VMHOOK_VERSION_MAJOR 0
 #define VMHOOK_VERSION_MINOR 4
-#define VMHOOK_VERSION_PATCH 3
+#define VMHOOK_VERSION_PATCH 4
 
 #define VMHOOK_MAKE_VERSION(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
@@ -90,6 +90,7 @@
 #include <string_view>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <typeindex>
 #include <memory>
 #include <mutex>
@@ -1371,6 +1372,17 @@ namespace vmhook
         */
         inline auto inherit_host_context_classloader_for_current_thread() noexcept
             -> void;
+
+        /*
+            @brief Forward declaration for the JVM primitive field-width helper used
+                   by field_proxy::set's size-mismatch guard.  Defined alongside
+                   sig_char_to_basic_type so the actual table lives next to its
+                   sibling helper, but the field_proxy template body needs to see
+                   the name at parse time (GCC's -Wtemplate-body is strict about
+                   qualified-name lookup inside templates).
+        */
+        inline auto jvm_primitive_byte_width(std::string_view signature) noexcept
+            -> std::size_t;
     }
 
     /*
@@ -6502,12 +6514,28 @@ namespace vmhook
         // Path 1: classic Threads::_thread_list intrusive list,
         // present on JDK 8-9 and (where the JVM ships the VMStruct
         // entry) still useful on later builds.
+        //
+        // Hard cap at 4096 entries to short-circuit any runaway walk.
+        // We also stop when the next pointer cycles back to a thread we
+        // have already seen this iteration - a corrupted intrusive list
+        // (e.g. mid-RedefineClasses while another agent re-stitches the
+        // _next chain) can form a cycle, and without cycle detection we
+        // would happily visit the same JavaThread up to 4096 times,
+        // invoking the user visitor on duplicates.  visited_set is a
+        // small unordered_set; with the cap at 4096 it stays bounded.
         std::int32_t visited_count{ 0 };
         bool         path1_visited_anything{ false };
+        std::unordered_set<const vmhook::hotspot::java_thread*> visited_set;
         for (auto* current{ vmhook::hotspot::find_any_java_thread() };
              current && vmhook::hotspot::is_valid_pointer(current) && visited_count < 4096;
              ++visited_count)
         {
+            if (!visited_set.insert(current).second)
+            {
+                // Already seen - cycle in the intrusive list.  Stop
+                // here rather than reporting duplicates to the visitor.
+                break;
+            }
             invoke_visitor(current);
             path1_visited_anything = true;
             auto* const next{ current->get_next() };
@@ -10979,18 +11007,46 @@ namespace vmhook
             }
             else if constexpr (std::is_trivially_copyable_v<clean_value_type>)
             {
-                if (this->field_pointer)
+                if (!this->field_pointer)
                 {
-                    if (this->signature_text == "C" && sizeof(clean_value_type) == sizeof(char))
-                    {
-                        const std::uint16_t wide_value{ static_cast<std::uint16_t>(static_cast<unsigned char>(value)) };
-                        std::memcpy(this->field_pointer, &wide_value, sizeof(wide_value));
-                    }
-                    else
-                    {
-                        std::memcpy(this->field_pointer, &value, sizeof(clean_value_type));
-                    }
+                    return;
                 }
+
+                // Special case: passing a 1-byte C++ `char` to a Java `char` field
+                // (descriptor "C", 2 bytes wide).  We widen via uint16 so the
+                // field's full 2 bytes are written rather than only the low byte.
+                if (this->signature_text == "C" && sizeof(clean_value_type) == sizeof(char))
+                {
+                    const std::uint16_t wide_value{ static_cast<std::uint16_t>(static_cast<unsigned char>(value)) };
+                    std::memcpy(this->field_pointer, &wide_value, sizeof(wide_value));
+                    return;
+                }
+
+                // Size mismatch guard.  Previously the write was an unconditional
+                // memcpy of sizeof(value_type) bytes into the field's storage,
+                // which silently clobbered adjacent fields when the C++ type was
+                // larger than the JVM type (e.g. set(int64_t{...}) on an "I"
+                // field wrote 8 bytes into a 4-byte slot, corrupting whatever
+                // came after it in the object layout).  Reject the write with a
+                // diagnostic instead - users who hit this had a type bug, and
+                // failing loudly is far better than overwriting the next field.
+                //
+                // The check is skipped for reference / array signatures (the
+                // helper returns 0), where the L/[ branches above handle the
+                // compressed-OOP / array-set paths and never reach this branch.
+                const std::size_t value_size{ sizeof(clean_value_type) };
+                const std::size_t field_size{
+                    vmhook::detail::jvm_primitive_byte_width(this->signature_text) };
+                if (field_size != 0 && value_size != field_size)
+                {
+                    VMHOOK_LOG("{} field_proxy::set: size mismatch (value={}B, field={}B, "
+                               "sig='{}') - refusing the write to avoid clobbering adjacent "
+                               "fields.  Convert the value to the matching primitive type.",
+                               vmhook::error_tag, value_size, field_size, this->signature_text);
+                    return;
+                }
+
+                std::memcpy(this->field_pointer, &value, value_size);
             }
             else
             {
@@ -11118,6 +11174,39 @@ namespace vmhook
             case '[': return 13;  // T_ARRAY
             case 'V': return 14;  // T_VOID
             default:  return 12;  // T_OBJECT (fallback)
+            }
+        }
+
+        /*
+            @brief Returns the in-heap byte width of a JVM primitive field given its
+                   type-descriptor signature.
+            @details
+            Used by field_proxy::set() to size-check the user's value against the
+            actual field width before memcpy'ing.  Returns 0 for reference and
+            array types (where the in-heap width depends on UseCompressedOops and
+            is handled by the wrapper / set_str_field paths), and for any unknown
+            signature - in both cases the caller skips the size validation.
+
+            Width table (JVM spec § 4.3.2):
+              Z (boolean) = 1, B (byte) = 1
+              S (short)   = 2, C (char) = 2
+              I (int)     = 4, F (float) = 4
+              J (long)    = 8, D (double) = 8
+        */
+        inline auto jvm_primitive_byte_width(const std::string_view signature) noexcept
+            -> std::size_t
+        {
+            if (signature.size() != 1)
+            {
+                return 0;
+            }
+            switch (signature[0])
+            {
+            case 'Z': case 'B': return 1;
+            case 'S': case 'C': return 2;
+            case 'I': case 'F': return 4;
+            case 'J': case 'D': return 8;
+            default:            return 0;
             }
         }
     }
