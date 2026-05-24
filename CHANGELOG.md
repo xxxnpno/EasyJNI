@@ -7,6 +7,28 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- `return_value::set_arg(index, ...)`: enforce the JVM spec's `max_locals`
+  upper bound (u2 = 65535).  Previously only `index < 0` was rejected, so a
+  caller passing e.g. `index = 1'000'000` would write to `locals[-1000000]`,
+  walking off the interpreter local-variable array into adjacent thread
+  state (operand stack, saved registers, frame header) and producing a
+  post-uninject crash cascade in the JVM.
+- `return_value::set_arg(index, std::string)` and the `const char*` overload
+  used to leak one JNI local reference per call: the jstring handle returned
+  by `NewStringUTF` was never `DeleteLocalRef`'d after the underlying OOP
+  was stored in the interpreter slot.  Long-lived attached threads (every
+  HotSpot interpreter thread that runs our detour) would eventually trip
+  JNI "local reference table overflow" warnings on hot-path string
+  injection.  A new `vmhook::detail::jni_delete_local_ref(handle)` helper
+  now releases the handle after the store, with cleanup on both the
+  success and failure paths.
+- `midi2i_hook` constructor now re-validates `chain_resume` with
+  `is_valid_pointer` before baking it into the trampoline's resume JMP.
+  `vmhook::hook<T>()` already filters at the call site, but direct
+  consumers of `midi2i_hook` (anyone using the lower-level API) bypassed
+  that guard; a bad pointer here would have caused the trampoline to
+  resume at an arbitrary address.  Bad input now falls through to the
+  default `target + HOOK_SIZE` resume.
 - `iterate_struct_entries` / `iterate_type_entries` now guard against null
   arguments and null `field_name` mid-table.  The standard HotSpot terminator
   zeroes both `type_name` and `field_name`, but custom JVMs / JVMTI agents
@@ -19,15 +41,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
-- Unit-test coverage expanded from ~98 to ~173 checks in `test_helpers` and
+- `vmhook::detail::jni_delete_local_ref(handle)` — releases a JNI local
+  reference via JNIEnv table slot 23.  Null-handle safe, no-JVM safe, used
+  by the set_arg string fix described above.
+- Unit-test coverage expanded from ~98 to ~177 checks in `test_helpers` and
   from ~20 to ~35 in `test_os_protect_interaction`.  New cases cover:
   iterate_*_entries no-JVM safety + null-arg guards, get_jvm_module /
   get_vm_types / get_vm_structs caching, return_value::set for float /
   double / pointer / unsigned / bool, return_value::caller / stack_trace /
-  set_arg with a null frame, is_valid_pointer at the floor / ceiling
-  boundaries, decode_u5 multi-byte boundary, format_log positive path,
-  protect / allocate_rwx / release / safe_read / get_proc_address input
-  guards, and protect walking every memory_protection enum value.
+  set_arg with a null frame, set_arg above the JVM max_locals limit,
+  jni_delete_local_ref no-JVM safety, is_valid_pointer at the floor /
+  ceiling boundaries, decode_u5 multi-byte boundary, format_log positive
+  path, protect / allocate_rwx / release / safe_read / get_proc_address
+  input guards, and protect walking every memory_protection enum value.
 - `vmhook::for_each_thread(visitor)` + `struct thread_info` — walks HotSpot's
   live JavaThread list (classic `Threads::_thread_list` on JDK 8/9, falls
   back to `ThreadsSMRSupport::_java_thread_list` on JDK 10+) and reports each

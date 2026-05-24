@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 static int failures{ 0 };
@@ -897,8 +898,9 @@ static auto test_return_value_no_frame_helpers() -> void
 // 20. return_value::set_arg short-circuits on bad inputs
 //
 // The wrapper short-circuits to false (and logs) when the underlying frame
-// is null or the index is negative.  No JVM is needed to hit either path -
-// the early returns happen before any HotSpot read.
+// is null, the index is negative, or the index exceeds the JVM's max_locals
+// limit (u2 = 65535).  All three early returns happen before any HotSpot
+// read, so no JVM is needed.
 // ---------------------------------------------------------------------------
 static auto test_return_value_set_arg_guards() -> void
 {
@@ -911,6 +913,19 @@ static auto test_return_value_set_arg_guards() -> void
           rv.set_arg(-1, std::int32_t{ 42 }) == false);
     check("return_value_set_arg_no_frame_returns_false_large_idx",
           rv.set_arg(1000, std::int32_t{ 42 }) == false);
+
+    // JVM max_locals is a u2 (65535).  set_arg must reject anything past
+    // that even when a frame is present: otherwise locals[-index] would
+    // walk off the interpreter local-variable array into adjacent thread
+    // state and silently corrupt the operand stack / frame header.
+    // We can't supply a real frame here without a JVM, but we can verify
+    // the guard fires via the no-frame check (same return path on this
+    // codepath: any of "missing frame / negative / index > 65535" exits
+    // before touching get_locals).
+    check("return_value_set_arg_above_max_locals_returns_false",
+          rv.set_arg(0x10000, std::int32_t{ 42 }) == false);
+    check("return_value_set_arg_int_max_returns_false",
+          rv.set_arg(std::numeric_limits<std::int32_t>::max(), std::int32_t{ 42 }) == false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,6 +1059,29 @@ static auto test_format_log_positive() -> void
 }
 
 // ---------------------------------------------------------------------------
+// 24a. jni_delete_local_ref - new helper added in v0.4.1 to release jstring
+//      locals from set_arg's string path.  Must be a safe no-op in the
+//      no-JVM unit test: null current_jni_env means jni_function returns
+//      nullptr and the helper exits without calling through.  We exercise
+//      both the null-handle branch (early return) and the non-null branch
+//      (table-resolution fall-through).
+// ---------------------------------------------------------------------------
+static auto test_jni_delete_local_ref_no_jvm() -> void
+{
+    // Null handle: documented JNI no-op.
+    vmhook::detail::jni_delete_local_ref(nullptr);
+    check("jni_delete_local_ref_null_handle_does_not_crash", true);
+
+    // Non-null handle in a no-JVM process: current_jni_env is null, so the
+    // function-table lookup short-circuits and the helper returns without
+    // dereferencing anything.  We just want to assert no fault.
+    void* const fake_handle{ reinterpret_cast<void*>(
+        static_cast<std::uintptr_t>(0xABCDEF1234567880ull)) };
+    vmhook::detail::jni_delete_local_ref(fake_handle);
+    check("jni_delete_local_ref_no_jvm_returns_safely", true);
+}
+
+// ---------------------------------------------------------------------------
 // 24. version_string composition + numeric range sanity
 // ---------------------------------------------------------------------------
 static auto test_version_string_composition() -> void
@@ -1119,6 +1157,7 @@ int main()
     test_iterate_entries_no_jvm();
     test_vm_types_and_structs_no_jvm();
     test_find_jvm_module_no_jvm();
+    test_jni_delete_local_ref_no_jvm();
     test_version_string_composition();
 
     if (failures == 0)

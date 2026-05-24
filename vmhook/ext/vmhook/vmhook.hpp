@@ -66,7 +66,7 @@
 // ---------------------------------------------------------------------------
 #define VMHOOK_VERSION_MAJOR 0
 #define VMHOOK_VERSION_MINOR 4
-#define VMHOOK_VERSION_PATCH 1
+#define VMHOOK_VERSION_PATCH 2
 
 #define VMHOOK_MAKE_VERSION(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
@@ -5194,7 +5194,18 @@ namespace vmhook
                 : target{ target }
                 , allocated{ nullptr }
                 , allocated_size{ 0 }
-                , current_chain_resume{ const_cast<void*>(chain_resume) }
+                // Defence in depth: vmhook::hook<T>() already filters
+                // chain_resume through is_valid_pointer, but the constructor
+                // is the only place that bakes the address into the
+                // trampoline's resume JMP.  Re-validate so that a direct
+                // caller (anyone using midi2i_hook outside the hook<T>
+                // gateway) cannot trick the trampoline into resuming at an
+                // arbitrary address.  Treat anything that fails the check
+                // as nullptr, which makes the trampoline fall through to
+                // its default `target + HOOK_SIZE` resume.
+                , current_chain_resume{ (chain_resume && vmhook::hotspot::is_valid_pointer(chain_resume))
+                                             ? const_cast<void*>(chain_resume)
+                                             : nullptr }
                 , error{ true }
             {
 #if !VMHOOK_RUNTIME_HOOKING_AVAILABLE
@@ -5419,9 +5430,15 @@ namespace vmhook
                 // their trampoline, which runs its detour and resumes at the
                 // original `target + HOOK_SIZE` from its own copy of the saved
                 // bytes.  Both hooks fire, neither overwrites the other.
+                //
+                // Use the constructor-validated this->current_chain_resume here,
+                // not the raw `chain_resume` parameter: the former is null when
+                // the input pointer failed is_valid_pointer, so a bad parameter
+                // gracefully falls through to the default resume instead of
+                // baking an arbitrary address into the trampoline.
                 const std::uint8_t* const effective_resume{
-                    chain_resume
-                        ? static_cast<const std::uint8_t*>(chain_resume)
+                    this->current_chain_resume
+                        ? static_cast<const std::uint8_t*>(this->current_chain_resume)
                         : target + HOOK_SIZE
                 };
 
@@ -7228,6 +7245,24 @@ namespace vmhook
         */
         inline auto jni_new_string_utf(std::string_view value) noexcept
             -> void*;
+
+        /*
+            @brief Releases a JNI local reference via JNIEnv::DeleteLocalRef.
+            @details
+            Callers that produce a local ref via jni_new_string_utf / jni_find_class /
+            jni_get_object_class etc. and only need the underlying OOP must DeleteLocalRef
+            the handle once they're done with it.  Long-lived attached threads (every
+            HotSpot interpreter thread that runs our detour) keep accumulating local refs
+            otherwise; the JNI local-ref table is small (default capacity 16) and
+            EnsureLocalCapacity / native-method-frame teardown is the normal way to
+            clean it up — neither runs for vmhook's detour-attached threads.
+            Defined after the JNI helper section below.
+
+            Complexity: O(1).
+            Exception safety: noexcept — null handle is a safe no-op.
+        */
+        inline auto jni_delete_local_ref(void* object_handle) noexcept
+            -> void;
     } // namespace detail
 
     inline auto return_value::caller() const noexcept -> caller_info
@@ -7414,11 +7449,21 @@ namespace vmhook
     auto return_value::set_arg(const std::int32_t index, value_type&& value) noexcept
         -> bool
     {
-        if (!this->stack_frame || index < 0)
+        // The JVM spec limits max_locals to a u2 (65535).  Reject anything past
+        // that up front: locals[-index] for an out-of-range index would walk
+        // off the interpreter local-variable array and start corrupting
+        // adjacent thread state (operand stack, saved registers, the frame
+        // header) - exactly the kind of subtle wreckage that turns into a
+        // post-uninject AV cascade in the JVM rather than a clean error
+        // here.  65535 is generous; real methods rarely exceed a couple of
+        // hundred locals.
+        constexpr std::int32_t max_jvm_locals{ 0xFFFF };
+        if (!this->stack_frame || index < 0 || index > max_jvm_locals)
         {
-            VMHOOK_LOG("{} return_value::set_arg(index={}): missing stack_frame or negative index "
-                       "(stack_frame={}).",
-                       vmhook::error_tag, index, static_cast<const void*>(this->stack_frame));
+            VMHOOK_LOG("{} return_value::set_arg(index={}): missing stack_frame, negative index, "
+                       "or index above JVM max_locals limit ({}) (stack_frame={}).",
+                       vmhook::error_tag, index, max_jvm_locals,
+                       static_cast<const void*>(this->stack_frame));
             return false;
         }
 
@@ -7470,19 +7515,30 @@ namespace vmhook
         }
         else if constexpr (std::is_same_v<clean_value_type, std::string> || std::is_same_v<clean_value_type, std::string_view>)
         {
+            // jni_new_string_utf returns a JNI local reference.  The OOP we
+            // extract goes into the interpreter local-variable slot (a GC
+            // root), so the String stays reachable after we release the
+            // handle.  Skipping DeleteLocalRef would leak one local per call
+            // on long-lived attached threads - HotSpot's default ref table
+            // capacity is 16 and there's no implicit per-detour-frame
+            // teardown, so the leak surfaces as JNI "local reference table
+            // overflow" warnings after enough hot-path string injections.
             void* const string_handle{ vmhook::detail::jni_new_string_utf(value) };
             void* const string_oop{ string_handle
                 ? vmhook::detail::jni_decode_object(string_handle)
                 : vmhook::make_java_string(value) };
             if (!string_oop)
             {
+                vmhook::detail::jni_delete_local_ref(string_handle);
                 VMHOOK_LOG("{} return_value::set_arg(index={}): both JNI NewStringUTF and "
                            "make_java_string fallback failed - cannot inject a Java String.",
                            vmhook::error_tag, index);
                 return false;
             }
 
-            return store_oop(string_oop);
+            const bool stored{ store_oop(string_oop) };
+            vmhook::detail::jni_delete_local_ref(string_handle);
+            return stored;
         }
         else if constexpr (std::is_same_v<clean_value_type, const char*> || std::is_same_v<clean_value_type, char*>)
         {
@@ -7493,13 +7549,16 @@ namespace vmhook
                 : vmhook::make_java_string(text) };
             if (!string_oop)
             {
+                vmhook::detail::jni_delete_local_ref(string_handle);
                 VMHOOK_LOG("{} return_value::set_arg(index={}): both JNI NewStringUTF and "
                            "make_java_string fallback failed for const char* arg.",
                            vmhook::error_tag, index);
                 return false;
             }
 
-            return store_oop(string_oop);
+            const bool stored{ store_oop(string_oop) };
+            vmhook::detail::jni_delete_local_ref(string_handle);
+            return stored;
         }
         else if constexpr (std::is_trivially_copyable_v<clean_value_type> && sizeof(clean_value_type) <= sizeof(void*))
         {
@@ -8444,6 +8503,29 @@ namespace vmhook
 
             void* const oop{ *reinterpret_cast<void**>(object_handle) };
             return vmhook::hotspot::is_valid_pointer(oop) ? oop : nullptr;
+        }
+
+        /*
+            @brief Implementation of jni_delete_local_ref (declared above).
+            @details
+            JNI table slot 23 is DeleteLocalRef.  Null handles are a documented
+            JNI no-op; we mirror that contract so callers don't have to repeat
+            the null guard at every release site.
+        */
+        inline auto jni_delete_local_ref(void* const object_handle) noexcept
+            -> void
+        {
+            if (!object_handle)
+            {
+                return;
+            }
+            using delete_local_ref_t = void(*)(void*, void*);
+            delete_local_ref_t const delete_local_ref{
+                vmhook::detail::jni_function<23, delete_local_ref_t>(vmhook::hotspot::current_jni_env) };
+            if (delete_local_ref)
+            {
+                delete_local_ref(vmhook::hotspot::current_jni_env, object_handle);
+            }
         }
 
         /*
