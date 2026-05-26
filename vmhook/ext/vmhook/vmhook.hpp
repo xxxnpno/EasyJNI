@@ -297,6 +297,23 @@
     #endif
 #endif
 
+// ---------------------------------------------------------------------------
+// VMHOOK_LOG_FILE - opt-in file logging.
+//
+// Define VMHOOK_LOG_FILE before including this header (or via the build system,
+// e.g. -DVMHOOK_LOG_FILE=\"vmhook.log\") to a string literal containing the
+// path of the log file.  When set, every VMHOOK_LOG() call (errors, warnings,
+// info) is appended to that file instead of being written to std::cout.  The
+// stream is opened lazily on first use, kept open for the lifetime of the
+// process, and writes are serialised with a mutex so concurrent log lines from
+// different threads cannot interleave.  Falls back to std::cout silently if
+// the file cannot be opened.
+//
+// Example:
+//   #define VMHOOK_LOG_FILE "vmhook.log"
+//   #include <vmhook/vmhook.hpp>
+// ---------------------------------------------------------------------------
+
 namespace vmhook::detail
 {
     /*
@@ -335,6 +352,21 @@ namespace vmhook::detail
     {
         try
         {
+            static std::mutex log_mutex;
+            std::lock_guard<std::mutex> lock{ log_mutex };
+#ifdef VMHOOK_LOG_FILE
+            // Opened once on first use, kept open for the lifetime of the
+            // process.  std::ios::app means every write is positioned at EOF,
+            // so a crashed process can be re-run without truncating earlier
+            // diagnostics.
+            static std::ofstream log_file{ VMHOOK_LOG_FILE, std::ios::out | std::ios::app };
+            if (log_file.is_open())
+            {
+                log_file << line << '\n';
+                log_file.flush();
+                return;
+            }
+#endif
             std::cout << line << '\n';
             std::cout.flush();
         }
