@@ -65,8 +65,8 @@
 // code on a minimum version via `#if VMHOOK_VERSION >= VMHOOK_MAKE_VERSION(0,3,0)`.
 // ---------------------------------------------------------------------------
 #define VMHOOK_VERSION_MAJOR 0
-#define VMHOOK_VERSION_MINOR 4
-#define VMHOOK_VERSION_PATCH 4
+#define VMHOOK_VERSION_MINOR 5
+#define VMHOOK_VERSION_PATCH 0
 
 #define VMHOOK_MAKE_VERSION(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
@@ -94,6 +94,7 @@
 #include <typeindex>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <algorithm>
@@ -7677,6 +7678,13 @@ namespace vmhook
               until HotSpot repairs that call site at a safepoint.
         @see midi2i_hook, common_detour, set_dont_inline, NO_COMPILE, shutdown_hooks
     */
+    // Forward declaration of the auto-repair watchdog spawner.  hook<T>()
+    // calls this at the end of a successful install; the definition lives
+    // alongside shutdown_hooks() further down because the worker_loop body
+    // depends on verify_hooks() being defined first.  Declaring it here
+    // makes it visible to GCC's first-phase name lookup inside the template.
+    namespace detail::auto_repair { static auto ensure_started() noexcept -> void; }
+
     template<class wrapper_type>
     static auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
@@ -7960,6 +7968,11 @@ namespace vmhook
                 }
             }
 
+            // Spawn the auto-repair watchdog on first successful install
+            // so hooks keep firing even when HotSpot eventually re-JITs
+            // them despite our NO_COMPILE flag.  No-op on subsequent calls.
+            vmhook::detail::auto_repair::ensure_started();
+
             return true;
         }
         catch (const std::exception& exception)
@@ -8204,34 +8217,69 @@ namespace vmhook
                 }
 
                 // Mode 3: same Method, but JIT state drifted.
-                const void* const code_now{ hm.method->get_code() };
-                const std::uint32_t* const flags_now{ hm.method->get_access_flags() };
+                //
+                // HotSpot's tiered compiler can re-populate Method::_code
+                // long after our install-time deopt, even though we set
+                // NO_COMPILE and _dont_inline.  Triggers we have observed:
+                // another JVMTI agent enabling compilation events,
+                // safepoint cleanup clearing our flags, or the JIT racing
+                // an in-flight compilation through the policy gate before
+                // it sees NO_COMPILE.  The symptom users hit is "the hook
+                // worked, then after a while stopped firing" - interpreted
+                // callers still hit the i2i patch, but every compiled
+                // caller sails past it into the regenerated nmethod.
+                //
+                // Repair = redo exactly what the install path does: re-arm
+                // both JIT inhibitors, redirect _from_compiled_entry to
+                // the c2i adapter so compiled callers fall back through
+                // the interpreter (and therefore through our i2i patch),
+                // then clear _code last so the entry-point write is
+                // visible first.  drift_logged is used as a debounce so
+                // we log once per drift event, not once per repair pass.
+                void* const code_now{ hm.method->get_code() };
+                std::uint32_t* const flags_now{ hm.method->get_access_flags() };
                 const bool no_compile_set{ flags_now && (*flags_now & vmhook::hotspot::NO_COMPILE) != 0 };
+                const bool jit_drifted{ code_now != nullptr || !no_compile_set };
 
-                if (code_now != nullptr)
+                if (jit_drifted)
                 {
-                    VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' has Method::_code = "
-                               "0x{:016X} (was nullptr at install) - something re-JIT'd the method "
-                               "or cleared our deopt.  Hook will NOT fire for compiled callers until "
-                               "the inline cache repairs at the next safepoint.",
-                               vmhook::warning_tag,
-                               hm.expected_class_name,
-                               hm.expected_method_name,
-                               hm.expected_signature,
-                               reinterpret_cast<std::uintptr_t>(code_now));
-                    hm.drift_logged = true;
+                    if (!hm.drift_logged)
+                    {
+                        VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' JIT-state drifted "
+                                   "(Method::_code=0x{:016X}, NO_COMPILE={}) - re-applying deopt.",
+                                   vmhook::warning_tag,
+                                   hm.expected_class_name,
+                                   hm.expected_method_name,
+                                   hm.expected_signature,
+                                   reinterpret_cast<std::uintptr_t>(code_now),
+                                   no_compile_set ? "set" : "cleared");
+                        hm.drift_logged = true;
+                    }
+
+                    vmhook::hotspot::set_dont_inline(hm.method, true);
+                    if (flags_now)
+                    {
+                        *flags_now |= vmhook::hotspot::NO_COMPILE;
+                    }
+
+                    if (code_now != nullptr && vmhook::hotspot::is_valid_pointer(code_now))
+                    {
+                        void* const adapter{ hm.method->get_adapter() };
+                        void* const c2i_entry{ vmhook::hotspot::get_c2i_entry_from_adapter(adapter) };
+                        if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
+                        {
+                            hm.method->set_from_compiled_entry(c2i_entry);
+                        }
+                        hm.method->set_code(nullptr);
+                    }
+
+                    ++repaired;
                 }
-                else if (!no_compile_set)
+                else
                 {
-                    VMHOOK_LOG("{} verify_hooks: hook for '{}.{}{}' no longer has NO_COMPILE set - "
-                               "something cleared the JIT-inhibitor flag we installed.  Currently "
-                               "un-compiled (_code == nullptr) so the hook still fires, but the JIT "
-                               "may recompile it at any moment.",
-                               vmhook::warning_tag,
-                               hm.expected_class_name,
-                               hm.expected_method_name,
-                               hm.expected_signature);
-                    hm.drift_logged = true;
+                    // Clean steady state.  Reset debounce so the next
+                    // drift event is logged again.
+                    hm.drift_logged = false;
                 }
             }
         }
@@ -8242,6 +8290,118 @@ namespace vmhook
         return repaired;
     }
 
+    // -------------------------------------------------------------------
+    // Auto-repair watchdog.
+    //
+    // Spawned on the first successful hook<T>() call (idempotent across
+    // TUs via g_started CAS).  Periodically calls verify_hooks() to
+    // repair JIT-state drift before users notice their hooks have
+    // silently stopped firing.  Without this, HotSpot's tiered compiler
+    // eventually re-populates Method::_code on every hot hooked method,
+    // and compiled callers sail past our i2i patch into the regenerated
+    // nmethod - "everything worked, then after an hour it stopped".
+    //
+    // Controls:
+    //   VMHOOK_DISABLE_AUTO_REPAIR        — define to opt out entirely.
+    //   VMHOOK_AUTO_REPAIR_INTERVAL_MS    — repair-pass interval (default 1000ms).
+    //
+    // Lifetime: the thread is detached after spawning so the std::thread
+    // destructor never calls terminate() at program exit even if the
+    // user forgets to call shutdown_hooks().  shutdown_hooks() raises
+    // g_shutdown_requested and notifies the cv before taking the install
+    // mutex; the watchdog observes the flag at its next wake (within
+    // VMHOOK_AUTO_REPAIR_INTERVAL_MS) and returns.
+    // -------------------------------------------------------------------
+    namespace detail::auto_repair
+    {
+        inline std::atomic<bool>        g_started{ false };
+        inline std::mutex               g_cv_mutex{};
+        inline std::condition_variable  g_cv{};
+
+        static auto worker_loop() noexcept -> void
+        {
+            constexpr auto interval{ std::chrono::milliseconds{
+#ifdef VMHOOK_AUTO_REPAIR_INTERVAL_MS
+                VMHOOK_AUTO_REPAIR_INTERVAL_MS
+#else
+                1000
+#endif
+            } };
+
+            for (;;)
+            {
+                {
+                    std::unique_lock<std::mutex> lk{ g_cv_mutex };
+                    g_cv.wait_for(lk, interval, []() noexcept
+                    {
+                        return vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire);
+                    });
+                }
+                if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire))
+                {
+                    return;
+                }
+                try
+                {
+                    (void)vmhook::verify_hooks();
+                }
+                catch (...)
+                {
+                    // verify_hooks already swallows internally; this is belt-and-braces.
+                }
+            }
+        }
+
+        static auto ensure_started() noexcept -> void
+        {
+#ifndef VMHOOK_DISABLE_AUTO_REPAIR
+            bool expected{ false };
+            if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+            {
+                return;
+            }
+            if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire))
+            {
+                // Library has already been torn down; do not resurrect.
+                return;
+            }
+            try
+            {
+                std::thread worker{ &vmhook::detail::auto_repair::worker_loop };
+                worker.detach();
+            }
+            catch (...)
+            {
+                // std::thread can throw on resource exhaustion.  Roll the
+                // started flag back so a later install call may retry.
+                g_started.store(false, std::memory_order_release);
+            }
+#endif
+        }
+
+        static auto notify_shutdown() noexcept -> void
+        {
+#ifndef VMHOOK_DISABLE_AUTO_REPAIR
+            try
+            {
+                // Take-and-release the cv mutex so the watchdog's wait
+                // cannot miss our notify_all - any thread that is about
+                // to call wait_for will observe shutdown_requested in the
+                // predicate after we release.
+                {
+                    std::lock_guard<std::mutex> lk{ g_cv_mutex };
+                }
+                g_cv.notify_all();
+            }
+            catch (...)
+            {
+                // Best-effort wakeup; thread will also exit at its next
+                // wait_for() timeout if the notify is lost.
+            }
+#endif
+        }
+    }
+
     static auto shutdown_hooks() noexcept
         -> void
     {
@@ -8250,6 +8410,13 @@ namespace vmhook
         // observes the flag and returns immediately - so we won't iterate
         // g_hooked_methods while it's being cleared further down.
         vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
+
+        // Wake the auto-repair watchdog so it observes the shutdown flag
+        // immediately instead of waiting out its next interval.  Done
+        // before we take the install mutex - the watchdog also acquires
+        // that mutex inside verify_hooks(), so notifying first avoids a
+        // brief lock-held wait.
+        vmhook::detail::auto_repair::notify_shutdown();
 
         // Lock for the whole tear-down so no in-flight vmhook::hook<T>() call
         // can push a new entry between our trampoline-delete loop and our
