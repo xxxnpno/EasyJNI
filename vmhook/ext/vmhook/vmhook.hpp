@@ -66,7 +66,7 @@
 // ---------------------------------------------------------------------------
 #define VMHOOK_VERSION_MAJOR 0
 #define VMHOOK_VERSION_MINOR 5
-#define VMHOOK_VERSION_PATCH 1
+#define VMHOOK_VERSION_PATCH 2
 
 #define VMHOOK_MAKE_VERSION(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
@@ -5017,8 +5017,39 @@ namespace vmhook
             auto get_arguments() const noexcept
                 -> std::tuple<types...>
             {
-                std::int32_t index{ 0 };
-                return std::tuple<types...>{ this->get_argument<types>(index++)... };
+                if constexpr (sizeof...(types) == 0)
+                {
+                    return std::tuple<>{};
+                }
+                else
+                {
+                    // A Java long/double occupies TWO interpreter local slots;
+                    // everything else (int/float/short/…, object references,
+                    // unique_ptr wrappers, strings) occupies one.  Each arg's slot
+                    // index is the running sum of prior widths, NOT the tuple index
+                    // — reading by tuple index made every arg AFTER a long/double
+                    // come from the wrong slot (audit hook_arg_decoding_primitives
+                    // [HIGH]).  The modern detail::extract_frame_arg path already
+                    // widens via detail::java_slot_offsets; this mirrors it for the
+                    // public frame::get_arguments<...>() accessor.  (Defined inline
+                    // because java_slot_offsets/is_java_double_slot_v live further
+                    // down the header; the predicate matches is_java_double_slot_v.)
+                    constexpr bool wide[]{
+                        (std::is_same_v<std::remove_cvref_t<types>, std::int64_t>
+                      || std::is_same_v<std::remove_cvref_t<types>, std::uint64_t>
+                      || std::is_same_v<std::remove_cvref_t<types>, double>)... };
+                    std::array<std::int32_t, sizeof...(types)> slots{};
+                    std::int32_t acc{ 0 };
+                    for (std::size_t i{ 0 }; i < sizeof...(types); ++i)
+                    {
+                        slots[i] = acc;
+                        acc += wide[i] ? 2 : 1;
+                    }
+                    return [this, &slots]<std::size_t... I>(std::index_sequence<I...>)
+                    {
+                        return std::tuple<types...>{ this->get_argument<types>(slots[I])... };
+                    }(std::index_sequence_for<types...>{});
+                }
             }
 
             /*
@@ -5160,6 +5191,19 @@ namespace vmhook
             auto get_argument(const std::int32_t index) const noexcept
                 -> argument_type
             {
+                // Bounds-guard the slot index exactly as return_value::set_arg
+                // does (JVM max_locals is a u2).  A negative index makes -index a
+                // huge positive offset and any index past max_locals walks off the
+                // interpreter local-variable array into adjacent thread state —
+                // an out-of-range read returns operand-stack / saved-register
+                // garbage that silently corrupts the user's decoded arg rather
+                // than failing cleanly (audit hook_arg_decoding_primitives [HIGH]).
+                constexpr std::int32_t max_jvm_locals{ 0xFFFF };
+                if (index < 0 || index > max_jvm_locals)
+                {
+                    return argument_type{};
+                }
+
                 void** const locals{ this->get_locals() };
                 if (!locals)
                 {
@@ -7340,6 +7384,17 @@ namespace vmhook
             -> std::remove_cvref_t<value_type>
         {
             using base_t = std::remove_cvref_t<value_type>;
+
+            // Bounds-guard the slot index (JVM max_locals is a u2): a negative or
+            // past-max_locals index turns locals[-index] into an out-of-range read
+            // of adjacent thread state.  Today the index comes from the compile-time
+            // java_slot_offsets table, but the signature is public and frame->
+            // get_argument shares the hazard (audit hook_arg_decoding_primitives).
+            constexpr std::int32_t max_jvm_locals{ 0xFFFF };
+            if (index < 0 || index > max_jvm_locals)
+            {
+                return base_t{};
+            }
 
             void** const locals{ frame->get_locals() };
             if (!locals)
