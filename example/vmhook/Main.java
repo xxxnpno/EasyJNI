@@ -38,6 +38,11 @@ public class Main
         // LateClass is deliberately NOT loaded here — the class-load probe
         // triggers it later so the C++ on_class_loaded watcher observes it.
 
+        // Modular harness: load every vmhook.fixtures.* class so its static
+        // initializer registers its Harness.Probe.  Conflict-free — each
+        // feature drops one fixture class and it is discovered here.
+        loadFixtures();
+
         // we let vmhook.dll do its things in the jvm
         // vmhook has to get_field("stopJVM")->set(true) to stop the JVM
         while(!stopJVM)
@@ -263,6 +268,9 @@ public class Main
                 },
                 () -> Example.edgeProbeDone = true);
 
+            // Modular harness: run any pending feature-fixture probe.
+            Harness.tickAll();
+
             Thread.sleep(1);
         }
 
@@ -287,5 +295,48 @@ public class Main
 
         action.run();
         markDone.run();
+    }
+
+    /**
+     * Discover and load every compiled vmhook.fixtures.* class so its static
+     * initializer registers its Harness.Probe.  Scans each classpath directory
+     * entry for a vmhook/fixtures sub-directory and Class.forName's each
+     * top-level .class file there.  Robust to the classpath being any directory
+     * (CI uses "out"; local runs use a temp dir).
+     */
+    private static void loadFixtures()
+    {
+        final String classpath = System.getProperty("java.class.path", "");
+        int loaded = 0;
+        for (final String entry : classpath.split(java.io.File.pathSeparator))
+        {
+            final java.io.File dir = new java.io.File(entry, "vmhook/fixtures");
+            if (!dir.isDirectory())
+            {
+                continue;
+            }
+            final java.io.File[] files = dir.listFiles(
+                (d, name) -> name.endsWith(".class") && !name.contains("$"));
+            if (files == null)
+            {
+                continue;
+            }
+            for (final java.io.File file : files)
+            {
+                final String simple = file.getName().substring(0, file.getName().length() - ".class".length());
+                final String fqcn = "vmhook.fixtures." + simple;
+                try
+                {
+                    Class.forName(fqcn);
+                    System.out.println("[INFO] loaded fixture " + fqcn);
+                    loaded++;
+                }
+                catch (final Throwable t)
+                {
+                    System.err.println("[WARN] fixture load failed " + fqcn + ": " + t);
+                }
+            }
+        }
+        System.out.println("[INFO] loaded " + loaded + " fixture(s).");
     }
 }

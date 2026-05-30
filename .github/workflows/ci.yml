@@ -227,7 +227,7 @@ jobs:
         shell: cmd
         run: |
           mkdir out 2>nul || ver >nul
-          javac -d out example\vmhook\*.java
+          javac -d out example\vmhook\*.java example\vmhook\fixtures\*.java
 
       - name: Run injection-based integration test
         shell: pwsh
@@ -317,7 +317,7 @@ jobs:
       - name: Compile Java fixtures
         run: |
           mkdir -p out
-          javac -d out example/vmhook/*.java
+          javac -d out example/vmhook/*.java example/vmhook/fixtures/*.java
 
       - name: Run JNI integration test
         env:
@@ -389,7 +389,7 @@ jobs:
       - name: Compile Java fixtures
         run: |
           mkdir -p out
-          javac -d out example/vmhook/*.java
+          javac -d out example/vmhook/*.java example/vmhook/fixtures/*.java
 
       - name: Run JNI integration test (best-effort)
         run: |

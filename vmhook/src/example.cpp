@@ -9,6 +9,10 @@
 extern "C" auto run_vmhook_vs_jni_speedtest() -> void;
 #endif
 
+// Modular JVM test harness: per-feature test modules under tests/jvm/modules/
+// self-register and are run by run_test_suite() once the JVM is live.
+#include "../../tests/jvm/harness.hpp"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -3184,6 +3188,26 @@ static auto run_test_suite() -> void
         test_caller_info();
         test_field_watcher();
         test_class_load_watcher();
+
+        // ── Modular per-feature JVM test modules ─────────────────────
+        // Every tests/jvm/modules/*.cpp self-registers and runs here against
+        // the live JVM, recording into the same test_results.txt.  This is the
+        // authoritative, JVM-based unit-test surface; the monolithic tests
+        // above are being decomposed into modules.
+        {
+            vmhook_test::context ctx{};
+            ctx.check  = [](const std::string& name, bool ok) { check(name, ok); };
+            ctx.record = [](const std::string& line) { write_result(line); };
+            ctx.run_probe = [](std::function<void(bool)> set_go,
+                               std::function<bool()>     get_done) -> bool
+            {
+                return run_java_probe(
+                    [&](bool value) { set_go(value); },
+                    [&]() { return get_done(); });
+            };
+            const std::size_t modules_ran{ vmhook_test::run_all(ctx) };
+            write_result("[INFO] ran " + std::to_string(modules_ran) + " modular JVM test module(s).");
+        }
 
         // ── vmhook vs pure JNI microbench ────────────────────────────
         // Lives in a separate translation unit (speedtest.cpp) so the

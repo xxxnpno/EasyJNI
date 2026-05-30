@@ -144,6 +144,15 @@ endfunction()
 if(VMHOOK_BUILD_EXAMPLE)
     set(_vmhook_example_sources vmhook/src/example.cpp)
 
+    # Modular JVM test harness: the registry implementation plus every
+    # self-registering per-feature module under tests/jvm/modules/.  Each module
+    # is one feature's exhaustive JVM tests; CONFIGURE_DEPENDS re-globs when a
+    # new module file is added so authors never edit this list.
+    list(APPEND _vmhook_example_sources tests/jvm/harness.cpp)
+    file(GLOB _vmhook_jvm_modules CONFIGURE_DEPENDS
+         "${CMAKE_CURRENT_SOURCE_DIR}/tests/jvm/modules/*.cpp")
+    list(APPEND _vmhook_example_sources ${_vmhook_jvm_modules})
+
     # Optional JNI-side speed test.  Only built when the JDK include
     # path is locatable, since pure-JNI calls require <jni.h> — vmhook
     # itself stays JNI-header-free, the bench is in a separate TU.
