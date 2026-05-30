@@ -29,7 +29,7 @@
 // must be CONSTRUCTIBLE FROM vmhook::oop_t (== void*).  A plain `int` is NOT
 // (std::make_unique<int>(void*) does not compile), so the task's literal
 // `to_vector<int>()` / `to_entries<int,int>()` cannot build.  We therefore use
-// minimal oop-constructible wrapper tags (elem_t / key_t / val_t) — the exact
+// minimal oop-constructible wrapper tags (elem_w / key_w / val_w) — the exact
 // pattern tests/test_api_surface.cpp uses — which faithfully exercises the same
 // documented empty/never-throw behaviour.
 #include <vmhook/vmhook.hpp>
@@ -54,29 +54,29 @@ static auto check(const char* name, bool ok) -> void
 // and to_entries<K,V>() require E/K/V to be constructible from vmhook::oop_t;
 // these are the smallest types that satisfy that contract.
 // ---------------------------------------------------------------------------
-class elem_t : public vmhook::object<elem_t>
+class elem_w : public vmhook::object<elem_w>
 {
 public:
-    explicit elem_t(vmhook::oop_t oop) noexcept
-        : vmhook::object<elem_t>{ oop }
+    explicit elem_w(vmhook::oop_t oop) noexcept
+        : vmhook::object<elem_w>{ oop }
     {
     }
 };
 
-class key_t : public vmhook::object<key_t>
+class key_w : public vmhook::object<key_w>
 {
 public:
-    explicit key_t(vmhook::oop_t oop) noexcept
-        : vmhook::object<key_t>{ oop }
+    explicit key_w(vmhook::oop_t oop) noexcept
+        : vmhook::object<key_w>{ oop }
     {
     }
 };
 
-class val_t : public vmhook::object<val_t>
+class val_w : public vmhook::object<val_w>
 {
 public:
-    explicit val_t(vmhook::oop_t oop) noexcept
-        : vmhook::object<val_t>{ oop }
+    explicit val_w(vmhook::oop_t oop) noexcept
+        : vmhook::object<val_w>{ oop }
     {
     }
 };
@@ -192,10 +192,10 @@ static auto test_to_vector_empty_no_jvm() -> void
     vmhook::set         s{ nullptr };
     vmhook::linked_list ll{ nullptr };
 
-    const auto vc{ c.to_vector<elem_t>() };
-    const auto vl{ l.to_vector<elem_t>() };
-    const auto vs{ s.to_vector<elem_t>() };
-    const auto vll{ ll.to_vector<elem_t>() };
+    const auto vc{ c.to_vector<elem_w>() };
+    const auto vl{ l.to_vector<elem_w>() };
+    const auto vs{ s.to_vector<elem_w>() };
+    const auto vll{ ll.to_vector<elem_w>() };
 
     check("collection_to_vector_empty",  vc.empty());
     check("collection_to_vector_size0",  vc.size() == 0);
@@ -215,8 +215,8 @@ static auto test_to_entries_empty_no_jvm() -> void
     vmhook::map      m{ nullptr };
     vmhook::hash_map hm{ nullptr };
 
-    const auto em{ m.to_entries<key_t, val_t>() };
-    const auto ehm{ hm.to_entries<key_t, val_t>() };
+    const auto em{ m.to_entries<key_w, val_w>() };
+    const auto ehm{ hm.to_entries<key_w, val_w>() };
 
     check("map_to_entries_empty",      em.empty());
     check("map_to_entries_size0",      em.size() == 0);
@@ -237,8 +237,8 @@ static auto test_default_value_t_empty() -> void
 {
     vmhook::field_proxy::value_t v{};
 
-    const auto vec{ v.to_vector<elem_t>() };
-    const auto entries{ v.to_entries<key_t, val_t>() };
+    const auto vec{ v.to_vector<elem_w>() };
+    const auto entries{ v.to_entries<key_w, val_w>() };
 
     check("default_value_t_to_vector_empty",   vec.empty());
     check("default_value_t_to_vector_size0",   vec.size() == 0);
@@ -249,9 +249,9 @@ static auto test_default_value_t_empty() -> void
     // alternative is still absent/zero, so both delegators return empty.
     vmhook::field_proxy::value_t v_sig{ std::uint32_t{ 0 }, std::string{ "Ljava/util/List;" } };
     check("value_t_zero_oop_to_vector_empty",
-          v_sig.to_vector<elem_t>().empty());
+          v_sig.to_vector<elem_w>().empty());
     check("value_t_zero_oop_to_entries_empty",
-          v_sig.to_entries<key_t, val_t>().empty());
+          v_sig.to_entries<key_w, val_w>().empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -267,8 +267,8 @@ static auto test_value_t_via_field_proxy_empty() -> void
     vmhook::field_proxy list_field{ nullptr, "Ljava/util/List;", false };
     vmhook::field_proxy map_field{ nullptr, "Ljava/util/Map;", false };
 
-    const auto vec{ list_field.get().to_vector<elem_t>() };
-    const auto entries{ map_field.get().to_entries<key_t, val_t>() };
+    const auto vec{ list_field.get().to_vector<elem_w>() };
+    const auto entries{ map_field.get().to_entries<key_w, val_w>() };
 
     check("proxy_list_to_vector_empty",  vec.empty());
     check("proxy_list_to_vector_size0",  vec.size() == 0);
@@ -278,17 +278,17 @@ static auto test_value_t_via_field_proxy_empty() -> void
     // Same proxy, cross-shaped call: to_entries on a List-typed proxy and
     // to_vector on a Map-typed proxy still return empty (null OOP dominates).
     check("proxy_list_to_entries_empty",
-          list_field.get().to_entries<key_t, val_t>().empty());
+          list_field.get().to_entries<key_w, val_w>().empty());
     check("proxy_map_to_vector_empty",
-          map_field.get().to_vector<elem_t>().empty());
+          map_field.get().to_vector<elem_w>().empty());
 }
 
 int main()
 {
     // Registering the element wrappers mirrors real usage; harmless with no JVM.
-    vmhook::register_class<elem_t>("test/Element");
-    vmhook::register_class<key_t>("test/Key");
-    vmhook::register_class<val_t>("test/Value");
+    vmhook::register_class<elem_w>("test/Element");
+    vmhook::register_class<key_w>("test/Key");
+    vmhook::register_class<val_w>("test/Value");
 
     test_type_tags_are_distinct();
     test_inheritance_lattice();
