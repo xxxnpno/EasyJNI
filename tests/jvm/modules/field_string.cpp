@@ -240,39 +240,43 @@ VMHOOK_JVM_MODULE(field_string)
     ctx.check("get_ascii_direct_equals_proxy",
               field_string_fixture::read_static_direct("getAscii") == ascii);
 
-    // --- Latin-1 (cp <= 0xFF): read_java_string assigns RAW bytes (NOT UTF-8). ---
-    // "héllo èéÿ" -> bytes {68 E9 6C 6C 6F 20 E8 E9 FF}, length 9.
+    // --- Latin-1 (cp <= 0xFF): read_java_string now UTF-8-encodes each code
+    // point (0xE9 'é' -> C3 A9), so the result is valid UTF-8 (NOT raw bytes). ---
+    // "héllo èéÿ" -> UTF-8 {68 C3A9 6C 6C 6F 20 C3A8 C3A9 C3BF}, length 13.
     const std::string latin1{ field_string_fixture::read_static("getLatin1") };
-    ctx.record(std::string{ "[INFO] getLatin1 raw bytes: " } + hex_bytes(latin1));
-    ctx.check("get_latin1_len_9", latin1.size() == 9);
+    ctx.record(std::string{ "[INFO] getLatin1 UTF-8 bytes: " } + hex_bytes(latin1));
+    ctx.check("get_latin1_utf8_len_13", latin1.size() == 13);
     ctx.check("get_latin1_byte0_h", static_cast<unsigned char>(latin1[0]) == 0x68);
-    ctx.check("get_latin1_byte1_is_E9_raw_latin1",
-              latin1.size() == 9 && static_cast<unsigned char>(latin1[1]) == 0xE9);
-    ctx.check("get_latin1_byte8_is_FF_raw_latin1",
-              latin1.size() == 9 && static_cast<unsigned char>(latin1[8]) == 0xFF);
-    // The Latin-1 byte 0xE9 is NOT the UTF-8 encoding of 'é' (which is C3 A9):
-    // this documents that read_java_string returns raw single bytes on coder 0.
-    ctx.check("get_latin1_not_utf8_for_e_acute",
-              !(latin1.size() >= 3 && static_cast<unsigned char>(latin1[1]) == 0xC3
-                                   && static_cast<unsigned char>(latin1[2]) == 0xA9));
+    // 'é' is now the correct 2-byte UTF-8 sequence C3 A9, not the raw Latin-1 0xE9.
+    ctx.check("get_latin1_e_acute_is_utf8_C3A9",
+              latin1.size() == 13 && static_cast<unsigned char>(latin1[1]) == 0xC3
+                                  && static_cast<unsigned char>(latin1[2]) == 0xA9);
+    // 'ÿ' (U+00FF) is the final code point -> trailing UTF-8 C3 BF.
+    ctx.check("get_latin1_y_diaeresis_is_utf8_C3BF",
+              latin1.size() == 13 && static_cast<unsigned char>(latin1[11]) == 0xC3
+                                  && static_cast<unsigned char>(latin1[12]) == 0xBF);
+    ctx.check("get_latin1_equals_expected_utf8",
+              latin1 == std::string{ "\x68\xC3\xA9\x6C\x6C\x6F\x20\xC3\xA8\xC3\xA9\xC3\xBF" });
     ctx.check("get_latin1_direct_equals_proxy",
               field_string_fixture::read_static_direct("getLatin1") == latin1);
 
-    // --- CJK / supplementary (UTF-16 coder 1): the lossy '?'-substitution bug. ---
-    // "日本語" (3 code units, all >= 0x80) -> "???".
+    // --- CJK (UTF-16 coder 1): read_java_string now emits correct UTF-8. ---
+    // "日本語" (3 code points) -> UTF-8 {E6 97 A5  E6 9C AC  E8 AA 9E}, length 9.
     const std::string cjk{ field_string_fixture::read_static("getCjk") };
     ctx.record(std::string{ "[INFO] getCjk decoded: '" } + cjk + "' bytes: " + hex_bytes(cjk));
-    ctx.check("get_cjk_is_three_question_marks_BUG", cjk == "???");
-    ctx.check("get_cjk_len_3", cjk.size() == 3);
+    ctx.check("get_cjk_is_utf8_three_kanji",
+              cjk == std::string{ "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E" });
+    ctx.check("get_cjk_utf8_len_9", cjk.size() == 9);
     ctx.check("get_cjk_direct_equals_proxy",
               field_string_fixture::read_static_direct("getCjk") == cjk);
 
-    // --- Mixed ASCII + >0xFF char: whole string promoted to UTF-16 coder 1. ---
-    // "A日BéC": A->A, 日->?, B->B, é->? (é<0x80? no, é=0xE9>=0x80 -> ?), C->C => "A?B?C".
+    // --- Mixed ASCII + >0xFF char (UTF-16 coder 1): correct UTF-8 throughout. ---
+    // "A日BéC" -> UTF-8 {41  E6 97 A5  42  C3 A9  43}, length 8.
     const std::string mixed{ field_string_fixture::read_static("getMixed") };
     ctx.record(std::string{ "[INFO] getMixed decoded: '" } + mixed + "'");
-    ctx.check("get_mixed_ascii_preserved_nonascii_q_BUG", mixed == "A?B?C");
-    ctx.check("get_mixed_len_5", mixed.size() == 5);
+    ctx.check("get_mixed_is_utf8_A_kanji_B_eacute_C",
+              mixed == std::string{ "A\xE6\x97\xA5" "B\xC3\xA9" "C" });
+    ctx.check("get_mixed_utf8_len_8", mixed.size() == 8);
 
     // --- Empty string: length<=0 guard -> "". ---
     ctx.check("get_empty_is_empty", field_string_fixture::read_static("getEmpty").empty());
@@ -310,12 +314,20 @@ VMHOOK_JVM_MODULE(field_string)
     ctx.check("get_len5000_rejected_empty_BUG",
               field_string_fixture::read_static("getLen5000").empty());
 
-    // --- 2048 CJK chars: UTF-16 byte length 4096 -> passes cap; all '?'. ---
-    // (Demonstrates the UTF-16 effective cap is 2048 *chars*, half of 4096.)
+    // --- 2048 CJK chars (日): UTF-16 byte[] length 4096 -> passes the cap, then
+    // decodes to correct UTF-8 — each 日 (U+65E5) is 3 bytes E6 97 A5, so the
+    // result is 2048 * 3 = 6144 bytes.  (The UTF-16 char cap is 2048, half of the
+    // 4096-byte array-length ceiling.) ---
     const std::string cjk2048{ field_string_fixture::read_static("getCjk2048") };
-    ctx.check("get_cjk2048_passes_cap_2048_chars", cjk2048.size() == 2048);
-    ctx.check("get_cjk2048_all_question_marks",
-              cjk2048.size() == 2048 && cjk2048.front() == '?' && cjk2048.back() == '?');
+    ctx.check("get_cjk2048_utf8_len_6144", cjk2048.size() == 2048u * 3u);
+    ctx.check("get_cjk2048_first_and_last_kanji",
+              cjk2048.size() == 6144
+              && static_cast<unsigned char>(cjk2048[0]) == 0xE6
+              && static_cast<unsigned char>(cjk2048[1]) == 0x97
+              && static_cast<unsigned char>(cjk2048[2]) == 0xA5
+              && static_cast<unsigned char>(cjk2048[6141]) == 0xE6
+              && static_cast<unsigned char>(cjk2048[6142]) == 0x97
+              && static_cast<unsigned char>(cjk2048[6143]) == 0xA5);
 
     // --- 2049 CJK chars: UTF-16 byte length 4098 > 4096 -> REJECTED -> "". ---
     ctx.check("get_cjk2049_rejected_empty_utf16_cap_2048_BUG",

@@ -16496,7 +16496,22 @@ namespace vmhook
             */
             auto oop() const noexcept -> vmhook::oop_t
             {
-                return this->handle_ ? *reinterpret_cast<void**>(this->handle_) : nullptr;
+                if (!this->handle_)
+                {
+                    return nullptr;
+                }
+                // HotSpot tags JNI handles in the low bits (JDK 9+: a small type
+                // tag distinguishing local / global / weak-global; the underlying
+                // OopStorage slot is 8-byte aligned).  A NewGlobalRef handle on a
+                // modern JDK therefore is NOT directly dereferenceable — its low
+                // bits hold the tag, so `*(void**)handle` reads a MISaligned,
+                // garbage oop.  Masking the low 3 bits recovers the real slot
+                // address.  This is a no-op on JDK 8 (untagged, already-aligned
+                // handles), which is why the raw deref worked there but returned
+                // garbage on the CI's JDK 11-25.
+                const std::uintptr_t slot{
+                    reinterpret_cast<std::uintptr_t>(this->handle_) & ~std::uintptr_t{ 0b111 } };
+                return *reinterpret_cast<void**>(slot);
             }
 
             /*
