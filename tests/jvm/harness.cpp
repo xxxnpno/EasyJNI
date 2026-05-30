@@ -68,6 +68,14 @@ namespace vmhook_test
                     ctx.check(std::string{ "module_" } + module_entry.name + "_no_throw", false);
                 }
             }
+            // Paired with the "=== module: X ===" line above: with per-line
+            // flushing in the driver, if a module crashes the JVM (SEH, not a
+            // C++ throw we can catch) the results file ends at its "=== module:
+            // X ===" with no matching "--- done ---", naming the culprit.
+            if (ctx.record)
+            {
+                ctx.record(std::string{ "[INFO] --- module " } + module_entry.name + " done ---");
+            }
             ++ran;
         }
         return ran;

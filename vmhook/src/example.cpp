@@ -1458,7 +1458,14 @@ namespace
     {
         if (test_log.is_open())
         {
+            // Flush every line: a JVM-crashing test (a wild OOP deref, a bad
+            // hook) takes the whole process down, and a buffered ofstream loses
+            // everything written-but-not-flushed — leaving an EMPTY results
+            // file with no clue WHERE it died.  Flushing per line means the
+            // file always reflects progress up to the crash, so the last line
+            // names the module/check that was running.
             test_log << line << '\n';
+            test_log.flush();
         }
     }
 

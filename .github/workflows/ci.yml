@@ -287,6 +287,19 @@ jobs:
             Write-Error "$($fail.Count) FAIL line(s) in test_results.txt"
             exit 1
           }
+          # The suite writes a "TOTAL: x/y PASSED" line ONLY after running to
+          # completion.  Its absence means the JVM crashed mid-suite (a wild
+          # OOP, a bad hook) and the buffered-but-flushed results stop at the
+          # crash point — which is a failure, not a vacuous "0 FAIL = pass".
+          # The last "=== module: X ===" without a matching "--- done ---"
+          # names the module that took the JVM down.
+          $total = @($results | Where-Object { $_ -match '^TOTAL:' })
+          if ($total.Count -eq 0) {
+            $lastModule = @($results | Where-Object { $_ -match '=== module:' }) | Select-Object -Last 1
+            Write-Host "::error::test suite did not run to completion (no TOTAL line) — JVM likely crashed. Last module entered: $lastModule"
+            Write-Error "incomplete suite: $($pass.Count) PASS recorded before the JVM died"
+            exit 1
+          }
           if ($java.ExitCode -ne 0) {
             Write-Host "::warning::java.exe exit=$($java.ExitCode) on the way out, but all tests in test_results.txt passed"
           }
