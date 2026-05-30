@@ -5191,8 +5191,21 @@ namespace vmhook
                 }
                 else if constexpr (sizeof(argument_type) <= sizeof(void*))
                 {
+                    // Two-word primitives (long/double, 8 bytes) span local slots
+                    // [index] and [index+1].  HotSpot's interpreter stores the
+                    // 64-bit value at the LOWER address — locals[-(index+1)] — per
+                    // LOCALS_LONG / LOCALS_DOUBLE in bytecodeInterpreter.hpp.
+                    // One-word primitives (int/float/short/char/byte/boolean, ≤4
+                    // bytes) live directly at locals[-index] (== raw_value).
+                    // Reading locals[-index] for a long/double picks up the wrong
+                    // slot and yields a garbage / halves-swapped value.
+                    void* slot_value{ raw_value };
+                    if constexpr (sizeof(argument_type) > sizeof(std::int32_t))
+                    {
+                        slot_value = locals[-(index + 1)];
+                    }
                     argument_type result{};
-                    std::memcpy(&result, &raw_value, sizeof(argument_type));
+                    std::memcpy(&result, &slot_value, sizeof(argument_type));
                     return result;
                 }
                 else
@@ -7383,8 +7396,17 @@ namespace vmhook
             }
             else if constexpr (sizeof(base_t) <= sizeof(void*))
             {
+                // Two-word primitives (long/double, 8 bytes) span local slots
+                // [index] and [index+1]; HotSpot stores the 64-bit value at the
+                // lower slot locals[-(index+1)] (LOCALS_LONG / LOCALS_DOUBLE).
+                // One-word primitives (≤4 bytes) live at locals[-index] (raw_value).
+                void* slot_value{ raw_value };
+                if constexpr (sizeof(base_t) > sizeof(std::int32_t))
+                {
+                    slot_value = locals[-(index + 1)];
+                }
                 base_t result{};
-                std::memcpy(&result, &raw_value, sizeof(base_t));
+                std::memcpy(&result, &slot_value, sizeof(base_t));
                 return result;
             }
             else
@@ -7767,7 +7789,18 @@ namespace vmhook
         {
             void* raw{};
             std::memcpy(&raw, &value, sizeof(clean_value_type));
-            locals[-index] = raw;
+            // Two-word primitives (long/double, 8 bytes) span local slots [index]
+            // and [index+1]; the interpreter reads the 64-bit value from the lower
+            // slot locals[-(index+1)] (LOCALS_LONG / LOCALS_DOUBLE), so a long/double
+            // arg injection must land there.  One-word primitives go to locals[-index].
+            if constexpr (sizeof(clean_value_type) > sizeof(std::int32_t))
+            {
+                locals[-(index + 1)] = raw;
+            }
+            else
+            {
+                locals[-index] = raw;
+            }
             return true;
         }
         else
@@ -11133,38 +11166,126 @@ namespace vmhook
         }
 
         const bool compact_string{ string_klass->find_field("coder").has_value() };
-        const std::int32_t length{ static_cast<std::int32_t>(std::min<std::size_t>(value.size(), 4096u)) };
 
-        if (compact_string)
+        // Decode the UTF-8 input into UTF-16 code units (astral code points
+        // become a surrogate pair).  The previous implementation copied the raw
+        // UTF-8 BYTES straight into a LATIN1 byte[] / char[], which conflated
+        // byte count with char count and corrupted every non-ASCII string —
+        // e.g. "é" (0xC3 0xA9) turned into the two chars U+00C3 U+00A9.
+        std::vector<std::uint16_t> units;
+        units.reserve(value.size());
+        for (std::size_t i{ 0 }; i < value.size(); )
         {
-            void* const value_array{ vmhook::make_java_array("[B", length, sizeof(std::uint8_t)) };
+            const std::uint8_t b0{ static_cast<std::uint8_t>(value[i]) };
+            std::uint32_t cp{ 0xFFFDu }; // U+FFFD replacement for malformed input
+            std::size_t adv{ 1 };
+            if (b0 < 0x80u)
+            {
+                cp = b0;
+            }
+            else if ((b0 & 0xE0u) == 0xC0u && (i + 1) < value.size())
+            {
+                cp = ((b0 & 0x1Fu) << 6)
+                   |  (static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu);
+                adv = 2;
+            }
+            else if ((b0 & 0xF0u) == 0xE0u && (i + 2) < value.size())
+            {
+                cp = ((b0 & 0x0Fu) << 12)
+                   | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 6)
+                   |  (static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu);
+                adv = 3;
+            }
+            else if ((b0 & 0xF8u) == 0xF0u && (i + 3) < value.size())
+            {
+                cp = ((b0 & 0x07u) << 18)
+                   | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 12)
+                   | ((static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu) << 6)
+                   |  (static_cast<std::uint8_t>(value[i + 3]) & 0x3Fu);
+                adv = 4;
+            }
+
+            if (cp >= 0x10000u)
+            {
+                cp -= 0x10000u;
+                units.push_back(static_cast<std::uint16_t>(0xD800u + (cp >> 10)));
+                units.push_back(static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu)));
+            }
+            else
+            {
+                units.push_back(static_cast<std::uint16_t>(cp));
+            }
+            i += adv;
+        }
+
+        // Bound the char count to the same 4096 ceiling read_java_string enforces.
+        if (units.size() > 4096u)
+        {
+            units.resize(4096u);
+        }
+        const std::int32_t char_count{ static_cast<std::int32_t>(units.size()) };
+
+        // A compact (JDK 9+) String may use the LATIN1 coder only when every
+        // code unit fits in one byte; otherwise it must use the UTF16 coder.
+        bool all_latin1{ true };
+        for (const std::uint16_t unit : units)
+        {
+            if (unit > 0xFFu) { all_latin1 = false; break; }
+        }
+
+        if (compact_string && all_latin1)
+        {
+            void* const value_array{ vmhook::make_java_array("[B", char_count, sizeof(std::uint8_t)) };
             if (!value_array)
             {
                 VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
-                           "array (compact string path, length={}).",
-                           vmhook::error_tag, length);
+                           "array (compact LATIN1 path, chars={}).",
+                           vmhook::error_tag, char_count);
                 return nullptr;
             }
 
-            std::memcpy(reinterpret_cast<std::uint8_t*>(value_array) + 16u, value.data(), static_cast<std::size_t>(length));
+            auto* const bytes{ reinterpret_cast<std::uint8_t*>(value_array) + 16u };
+            for (std::int32_t index{ 0 }; index < char_count; ++index)
+            {
+                bytes[index] = static_cast<std::uint8_t>(units[static_cast<std::size_t>(index)]);
+            }
             vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
             vmhook::set_field<std::uint8_t>(string_oop, string_klass, "coder", 0u);
         }
+        else if (compact_string)
+        {
+            // UTF16 coder: byte[] holding 2 bytes per code unit, native-endian
+            // (HotSpot StringUTF16 stores chars in platform byte order; on the
+            // x64 CI that is little-endian, matching the units' in-memory bytes).
+            void* const value_array{ vmhook::make_java_array("[B", char_count * 2, sizeof(std::uint8_t)) };
+            if (!value_array)
+            {
+                VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the byte[] backing "
+                           "array (compact UTF16 path, chars={}).",
+                           vmhook::error_tag, char_count);
+                return nullptr;
+            }
+
+            std::memcpy(reinterpret_cast<std::uint8_t*>(value_array) + 16u,
+                        units.data(), static_cast<std::size_t>(char_count) * 2u);
+            vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
+            vmhook::set_field<std::uint8_t>(string_oop, string_klass, "coder", 1u);
+        }
         else
         {
-            void* const value_array{ vmhook::make_java_array("[C", length, sizeof(std::uint16_t)) };
+            void* const value_array{ vmhook::make_java_array("[C", char_count, sizeof(std::uint16_t)) };
             if (!value_array)
             {
                 VMHOOK_LOG("{} vmhook::make_java_string(): failed to allocate the char[] backing "
-                           "array (classic string path, length={}).",
-                           vmhook::error_tag, length);
+                           "array (classic string path, chars={}).",
+                           vmhook::error_tag, char_count);
                 return nullptr;
             }
 
             auto* const chars{ reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(value_array) + 16u) };
-            for (std::int32_t index{ 0 }; index < length; ++index)
+            for (std::int32_t index{ 0 }; index < char_count; ++index)
             {
-                chars[index] = static_cast<std::uint8_t>(value[static_cast<std::size_t>(index)]);
+                chars[index] = units[static_cast<std::size_t>(index)];
             }
 
             vmhook::set_field(string_oop, string_klass, "value", vmhook::hotspot::encode_oop_pointer(value_array));
@@ -11176,7 +11297,7 @@ namespace vmhook
 
             if (string_klass->find_field("count").has_value())
             {
-                vmhook::set_field<std::int32_t>(string_oop, string_klass, "count", length);
+                vmhook::set_field<std::int32_t>(string_oop, string_klass, "count", char_count);
             }
         }
 
@@ -11541,6 +11662,46 @@ namespace vmhook
                     {
                         return this->cast_for_variant<target_type>(value);
                     }, data);
+            }
+
+            /*
+                @brief The field value as a std::string, unambiguously.
+                @details
+                Parity with method_proxy::value_t::as_string().  Prefer this over
+                `std::string s{ proxy->get() }` or a static_cast: the templated
+                conversion operator can ALSO yield `const char*` (which std::string
+                constructs from), so the brace-init / cast forms are ambiguous on
+                MSVC — and on the compilers that do resolve them, can silently pick
+                the const char* path and build a std::string from a null pointer for
+                a non-string field.  as_string() names the extraction directly: a
+                reference/String field (compressed OOP, the uint32 alternative) is
+                decoded through read_java_string(); every numeric / boolean
+                alternative — including a null proxy's int32 zero — yields "".
+            */
+            auto as_string() const noexcept -> std::string
+            {
+                return std::visit([](const auto& v) noexcept
+                    -> std::string
+                    {
+                        using stored_type = std::remove_cvref_t<decltype(v)>;
+                        if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                        {
+                            return vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(v));
+                        }
+                        else
+                        {
+                            return std::string{};
+                        }
+                    }, data);
+            }
+
+            /*
+                @brief True when this value holds a reference/String field (compressed OOP).
+                Parity with method_proxy::value_t::is_string()/is_void() introspection.
+            */
+            auto is_reference() const noexcept -> bool
+            {
+                return std::holds_alternative<std::uint32_t>(data);
             }
 
             /*
@@ -15251,32 +15412,84 @@ namespace vmhook
         const std::uint8_t* const data{ arr + 16 };
         const bool has_coder{ string_klass->find_field("coder").has_value() };
 
+        // Append a Unicode code point to `out` as standard UTF-8 (1-4 bytes).
+        // Replaces the previous lossy "non-ASCII -> '?'" substitution that
+        // silently corrupted every string containing any char >= 0x80 (and the
+        // LATIN1 path that copied raw 0x80-0xFF bytes as if they were UTF-8).
+        const auto append_utf8 = [](std::string& out, std::uint32_t cp) -> void
+        {
+            if (cp < 0x80u)
+            {
+                out += static_cast<char>(cp);
+            }
+            else if (cp < 0x800u)
+            {
+                out += static_cast<char>(0xC0u | (cp >> 6));
+                out += static_cast<char>(0x80u | (cp & 0x3Fu));
+            }
+            else if (cp < 0x10000u)
+            {
+                out += static_cast<char>(0xE0u | (cp >> 12));
+                out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+                out += static_cast<char>(0x80u | (cp & 0x3Fu));
+            }
+            else
+            {
+                out += static_cast<char>(0xF0u | (cp >> 18));
+                out += static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu));
+                out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+                out += static_cast<char>(0x80u | (cp & 0x3Fu));
+            }
+        };
+
+        // Decode `count` native-endian UTF-16 code units (combining surrogate
+        // pairs into astral code points) and append them to `out` as UTF-8.
+        const auto utf16_to_utf8 = [&append_utf8](std::string& out,
+                                                  const std::uint16_t* const chars,
+                                                  const std::int32_t count) -> void
+        {
+            for (std::int32_t i{ 0 }; i < count; ++i)
+            {
+                std::uint32_t cp{ chars[i] };
+                if (cp >= 0xD800u && cp <= 0xDBFFu && (i + 1) < count)
+                {
+                    const std::uint16_t low{ chars[i + 1] };
+                    if (low >= 0xDC00u && low <= 0xDFFFu)
+                    {
+                        cp = 0x10000u + ((cp - 0xD800u) << 10) + (low - 0xDC00u);
+                        ++i;
+                    }
+                }
+                append_utf8(out, cp);
+            }
+        };
+
         std::string result;
         if (!has_coder)
         {
-            const auto* const chars{ reinterpret_cast<const std::uint16_t*>(data) };
+            // JDK 8: backing char[] is always UTF-16; `length` is the char count.
             result.reserve(static_cast<std::size_t>(length));
-            for (std::int32_t i{ 0 }; i < length; ++i)
-            {
-                result += (chars[i] < 0x80) ? static_cast<char>(chars[i]) : '?';
-            }
+            utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), length);
         }
         else
         {
             const std::uint8_t coder{ vmhook::get_field<std::uint8_t>(string_oop, string_klass, "coder") };
             if (coder == 0)
             {
-                result.assign(reinterpret_cast<const char*>(data), static_cast<std::size_t>(length));
+                // JDK 9+ LATIN1: one byte per char, each a code point in 0..255.
+                // UTF-8-encode each (so 0xE9 'é' -> C3 A9, not a raw invalid byte).
+                result.reserve(static_cast<std::size_t>(length));
+                for (std::int32_t i{ 0 }; i < length; ++i)
+                {
+                    append_utf8(result, data[i]);
+                }
             }
             else
             {
-                const auto* const chars{ reinterpret_cast<const std::uint16_t*>(data) };
+                // JDK 9+ UTF16: `length` is the byte[] length == 2 * char count.
                 const std::int32_t char_count{ length / 2 };
                 result.reserve(static_cast<std::size_t>(char_count));
-                for (std::int32_t i{ 0 }; i < char_count; ++i)
-                {
-                    result += (chars[i] < 0x80) ? static_cast<char>(chars[i]) : '?';
-                }
+                utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), char_count);
             }
         }
         return result;

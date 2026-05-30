@@ -132,7 +132,6 @@ namespace
     std::atomic<std::int64_t> g_mix_long_orig{ 0 };
     std::atomic<std::int32_t> g_mix_int_orig{ 0 };
     std::atomic<bool>         g_mix_slot3_set_ok{ false };
-    std::atomic<bool>         g_mix_slot2_set_ok{ false };
 
     // twoInts slot model
     std::atomic<bool>         g_two_a_set_ok{ false };
@@ -295,9 +294,12 @@ VMHOOK_JVM_MODULE(return_set_arg)
         ctx.check("set_arg_string2_hook_installed", h_str2.installed());
 
         // ── mixLongInt(long a, int b): slot model with a J/D in front ────
-        // this=slot0, a=slot1 (long), b=slot3.  Mutate b at slot 3 (correct)
-        // and *also* poke slot 2 (the reserved second half of the long) to
-        // prove it does NOT change b.  a is left untouched and must survive.
+        // this=slot0, a=slots1..2 (long), b=slot3.  The leading long consumes
+        // BOTH slot 1 and slot 2 (its 64-bit value is read from the lower of
+        // the two, locals[-2]), so the SECOND Java arg b lands at slot 3 — NOT
+        // slot 2.  A user who guessed "second arg => index 2" would overwrite
+        // the long's own value slot.  We change ONLY b (slot 3) and require a
+        // to survive untouched, proving the slot index is what set_arg targets.
         auto h_mix{ vmhook::scoped_hook<set_arg_fixture>(
             "mixLongInt", "(JI)V",
             [](vmhook::return_value& ret,
@@ -306,12 +308,7 @@ VMHOOK_JVM_MODULE(return_set_arg)
             {
                 g_mix_long_orig.store(a, std::memory_order_relaxed);
                 g_mix_int_orig.store(b, std::memory_order_relaxed);
-                // Poke slot 2 first (the naive "argument index 2" a user might
-                // guess).  On x64 this hits the long's reserved high slot, not
-                // b — the write itself succeeds (in-bounds) but must not move b.
-                g_mix_slot2_set_ok.store(ret.set_arg(2, static_cast<std::int32_t>(0x7777)),
-                                         std::memory_order_relaxed);
-                // Now the correct base slot for b.
+                // The correct base slot for b is 3 (the long ate slots 1-2).
                 g_mix_slot3_set_ok.store(ret.set_arg(3, static_cast<std::int32_t>(99)),
                                          std::memory_order_relaxed);
             }) };
@@ -448,14 +445,15 @@ VMHOOK_JVM_MODULE(return_set_arg)
         ctx.check("set_arg_char_returned_true",  g_char_set_ok.load(std::memory_order_relaxed));
         ctx.check("set_arg_char_body_saw_2764",  set_arg_fixture::get_char_seen() == 0x2764);
 
-        // ── long (slots 1..2): full 64-bit round-trip through one slot. ──
-        // On HotSpot x64 a long argument's 64-bit value lives in a single
-        // 8-byte local at its base slot (slot 1 here); vmhook's read path
-        // delivers it from locals[-1], so set_arg writing 8 bytes to the same
-        // slot must round-trip to what the body's `lload_1` reads.  The
-        // `saw_original_1` check is itself the proof the read/write slot agrees
-        // with the interpreter; if it fails, `body_saw_value` failing is the
-        // same root cause.
+        // ── long (slots 1..2): full 64-bit round-trip through the wide slot. ─
+        // The user passes the BASE slot index (1) to both the read path and
+        // set_arg; internally HotSpot stores a two-word long's 64-bit value at
+        // the LOWER slot locals[-(1+1)] == locals[-2] (LOCALS_LONG), and vmhook
+        // applies that +1 for 8-byte primitives on both read and write.  So
+        // set_arg(1, <long>) lands exactly where the body's `lload_1` reads.
+        // The `saw_original_1` check proves the read slot agrees with the
+        // interpreter; if it fails, `body_saw_value` failing is the same root
+        // cause (the wide-slot adjustment).
         ctx.check("set_arg_long_returned_true",    g_long_set_ok.load(std::memory_order_relaxed));
         ctx.check("set_arg_long_saw_original_1",   g_long_orig.load(std::memory_order_relaxed) == 1);
         ctx.check("set_arg_long_body_saw_value",
@@ -511,23 +509,21 @@ VMHOOK_JVM_MODULE(return_set_arg)
         // ── mixLongInt slot model ────────────────────────────────────────
         ctx.check("set_arg_mix_saw_original_a_100", g_mix_long_orig.load(std::memory_order_relaxed) == 100);
         ctx.check("set_arg_mix_saw_original_b_7",   g_mix_int_orig.load(std::memory_order_relaxed) == 7);
-        ctx.check("set_arg_mix_slot2_returned_true", g_mix_slot2_set_ok.load(std::memory_order_relaxed));
         ctx.check("set_arg_mix_slot3_returned_true", g_mix_slot3_set_ok.load(std::memory_order_relaxed));
-        // b is at slot 3 -> set_arg(3,99) wins; the slot-2 poke must NOT have
-        // moved b.  Correct observation: b == 99.  b is a plain int whose slot
+        // b is at slot 3 -> set_arg(3,99) wins.  b is a plain int whose slot
         // index (3) both the read path and the interpreter's iload_3 compute
         // identically, so this is independent of the long's internal layout.
         ctx.check("set_arg_mix_body_b_is_99", set_arg_fixture::get_mix_int_seen() == 99);
-        // a's 64-bit value lives at base slot 1, untouched by either poke (slots
-        // 2 and 3).  This is the concrete demonstration of the slot-index vs
-        // argument-index ambiguity (audit [HIGH]): a user who naively guessed
-        // "argument 2" and called set_arg(2,..) would NOT have changed b; only
-        // the correct base slot (3) does.
+        // a's 64-bit long, base slot 1 (value stored at locals[-2]), is never
+        // targeted — only slot 3 was written — so it must survive == 100.  This
+        // is the concrete demonstration of the slot-index vs argument-index
+        // ambiguity (audit [HIGH]): reaching the int that FOLLOWS a long needs
+        // its true slot (3), because the long occupies slots 1 AND 2.
         ctx.check("set_arg_mix_body_a_unchanged_100", set_arg_fixture::get_mix_long_seen() == 100);
         {
             std::ostringstream oss;
-            oss << "[INFO] set_arg mixLongInt slot model: after set_arg(2,0x7777)+"
-                   "set_arg(3,99), body saw a=" << set_arg_fixture::get_mix_long_seen()
+            oss << "[INFO] set_arg mixLongInt slot model: after set_arg(3,99), "
+                   "body saw a=" << set_arg_fixture::get_mix_long_seen()
                 << " b=" << set_arg_fixture::get_mix_int_seen()
                 << " (correct: a=100 untouched, b=99 via base slot 3).";
             ctx.record(oss.str());

@@ -2893,8 +2893,42 @@ namespace
         vmhook::jni::global_ref pinned{ vmhook::pin(made) };
         check("globalRefPinIsHeld", static_cast<bool>(pinned));
         check("globalRefPinOopNonNull", pinned.oop() != nullptr);
-        check("globalRefPinMatchesInstanceInitially",
-              pinned.oop() == made->vmhook::object_base::get_instance());
+
+        // The pin must point at OUR object.  Assert this FUNCTIONALLY — read the
+        // sentinel field THROUGH pinned.oop() — rather than by raw-address
+        // identity.  A wrapper holds a BARE oop that HotSpot does NOT rewrite on
+        // relocation, so pinned.oop() (which re-derives the live address from the
+        // global-ref slot every call) can legitimately differ from the wrapper's
+        // get_instance() the instant any GC fires between the pin and this read.
+        // (See audit/npnoqol/global_ref_raii.md: "the numeric address from
+        // .oop() is allowed to differ pre/post GC".)  The earlier
+        // pointer-identity assertion was therefore unsound and flaked under CI GC.
+        if (pinned.oop() && vmhook::hotspot::is_valid_pointer(pinned.oop()))
+        {
+            a_class via_pin_initial{ pinned.oop() };
+            check_equal("globalRefPinReadsFieldInitially",
+                        via_pin_initial.get_val(), std::int32_t{ 0x5A5A });
+        }
+        else
+        {
+            check("globalRefPinReadsFieldInitially", false);
+        }
+
+        // DIAGNOSTIC: record the pre-drop pointer relationship for the CI artifact
+        // (handle slot, derived oop(), the wrapper's bare instance, handle tag
+        // bits).  Helps localise any future regression without a local repro.
+        {
+            const auto hbits{ reinterpret_cast<std::uintptr_t>(pinned.handle()) };
+            const auto obits{ reinterpret_cast<std::uintptr_t>(pinned.oop()) };
+            const auto ibits{ reinterpret_cast<std::uintptr_t>(made->vmhook::object_base::get_instance()) };
+            std::ostringstream oss{};
+            oss << "[INFO] globalRef diag: handle=0x" << std::hex << hbits
+                << " oop()=0x" << obits
+                << " instance=0x" << ibits
+                << " handle_lowbits=0x" << (hbits & 0xF)
+                << " oop_eq_instance=" << std::dec << (obits == ibits);
+            write_result(oss.str());
+        }
 
         // Drop the wrapper — now the global ref is the ONLY thing keeping the
         // object alive.  Without the pin this object would be collectible.

@@ -211,9 +211,12 @@ namespace
                      const std::string&    tag,
                      const forced_values&  v) -> void
     {
-        // --- Each hook fired exactly 8 (instance) / 8 (static) times this round.
-        ctx.check(tag + "_instance_hooks_fired_8", g_inst_fires.load() == 8);
-        ctx.check(tag + "_static_hooks_fired_8",   g_stat_fires.load() == 8);
+        // --- Each instance hook fires once per Java call.  The fixture invokes
+        // origInt() TWICE (obsInt + obsIntReadback stability readback) and the
+        // other 7 origs once, so the instance path yields 9 fires; the static
+        // path calls each of its 8 origs exactly once → 8 fires.
+        ctx.check(tag + "_instance_hooks_fired", g_inst_fires.load() == 9);
+        ctx.check(tag + "_static_hooks_fired",   g_stat_fires.load() == 8);
         ctx.check(tag + "_instance_hooks_saw_self", g_inst_all_saw_self.load());
         ctx.check(tag + "_no_java_exception",       !rsp_fixture::saw_exception());
 

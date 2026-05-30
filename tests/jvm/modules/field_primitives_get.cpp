@@ -533,7 +533,10 @@ VMHOOK_JVM_MODULE(field_primitives_get)
         // String-typed null proxy decodes to empty (does not chase a garbage OOP).
         {
             vmhook::field_proxy fp{ nullptr, "Ljava/lang/String;", false };
-            const std::string s{ fp.get() };
+            // Use as_string() (parity with method_proxy::value_t): a brace-init
+            // std::string{ fp.get() } is ambiguous / can pick the const char*
+            // conversion and build from a null pointer for a non-string value.
+            const std::string s{ fp.get().as_string() };
             ctx.check("null_ptr_string_is_empty", s.empty());
         }
     }
