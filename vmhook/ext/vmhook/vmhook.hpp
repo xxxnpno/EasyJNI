@@ -12729,17 +12729,26 @@ namespace vmhook
                         vmhook::detail::jni_delete_local_ref(result_handle);
                         return value_t{ std::move(utf) };
                     }
-                    // Any other reference type: best-effort return
-                    // the handle's truncated value so callers know it
-                    // was non-null.  Truncated-uint32 already loses the
-                    // upper bits of the handle, so releasing the local
-                    // ref doesn't make the return value any less usable -
-                    // and stops the per-call leak that previously
-                    // accumulated one local per Object-returning call.
-                    const std::uint32_t truncated_handle{
-                        static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(result_handle)) };
+                    // Any other reference type: decode the JNI handle to the
+                    // real heap OOP and store it as a COMPRESSED OOP, so
+                    // value_t's unique_ptr<wrapper> / void* conversion (which
+                    // runs decode_oop_pointer) recovers the actual object.
+                    //
+                    // The previous code stored the *truncated jobject handle*
+                    // as if it were a compressed OOP; decode_oop_pointer then
+                    // produced a garbage address — a non-null but invalid
+                    // wrapper whose first field read took an access violation
+                    // (this crashed the JVM on the call_jni path, i.e. every
+                    // object-returning call on JDK 21+ where the call stub is
+                    // gone).  A null Java return now becomes monostate so
+                    // value_t::is_void() is true and unique_ptr<wrapper> is null.
+                    void* const result_oop{ vmhook::detail::jni_decode_object(result_handle) };
                     vmhook::detail::jni_delete_local_ref(result_handle);
-                    return value_t{ truncated_handle };
+                    if (!result_oop)
+                    {
+                        return value_t{ std::monostate{} };
+                    }
+                    return value_t{ vmhook::hotspot::encode_oop_pointer(result_oop) };
                 }
                 default:
                     VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): unhandled return type char '{}' "
