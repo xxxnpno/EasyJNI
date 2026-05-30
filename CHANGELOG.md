@@ -171,6 +171,26 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
+- Multi-classloader class resolution — `vmhook::find_class_via_oop(anchor_oop,
+  name)`, `vmhook::override_class_lookup(name, klass)`,
+  `vmhook::evict_class_lookup(name)`, and the
+  `vmhook::reanchor_classes_via_oop(anchor_oop, {names...})` convenience.  The
+  existing `find_class()` resolves a class by NAME across the whole
+  ClassLoaderDataGraph and returns the first match; when a process loads two
+  copies of a class under different loaders (a custom launcher loader, OSGi, app
+  servers, modded games — the NPNOQOL deep-dive flagged Lunar/Forge shipping
+  duplicate `net.kyori.*` / `com.mojang.*` classes), "first by name" is
+  graph-iteration-order-dependent and routinely resolves the WRONG copy, with the
+  only symptom a `ClassCastException` thrown deep in host code when the result is
+  handed back.  `find_class_via_oop` walks `anchor -> getClass -> getClassLoader
+  -> loadClass(name)` to force the copy visible from an object you already hold;
+  `override_class_lookup` seeds that copy into the `find_class` cache so the whole
+  SDK transparently follows it (the supported replacement for reaching into the
+  internal cache); `reanchor_classes_via_oop` does both for a set of names and
+  returns true only when all resolve (so callers can poll until their anchor is
+  live).  Covered by a new standalone `classloader_reanchor` suite (null / no-JVM
+  safety, and override/evict cache round-trips verified directly against
+  `klass_lookup_cache`).
 - Method enumeration / descriptor-based hooking — `vmhook::get_class_methods<T>()`
   / `get_class_methods("internal/Name")` return every declared method of a class
   as `(name, JVM-descriptor)` pairs by walking `InstanceKlass::_methods` directly

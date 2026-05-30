@@ -10344,6 +10344,199 @@ namespace vmhook
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Class resolution under multiple classloaders.
+    //
+    // vmhook::find_class() resolves a class by NAME across the whole
+    // ClassLoaderDataGraph and returns the first match.  When a process has two
+    // copies of a class under different loaders (modded games with a custom
+    // launcher loader, OSGi, app servers, any plugin host), "first by name" is
+    // graph-iteration-order-dependent and routinely resolves the WRONG copy —
+    // the only symptom being a ClassCastException thrown deep in host code when
+    // the result is handed back.  These helpers give the corrective half:
+    // "resolve the copy visible from an object I already hold", and "make every
+    // find_class() consumer pick up that copy".  Surfaced by the NPNOQOL
+    // deep-dive (Lunar/Forge ship duplicate net.kyori.* / com.mojang.* classes).
+    // -------------------------------------------------------------------------
+
+    /*
+        @brief Resolves a class through the classloader of a live anchor object.
+        @details
+        Walks anchor_oop -> getClass() -> getClassLoader() -> loadClass(name),
+        forcing the copy of `class_name` visible from THAT object's loader rather
+        than whatever find_class() happens to hit first.  Use it to disambiguate
+        when the JVM has more than one class of the same name.
+
+        Complexity: O(JNI loadClass).  Exception safety: noexcept — clears any
+        pending JNI exception and returns nullptr on any failure (null anchor,
+        no JVM, class not visible from that loader).
+
+        @param anchor_oop   Raw decoded heap OOP of an object whose loader to use.
+        @param class_name   Internal ('/'-separated) JVM class name.
+        @return  The Klass* of the loader-specific copy, or nullptr.
+    */
+    inline auto find_class_via_oop(void* const anchor_oop, const std::string_view class_name) noexcept
+        -> vmhook::hotspot::klass*
+    {
+        if (!anchor_oop || !vmhook::hotspot::ensure_current_java_thread())
+        {
+            return nullptr;
+        }
+
+        void* storage{};
+        void* const anchor_handle{ vmhook::detail::jni_oop_handle(anchor_oop, storage) };
+        void* const anchor_class_handle{ vmhook::detail::jni_get_object_class(anchor_handle) };
+        if (!anchor_class_handle)
+        {
+            vmhook::detail::jni_exception_clear();
+            return nullptr;
+        }
+
+        void* const class_class{ vmhook::detail::jni_get_object_class(anchor_class_handle) };
+        if (!class_class)
+        {
+            vmhook::detail::jni_exception_clear();
+            vmhook::detail::jni_delete_local_ref(anchor_class_handle);
+            return nullptr;
+        }
+
+        void* const get_loader_id{ vmhook::detail::jni_get_method_id(
+            class_class, "getClassLoader", "()Ljava/lang/ClassLoader;") };
+        vmhook::detail::jni_delete_local_ref(class_class);
+        if (!get_loader_id)
+        {
+            vmhook::detail::jni_delete_local_ref(anchor_class_handle);
+            return nullptr;
+        }
+
+        void* const classloader{ vmhook::detail::jni_call_object_method(
+            anchor_class_handle, get_loader_id, nullptr) };
+        vmhook::detail::jni_delete_local_ref(anchor_class_handle);
+        vmhook::detail::jni_exception_clear();
+        if (!classloader)
+        {
+            return nullptr;
+        }
+
+        void* const cl_class{ vmhook::detail::jni_get_object_class(classloader) };
+        if (!cl_class)
+        {
+            vmhook::detail::jni_delete_local_ref(classloader);
+            return nullptr;
+        }
+        void* const load_class_id{ vmhook::detail::jni_get_method_id(
+            cl_class, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") };
+        vmhook::detail::jni_delete_local_ref(cl_class);
+        if (!load_class_id)
+        {
+            vmhook::detail::jni_delete_local_ref(classloader);
+            return nullptr;
+        }
+
+        std::string dotted_name{ class_name };
+        std::replace(dotted_name.begin(), dotted_name.end(), '/', '.');
+        void* const name_string{ vmhook::detail::jni_new_string_utf(dotted_name) };
+        if (!name_string)
+        {
+            vmhook::detail::jni_delete_local_ref(classloader);
+            return nullptr;
+        }
+
+        vmhook::detail::jni_value args[1]{};
+        args[0].l = name_string;
+        void* const class_mirror{ vmhook::detail::jni_call_object_method(classloader, load_class_id, args) };
+        vmhook::detail::jni_delete_local_ref(name_string);
+        vmhook::detail::jni_delete_local_ref(classloader);
+        vmhook::detail::jni_exception_clear();
+        if (!class_mirror)
+        {
+            return nullptr;
+        }
+
+        vmhook::hotspot::klass* const result{ vmhook::detail::jni_klass_from_class_mirror(class_mirror) };
+        vmhook::detail::jni_delete_local_ref(class_mirror);
+        return result;
+    }
+
+    /*
+        @brief Installs / replaces the find_class cache entry for `class_name`.
+        @details
+        After this call, every subsequent vmhook::find_class(class_name) returns
+        `k` directly without walking the ClassLoaderDataGraph.  Pair it with
+        find_class_via_oop() to nail the correct loader's copy once and have the
+        whole SDK (every wrapper that calls find_class) follow it — the supported
+        replacement for reaching into the internal cache.  Passing a null `k`
+        seeds a negative entry; prefer evict_class_lookup() to actually forget.
+
+        Complexity: O(1).  Exception safety: noexcept.
+    */
+    inline auto override_class_lookup(const std::string_view class_name, vmhook::hotspot::klass* const k) noexcept
+        -> void
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+            vmhook::klass_lookup_cache[std::string{ class_name }] = k;
+        }
+        catch (...)
+        {
+        }
+    }
+
+    /*
+        @brief Forgets any cached find_class resolution for `class_name`.
+        @details Next find_class(class_name) re-walks the graph (or re-resolves).
+        Complexity: O(1).  Exception safety: noexcept.
+    */
+    inline auto evict_class_lookup(const std::string_view class_name) noexcept
+        -> void
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
+            vmhook::klass_lookup_cache.erase(std::string{ class_name });
+        }
+        catch (...)
+        {
+        }
+    }
+
+    /*
+        @brief Convenience: anchor a set of classes to an object's loader in one call.
+        @details
+        For each name, find_class_via_oop(anchor_oop, name) then
+        override_class_lookup(name, resolved) so every later find_class() picks the
+        anchor loader's copy.  Returns true only if EVERY name resolved — callers
+        that anchor against an object which only becomes available later (e.g. once
+        a world/context is loaded) can poll until it returns true.  Names that
+        don't resolve are left un-overridden.
+
+        Complexity: O(N · JNI loadClass).  Exception safety: noexcept.
+    */
+    inline auto reanchor_classes_via_oop(void* const anchor_oop,
+                                         std::initializer_list<std::string_view> class_names) noexcept
+        -> bool
+    {
+        if (!anchor_oop)
+        {
+            return false;
+        }
+        bool all_resolved{ true };
+        for (const std::string_view class_name : class_names)
+        {
+            vmhook::hotspot::klass* const resolved{ vmhook::find_class_via_oop(anchor_oop, class_name) };
+            if (resolved)
+            {
+                vmhook::override_class_lookup(class_name, resolved);
+            }
+            else
+            {
+                all_resolved = false;
+            }
+        }
+        return all_resolved;
+    }
+
     /*
         @brief Constructs a new Java object and returns a C++ wrapper.
         @tparam T The C++ wrapper class (must derive from vmhook::object).
