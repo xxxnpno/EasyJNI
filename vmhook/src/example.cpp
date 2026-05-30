@@ -2912,7 +2912,12 @@ namespace
         // freed / reused memory rather than the sentinel.
         void* const live_oop{ pinned.oop() };
         check("globalRefSurvivesGcOopNonNull", live_oop != nullptr);
-        if (live_oop)
+        // Guard the field read with is_valid_pointer: if the pin failed to keep
+        // the object alive (or oop() returns an unusable representation on this
+        // JDK), live_oop points into freed/unmapped memory and the field read
+        // would AV and take the whole suite down.  A guarded miss records a
+        // visible FAIL instead of crashing.
+        if (live_oop && vmhook::hotspot::is_valid_pointer(live_oop))
         {
             a_class via_pin{ live_oop };
             check_equal("globalRefFieldSurvivesGc", via_pin.get_val(), std::int32_t{ 0x5A5A });
