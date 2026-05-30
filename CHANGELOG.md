@@ -7,6 +7,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **CRITICAL**: `method_proxy::call_jni`'s argument diagnostic dump dereferenced
+  `values[i].l` for EVERY argument, but `jni_value` is a union — for a primitive
+  argument (e.g. `jint 1`) `.l` aliases the primitive bits (`0x1`), which is
+  non-null but NOT a pointer.  `*reinterpret_cast<void**>(0x1)` took an access
+  violation that crashed the whole JVM on the FIRST primitive-argument call
+  through `call_jni` — i.e. every method call with a primitive arg on JDKs where
+  the call stub is gone (21+).  The dump now dereferences only a synthetic object
+  handle (`values[i].l == &handle_storage[i]`) and prints raw bytes otherwise.
+  Same union-aliasing class as the DeleteLocalRef fix below; this one was masked
+  because the integration suite's CI treated a crash (empty results, 0 FAIL) as a
+  vacuous pass until the suite gained a required `TOTAL:` completion line.
 - `write_jni_arg_to_slot` / `append_jni_arg` now clear the full 8-byte
   `jni_value` union cell (`value.j = 0`) before writing the active member,
   instead of relying on `value = jni_value{}`.  Value-initialising a union only

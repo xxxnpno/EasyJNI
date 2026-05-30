@@ -12378,12 +12378,18 @@ namespace vmhook
                 for (std::size_t i{ 0 }; i < sizeof...(args_t); ++i)
                 {
                     if (i > 0) { args_dump += ", "; }
-                    if (values[i].l)
+                    // Deref ONLY a synthetic object handle (value.l points at
+                    // its own handle_storage slot, which write_jni_arg_to_slot
+                    // set for object args).  jni_value is a UNION: for a
+                    // primitive arg (e.g. jint 1) value.l aliases the primitive
+                    // bits (0x1), which is non-null but is NOT a pointer —
+                    // dereferencing it took an access violation that crashed
+                    // the JVM on the first primitive-arg call on JDKs without
+                    // the call stub (21+).  Same union-aliasing class as the
+                    // DeleteLocalRef fix; here we discriminate by the synthetic
+                    // handle's self-pointer and dump raw bytes otherwise.
+                    if (values[i].l == &handle_storage[i])
                     {
-                        // values[i].l is `jobject` == pointer-to-OOP-slot.
-                        // Reading the slot is one indirection of a known
-                        // stack address we just wrote, never a faulting
-                        // load - safe to do unconditionally.
                         void* const arg_oop{ *reinterpret_cast<void**>(values[i].l) };
                         args_dump += std::format("oop=0x{:016X}",
                                                   reinterpret_cast<std::uintptr_t>(arg_oop));
