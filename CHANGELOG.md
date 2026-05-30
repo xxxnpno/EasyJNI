@@ -163,6 +163,23 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
+- `vmhook::jni::global_ref` + `vmhook::pin()` — the missing GC-pin lifetime
+  primitive.  Every other handle in the library (`oop_t`, `object_base`, wrapper
+  `unique_ptr`, `method_proxy::call()` results) is valid only for the duration of
+  the current hook invocation: HotSpot relocates objects on every collecting GC,
+  so an address captured this tick dangles the moment a GC runs.  That makes the
+  ubiquitous "compute Java objects on one thread/tick, consume them on another"
+  pattern a use-after-relocation by construction — a gap the downstream NPNOQOL
+  fork had to fill itself before it could cache method results across ticks or
+  publish Java objects into cross-thread snapshots.  `global_ref` is a move-only
+  RAII pin over `NewGlobalRef`/`DeleteGlobalRef` (JNI slots 21/22) whose `oop()`
+  re-derives the object's CURRENT (post-relocation) address every call; `pin(oop)`
+  and `pin(unique_ptr<wrapper>)` are one-liner factories.  Added
+  `vmhook::detail::jni_new_global_ref` / `jni_delete_global_ref`.  Covered by a
+  new standalone `global_ref` unit suite (move-only / null-safety / no-JVM-inert
+  contract) and a `test_global_ref` JVM-integration scenario that pins a freshly
+  allocated object, drops every other reference, forces `System.gc()`, and proves
+  the field survives and the pin tracks relocation.
 - `method_proxy::value_t` can now convert to `std::unique_ptr<wrapper>` and to
   `std::string`, mirroring `field_proxy::value_t`.  Previously an Object-returning
   Java method assigned into a `std::unique_ptr<my_wrapper>` silently yielded

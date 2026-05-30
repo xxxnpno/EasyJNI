@@ -8756,6 +8756,56 @@ namespace vmhook
         }
 
         /*
+            @brief Calls JNIEnv::NewGlobalRef (table slot 21) to pin a Java object.
+            @details
+            Promotes a local reference / synthetic handle to a JNI global reference.
+            Global references survive across JNI calls, ticks, threads, and — crucially
+            — across relocating garbage collections: the JVM rewrites the slot the
+            handle points at when it moves the object, so dereferencing the global
+            handle always yields the object's CURRENT heap address.  Must be released
+            with jni_delete_global_ref().  Null input / no JVM returns nullptr.
+
+            Complexity: O(1).  Exception safety: noexcept.
+        */
+        inline auto jni_new_global_ref(void* const object_handle) noexcept
+            -> void*
+        {
+            if (!object_handle)
+            {
+                return nullptr;
+            }
+            using new_global_ref_t = void* (*)(void*, void*);
+            new_global_ref_t const new_global_ref{
+                vmhook::detail::jni_function<21, new_global_ref_t>(vmhook::hotspot::current_jni_env) };
+            return new_global_ref ? new_global_ref(vmhook::hotspot::current_jni_env, object_handle) : nullptr;
+        }
+
+        /*
+            @brief Calls JNIEnv::DeleteGlobalRef (table slot 22) to unpin a Java object.
+            @details
+            Null handles are a documented JNI no-op, mirrored here.  Releasing a global
+            ref twice corrupts the JNI handle table, so ownership must be exactly-once —
+            vmhook::jni::global_ref encapsulates that for you.
+
+            Complexity: O(1).  Exception safety: noexcept.
+        */
+        inline auto jni_delete_global_ref(void* const global_handle) noexcept
+            -> void
+        {
+            if (!global_handle)
+            {
+                return;
+            }
+            using delete_global_ref_t = void (*)(void*, void*);
+            delete_global_ref_t const delete_global_ref{
+                vmhook::detail::jni_function<22, delete_global_ref_t>(vmhook::hotspot::current_jni_env) };
+            if (delete_global_ref)
+            {
+                delete_global_ref(vmhook::hotspot::current_jni_env, global_handle);
+            }
+        }
+
+        /*
             @brief Constructs a synthetic JNI handle for a raw heap OOP without a JNI frame.
             @details
             Stores oop into handle_storage and returns a pointer to handle_storage.
@@ -15658,5 +15708,147 @@ namespace vmhook
         };
 
         return watch_handle{ std::move(block) };
+    }
+
+    // -------------------------------------------------------------------------
+    // JNI global references: keep a Java object alive across GC.
+    //
+    // Everything else in this header hands you an oop_t / object_base / wrapper
+    // whose address is valid only for the duration of the current hook
+    // invocation: HotSpot relocates objects on every (relocating) GC, so an
+    // address you captured this tick is a dangling pointer the moment a
+    // collection runs.  That makes the common "compute Java objects on one
+    // thread/tick, consume them on another" pattern a use-after-relocation by
+    // construction.  global_ref is the missing lifetime primitive: it pins the
+    // object via NewGlobalRef and its oop() always reads the object's CURRENT
+    // (post-relocation) address out of the handle slot.
+    // -------------------------------------------------------------------------
+    namespace jni
+    {
+        /*
+            @brief Move-only RAII pin around a JNI global reference.
+            @details
+            Construct from a raw decoded heap OOP (e.g. wrapper->get_instance(),
+            field_proxy reads, method_proxy::call() results).  The constructor
+            promotes it to a JNI global reference so the JVM cannot collect the
+            object while this handle is alive; the destructor releases it exactly
+            once.  oop() re-derives the live address every call, so it stays valid
+            across relocating GCs.  Copying is disabled (a global ref is owned
+            exactly once — double DeleteGlobalRef corrupts the handle table);
+            moving transfers ownership and nulls the source.
+
+            Typical use: cache the result of a method call across ticks, own Java
+            objects inside a long-lived / cross-thread snapshot, or hold a handle
+            on a thread other than the one that produced it.
+
+                vmhook::jni::global_ref pinned{ wrapper->get_instance() };
+                // ... ticks / GCs later, on any thread ...
+                if (pinned) { use(pinned.oop()); }   // live, relocated address
+
+            Requires a JVM (and an attached thread): with no JVM, construction is
+            a no-op and the handle stays empty (operator bool == false).
+        */
+        class global_ref final
+        {
+        public:
+            global_ref() noexcept = default;
+
+            explicit global_ref(vmhook::oop_t const raw_oop) noexcept
+            {
+                if (!raw_oop)
+                {
+                    return;
+                }
+                void* storage{};
+                void* const local_handle{ vmhook::detail::jni_oop_handle(raw_oop, storage) };
+                this->handle_ = vmhook::detail::jni_new_global_ref(local_handle);
+            }
+
+            ~global_ref() noexcept
+            {
+                vmhook::detail::jni_delete_global_ref(this->handle_);
+            }
+
+            global_ref(const global_ref&)                    = delete;
+            auto operator=(const global_ref&) -> global_ref& = delete;
+
+            global_ref(global_ref&& other) noexcept
+                : handle_{ other.handle_ }
+            {
+                other.handle_ = nullptr;
+            }
+
+            auto operator=(global_ref&& other) noexcept -> global_ref&
+            {
+                if (this != &other)
+                {
+                    vmhook::detail::jni_delete_global_ref(this->handle_);
+                    this->handle_ = other.handle_;
+                    other.handle_ = nullptr;
+                }
+                return *this;
+            }
+
+            /*
+                @brief The pinned object's CURRENT heap OOP, or nullptr if empty.
+                @details Dereferences the global-ref slot, so the returned address
+                reflects any relocation the JVM performed since the pin was taken.
+            */
+            auto oop() const noexcept -> vmhook::oop_t
+            {
+                return this->handle_ ? *reinterpret_cast<void**>(this->handle_) : nullptr;
+            }
+
+            /*
+                @brief Releases the pin early (idempotent).  oop() returns nullptr after.
+            */
+            auto reset() noexcept -> void
+            {
+                vmhook::detail::jni_delete_global_ref(this->handle_);
+                this->handle_ = nullptr;
+            }
+
+            /*
+                @brief The raw JNI global handle (for advanced JNI interop).  May be null.
+            */
+            auto handle() const noexcept -> void*
+            {
+                return this->handle_;
+            }
+
+            explicit operator bool() const noexcept
+            {
+                return this->handle_ != nullptr;
+            }
+
+        private:
+            void* handle_{ nullptr };
+        };
+    }
+
+    /*
+        @brief Pins a raw OOP against GC, returning an owning vmhook::jni::global_ref.
+        @details One-liner for the ubiquitous `global_ref{ oop }` pattern.
+    */
+    inline auto pin(vmhook::oop_t const oop) noexcept
+        -> vmhook::jni::global_ref
+    {
+        return vmhook::jni::global_ref{ oop };
+    }
+
+    /*
+        @brief Pins the Java object behind a wrapper unique_ptr against GC.
+        @details `pin(wrapper)` instead of `vmhook::jni::global_ref{ wrapper->get_instance() }`.
+        Returns an empty pin for a null wrapper.
+    */
+    template<typename wrapper_type>
+    inline auto pin(const std::unique_ptr<wrapper_type>& wrapper) noexcept
+        -> vmhook::jni::global_ref
+    {
+        static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
+                      "vmhook::pin(unique_ptr<T>): T must derive from vmhook::object_base.");
+        return wrapper
+            ? vmhook::jni::global_ref{ wrapper->vmhook::object_base::get_instance() }
+            : vmhook::jni::global_ref{};
     }
 }

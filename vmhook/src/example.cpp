@@ -343,6 +343,20 @@ public:
     static auto get_beacon() -> std::int32_t { return static_field("beacon")->get(); }
 };
 
+// ── java.lang.System wrapper — only used to trigger a GC from the global_ref
+//    integration test (System.gc() is a request, not a guarantee, but on the
+//    serial / G1 collectors the CI uses it reliably runs a collection).
+class system_class : public vmhook::object<system_class>
+{
+public:
+    explicit system_class(vmhook::oop_t instance)
+        : vmhook::object<system_class>{ instance }
+    {
+    }
+
+    static auto gc() -> void { static_method("gc")->call(); }
+};
+
 class example_class : public vmhook::object<example_class>
 {
 public:
@@ -2834,6 +2848,67 @@ namespace
         check_equal("readJavaStringValue", decoded, std::string{ "cppwins!" });
     }
 
+    // Exercises vmhook::jni::global_ref / vmhook::pin against a live JVM:
+    //   * pin a freshly-allocated object,
+    //   * drop the only other reference,
+    //   * force GC,
+    //   * prove the object is still alive and reachable through the pin
+    //     (its field survives), and that the pin tracks any relocation.
+    // This is the executable spec for the "compute on one tick, consume on
+    // another after a GC" pattern that a bare oop_t cannot support.
+    auto test_global_ref() -> void
+    {
+        // Allocate a fresh A with a known sentinel field value.
+        auto made{ vmhook::make_unique<a_class>(0x5A5A) };
+        if (!made)
+        {
+            check("globalRefAllocated", false);
+            return;
+        }
+        check("globalRefAllocated", true);
+        check_equal("globalRefInitialFieldValue", made->get_val(), std::int32_t{ 0x5A5A });
+
+        // Pin it.  pin(unique_ptr) promotes the wrapper's OOP to a global ref.
+        vmhook::jni::global_ref pinned{ vmhook::pin(made) };
+        check("globalRefPinIsHeld", static_cast<bool>(pinned));
+        check("globalRefPinOopNonNull", pinned.oop() != nullptr);
+        check("globalRefPinMatchesInstanceInitially",
+              pinned.oop() == made->vmhook::object_base::get_instance());
+
+        // Drop the wrapper — now the global ref is the ONLY thing keeping the
+        // object alive.  Without the pin this object would be collectible.
+        made.reset();
+
+        // Force a collection (best-effort; the request reliably collects on the
+        // serial/G1 collectors the CI uses).  A relocating GC may move the
+        // object — pinned.oop() must observe the new address.
+        system_class::gc();
+        system_class::gc();
+
+        // Reconstruct a wrapper from the pin's CURRENT address and read the
+        // field back.  If the pin failed to keep the object alive (or oop()
+        // returned a stale pre-relocation address) this read would observe
+        // freed / reused memory rather than the sentinel.
+        void* const live_oop{ pinned.oop() };
+        check("globalRefSurvivesGcOopNonNull", live_oop != nullptr);
+        if (live_oop)
+        {
+            a_class via_pin{ live_oop };
+            check_equal("globalRefFieldSurvivesGc", via_pin.get_val(), std::int32_t{ 0x5A5A });
+        }
+        else
+        {
+            check("globalRefFieldSurvivesGc", false);
+        }
+
+        // Explicit reset releases the pin; oop() goes null and a second reset
+        // is a safe no-op (exactly-once DeleteGlobalRef).
+        pinned.reset();
+        check("globalRefResetClearsOop", pinned.oop() == nullptr);
+        pinned.reset();
+        check("globalRefDoubleResetSafe", !static_cast<bool>(pinned));
+    }
+
     auto test_for_each_instance() -> void
     {
         // Walk the heap for instances of Example.  At least one
@@ -2992,6 +3067,7 @@ static auto run_test_suite() -> void
     vmhook::register_class<nested_inner_class>("vmhook/NestedHost$Inner");
     vmhook::register_class<caller_probe_class>("vmhook/CallerProbe");
     vmhook::register_class<ticker_probe_class>("vmhook/TickerProbe");
+    vmhook::register_class<system_class>("java/lang/System");
 
     const auto instance{ example_class::get_instance() };
 
@@ -3042,6 +3118,7 @@ static auto run_test_suite() -> void
         // not any installed hooks.
         test_for_each_thread();
         test_read_java_string();
+        test_global_ref();
 
         // Newer feature surface: caller info, field watcher, class-load watcher.
         // on_exception is exercised BEFORE test_caller_info because the
