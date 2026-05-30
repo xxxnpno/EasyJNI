@@ -1,0 +1,532 @@
+// method_call_primitives — exhaustive JVM tests for method_proxy::call()
+// returning every JVM primitive (Z B S C I J F D) and void.
+//
+// Feature lives in vmhook/ext/vmhook/vmhook.hpp:
+//   * value_t + its templated conversion operator  : 11956-12111
+//   * call() interpreter fast path + result decode  : 12726-12938
+//       - primitive decode switch                   : 12889-12937
+//   * call_jni() JNI fallback + per-type slots      : 12141-12695
+//       - primitive dispatch slots                  : 12564-12643
+//   * sig_char_to_basic_type (return BasicType id)  : 11877-11894
+//
+// Why everything runs inside ONE hook detour: method_proxy::call() requires
+// vmhook::hotspot::current_java_thread to be set, which only happens on the
+// Java thread while it is executing inside an interpreter detour.  So the
+// module hooks MethodPrimitives.trigger(int); the detour performs every call()
+// and records the converted C++ value into a file-scope atomic.  The module
+// body then asserts each captured value against the Java method's boundary
+// return.  This exercises BOTH the call_stub fast path (when the JDK exposes
+// StubRoutines::_call_stub_entry) and the JNI fallback (modern JDKs) with the
+// same assertions — the converted value_t must be identical either way.
+#include <vmhook/vmhook.hpp>
+
+#include "../harness.hpp"
+
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+
+namespace
+{
+    // Wrapper for vmhook.fixtures.MethodPrimitives.  Each helper resolves a
+    // method by name and converts the returned value_t into the exact matching
+    // C++ type, so the assertions test the conversion operator at the right
+    // target type (sign-extension for B/S/I/J, zero-extension for C, bit-cast
+    // fidelity for F/D).  Helpers are invoked from inside the trigger() detour.
+    class method_primitives : public vmhook::object<method_primitives>
+    {
+    public:
+        explicit method_primitives(vmhook::oop_t instance) noexcept
+            : vmhook::object<method_primitives>{ instance }
+        {
+        }
+
+        // -- handshake / observable static fields --
+        static auto set_go(bool v) -> void              { static_field("go")->set(v); }
+        static auto get_done() -> bool                  { return static_field("done")->get(); }
+        static auto get_void_instance_hits() -> std::int32_t { return static_field("voidInstanceHits")->get(); }
+        static auto get_void_static_hits() -> std::int32_t   { return static_field("voidStaticHits")->get(); }
+        static auto get_last_echo_arg() -> std::int32_t      { return static_field("lastEchoArg")->get(); }
+
+        // -- instance primitive returners (call into the live receiver) --
+        auto call_bool(const char* n) -> bool        { return get_method(n)->call(); }
+        auto call_byte(const char* n) -> std::int8_t { return get_method(n)->call(); }
+        auto call_short(const char* n) -> std::int16_t { return get_method(n)->call(); }
+        auto call_char(const char* n) -> std::uint16_t { return get_method(n)->call(); }
+        auto call_int(const char* n) -> std::int32_t { return get_method(n)->call(); }
+        auto call_long(const char* n) -> std::int64_t { return get_method(n)->call(); }
+        auto call_float(const char* n) -> float      { return get_method(n)->call(); }
+        auto call_double(const char* n) -> double    { return get_method(n)->call(); }
+        auto call_int_arg(const char* n, std::int32_t a) -> std::int32_t { return get_method(n)->call(a); }
+
+        // value_t introspection probes (instance)
+        auto is_void(const char* n) -> bool   { return get_method(n)->call().is_void(); }
+        auto is_string(const char* n) -> bool { return get_method(n)->call().is_string(); }
+
+        // -- static primitive returners (exercise CallStatic<T>MethodA slots) --
+        static auto scall_bool(const char* n) -> bool        { return static_method(n)->call(); }
+        static auto scall_byte(const char* n) -> std::int8_t { return static_method(n)->call(); }
+        static auto scall_short(const char* n) -> std::int16_t { return static_method(n)->call(); }
+        static auto scall_char(const char* n) -> std::uint16_t { return static_method(n)->call(); }
+        static auto scall_int(const char* n) -> std::int32_t { return static_method(n)->call(); }
+        static auto scall_long(const char* n) -> std::int64_t { return static_method(n)->call(); }
+        static auto scall_float(const char* n) -> float      { return static_method(n)->call(); }
+        static auto scall_double(const char* n) -> double    { return static_method(n)->call(); }
+        static auto scall_int_arg(const char* n, std::int32_t a) -> std::int32_t { return static_method(n)->call(a); }
+        static auto svoid(const char* n) -> bool { return static_method(n)->call().is_void(); }
+    };
+
+    // ---- raw-bit capture helpers so NaN / Inf / -0.0 survive the atomic ----
+    inline auto f2bits(float f) noexcept -> std::uint32_t
+    {
+        std::uint32_t b{ 0 };
+        std::memcpy(&b, &f, sizeof(b));
+        return b;
+    }
+    inline auto bits2f(std::uint32_t b) noexcept -> float
+    {
+        float f{ 0.0f };
+        std::memcpy(&f, &b, sizeof(f));
+        return f;
+    }
+    inline auto d2bits(double d) noexcept -> std::uint64_t
+    {
+        std::uint64_t b{ 0 };
+        std::memcpy(&b, &d, sizeof(b));
+        return b;
+    }
+    inline auto bits2d(std::uint64_t b) noexcept -> double
+    {
+        double d{ 0.0 };
+        std::memcpy(&d, &b, sizeof(d));
+        return d;
+    }
+
+    // Sentinel that no Java boundary value collides with, so "did the detour
+    // capture run?" is unambiguous for integer slots.
+    constexpr std::int64_t k_uncaptured = static_cast<std::int64_t>(0xDEADBEEFCAFEF00Dull);
+
+    // ------------------------------------------------------------------
+    //  Captured observations.  The detour writes; the module body reads.
+    // ------------------------------------------------------------------
+    std::atomic<int>  g_detour_calls{ 0 };
+    std::atomic<bool> g_detour_saw_self{ false };
+
+    // boolean
+    std::atomic<int>  g_bool_true_inst{ -1 };
+    std::atomic<int>  g_bool_false_inst{ -1 };
+    std::atomic<int>  g_bool_true_stat{ -1 };
+    std::atomic<int>  g_bool_false_stat{ -1 };
+
+    // byte
+    std::atomic<std::int64_t> g_byte_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_one{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_negone_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_max_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_byte_min_stat{ k_uncaptured };
+    // byte sign-extension when read into a wider int
+    std::atomic<std::int64_t> g_byte_negone_as_int{ k_uncaptured };
+
+    // short
+    std::atomic<std::int64_t> g_short_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_negone_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_max_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_short_min_stat{ k_uncaptured };
+
+    // char  (UNSIGNED)
+    std::atomic<std::int64_t> g_char_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_a{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_a_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_char_max_stat{ k_uncaptured };
+    // char must NOT sign-extend: 0xFFFF read into an int stays 65535
+    std::atomic<std::int64_t> g_char_max_as_int{ k_uncaptured };
+
+    // int
+    std::atomic<std::int64_t> g_int_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_42{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_max_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_min_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_42_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_echo_inst{ k_uncaptured };
+    std::atomic<std::int64_t> g_int_echo_stat{ k_uncaptured };
+
+    // long
+    std::atomic<std::int64_t> g_long_zero{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_negone{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_max{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_min{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_big{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_max_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_min_stat{ k_uncaptured };
+    std::atomic<std::int64_t> g_long_big_stat{ k_uncaptured };
+
+    // float (raw bits; 0 is a valid value so use a separate "captured" flag)
+    std::atomic<bool>          g_float_captured{ false };
+    std::atomic<std::uint32_t> g_float_zero{ 0 };
+    std::atomic<std::uint32_t> g_float_one{ 0 };
+    std::atomic<std::uint32_t> g_float_negone{ 0 };
+    std::atomic<std::uint32_t> g_float_half{ 0 };
+    std::atomic<std::uint32_t> g_float_max{ 0 };
+    std::atomic<std::uint32_t> g_float_minval{ 0 };
+    std::atomic<std::uint32_t> g_float_negzero{ 0 };
+    std::atomic<std::uint32_t> g_float_nan{ 0 };
+    std::atomic<std::uint32_t> g_float_posinf{ 0 };
+    std::atomic<std::uint32_t> g_float_neginf{ 0 };
+    std::atomic<std::uint32_t> g_float_half_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_nan_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_posinf_stat{ 0 };
+    std::atomic<std::uint32_t> g_float_negzero_stat{ 0 };
+
+    // double (raw bits)
+    std::atomic<bool>          g_double_captured{ false };
+    std::atomic<std::uint64_t> g_double_zero{ 0 };
+    std::atomic<std::uint64_t> g_double_one{ 0 };
+    std::atomic<std::uint64_t> g_double_negone{ 0 };
+    std::atomic<std::uint64_t> g_double_pi{ 0 };
+    std::atomic<std::uint64_t> g_double_max{ 0 };
+    std::atomic<std::uint64_t> g_double_minval{ 0 };
+    std::atomic<std::uint64_t> g_double_negzero{ 0 };
+    std::atomic<std::uint64_t> g_double_nan{ 0 };
+    std::atomic<std::uint64_t> g_double_posinf{ 0 };
+    std::atomic<std::uint64_t> g_double_neginf{ 0 };
+    std::atomic<std::uint64_t> g_double_pi_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_nan_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_neginf_stat{ 0 };
+    std::atomic<std::uint64_t> g_double_negzero_stat{ 0 };
+
+    // void + introspection
+    std::atomic<int> g_void_inst_is_void{ -1 };
+    std::atomic<int> g_void_stat_is_void{ -1 };
+    std::atomic<int> g_int_is_void{ -1 };     // is_void() on an int return -> must be false
+    std::atomic<int> g_int_is_string{ -1 };   // is_string() on an int return -> must be false
+
+    // Conversion-operator-on-value_t cross checks done in-detour
+    std::atomic<int> g_bool_true_to_int{ -1 };   // bool true -> int == 1
+    std::atomic<int> g_float_half_to_double{ -1 };// 0.5f -> double == 0.5 exactly
+
+    auto run_all_calls(const std::unique_ptr<method_primitives>& self) -> void
+    {
+        if (!self)
+        {
+            return;
+        }
+        method_primitives& s = *self;
+
+        // ---- boolean ----
+        g_bool_true_inst.store(s.call_bool("retBoolTrue") ? 1 : 0);
+        g_bool_false_inst.store(s.call_bool("retBoolFalse") ? 1 : 0);
+        g_bool_true_stat.store(method_primitives::scall_bool("sRetBoolTrue") ? 1 : 0);
+        g_bool_false_stat.store(method_primitives::scall_bool("sRetBoolFalse") ? 1 : 0);
+
+        // ---- byte ----
+        g_byte_zero.store(s.call_byte("retByteZero"));
+        g_byte_one.store(s.call_byte("retByteOne"));
+        g_byte_negone.store(s.call_byte("retByteNegOne"));
+        g_byte_max.store(s.call_byte("retByteMax"));
+        g_byte_min.store(s.call_byte("retByteMin"));
+        g_byte_negone_stat.store(method_primitives::scall_byte("sRetByteNegOne"));
+        g_byte_max_stat.store(method_primitives::scall_byte("sRetByteMax"));
+        g_byte_min_stat.store(method_primitives::scall_byte("sRetByteMin"));
+        // sign-extension: value_t holding int8_t(-1) read as int must be -1
+        {
+            const std::int32_t as_int = s.get_method("retByteNegOne")->call();
+            g_byte_negone_as_int.store(as_int);
+        }
+
+        // ---- short ----
+        g_short_zero.store(s.call_short("retShortZero"));
+        g_short_negone.store(s.call_short("retShortNegOne"));
+        g_short_max.store(s.call_short("retShortMax"));
+        g_short_min.store(s.call_short("retShortMin"));
+        g_short_negone_stat.store(method_primitives::scall_short("sRetShortNegOne"));
+        g_short_max_stat.store(method_primitives::scall_short("sRetShortMax"));
+        g_short_min_stat.store(method_primitives::scall_short("sRetShortMin"));
+
+        // ---- char ----
+        g_char_zero.store(s.call_char("retCharZero"));
+        g_char_a.store(s.call_char("retCharA"));
+        g_char_max.store(s.call_char("retCharMax"));
+        g_char_a_stat.store(method_primitives::scall_char("sRetCharA"));
+        g_char_max_stat.store(method_primitives::scall_char("sRetCharMax"));
+        // char 0xFFFF read into an int stays 65535 (zero-extend, not sign)
+        {
+            const std::int32_t as_int = s.get_method("retCharMax")->call();
+            g_char_max_as_int.store(as_int);
+        }
+
+        // ---- int ----
+        g_int_zero.store(s.call_int("retIntZero"));
+        g_int_negone.store(s.call_int("retIntNegOne"));
+        g_int_max.store(s.call_int("retIntMax"));
+        g_int_min.store(s.call_int("retIntMin"));
+        g_int_42.store(s.call_int("retIntFortyTwo"));
+        g_int_max_stat.store(method_primitives::scall_int("sRetIntMax"));
+        g_int_min_stat.store(method_primitives::scall_int("sRetIntMin"));
+        g_int_42_stat.store(method_primitives::scall_int("sRetIntFortyTwo"));
+        g_int_echo_inst.store(s.call_int_arg("echoInt", 1234567));
+        g_int_echo_stat.store(method_primitives::scall_int_arg("sEchoInt", -7654321));
+
+        // ---- long ----
+        g_long_zero.store(s.call_long("retLongZero"));
+        g_long_negone.store(s.call_long("retLongNegOne"));
+        g_long_max.store(s.call_long("retLongMax"));
+        g_long_min.store(s.call_long("retLongMin"));
+        g_long_big.store(s.call_long("retLongBig"));
+        g_long_max_stat.store(method_primitives::scall_long("sRetLongMax"));
+        g_long_min_stat.store(method_primitives::scall_long("sRetLongMin"));
+        g_long_big_stat.store(method_primitives::scall_long("sRetLongBig"));
+
+        // ---- float ----
+        g_float_zero.store(f2bits(s.call_float("retFloatZero")));
+        g_float_one.store(f2bits(s.call_float("retFloatOne")));
+        g_float_negone.store(f2bits(s.call_float("retFloatNegOne")));
+        g_float_half.store(f2bits(s.call_float("retFloatHalf")));
+        g_float_max.store(f2bits(s.call_float("retFloatMax")));
+        g_float_minval.store(f2bits(s.call_float("retFloatMinValue")));
+        g_float_negzero.store(f2bits(s.call_float("retFloatNegZero")));
+        g_float_nan.store(f2bits(s.call_float("retFloatNaN")));
+        g_float_posinf.store(f2bits(s.call_float("retFloatPosInf")));
+        g_float_neginf.store(f2bits(s.call_float("retFloatNegInf")));
+        g_float_half_stat.store(f2bits(method_primitives::scall_float("sRetFloatHalf")));
+        g_float_nan_stat.store(f2bits(method_primitives::scall_float("sRetFloatNaN")));
+        g_float_posinf_stat.store(f2bits(method_primitives::scall_float("sRetFloatPosInf")));
+        g_float_negzero_stat.store(f2bits(method_primitives::scall_float("sRetFloatNegZero")));
+        g_float_captured.store(true);
+
+        // ---- double ----
+        g_double_zero.store(d2bits(s.call_double("retDoubleZero")));
+        g_double_one.store(d2bits(s.call_double("retDoubleOne")));
+        g_double_negone.store(d2bits(s.call_double("retDoubleNegOne")));
+        g_double_pi.store(d2bits(s.call_double("retDoublePi")));
+        g_double_max.store(d2bits(s.call_double("retDoubleMax")));
+        g_double_minval.store(d2bits(s.call_double("retDoubleMinValue")));
+        g_double_negzero.store(d2bits(s.call_double("retDoubleNegZero")));
+        g_double_nan.store(d2bits(s.call_double("retDoubleNaN")));
+        g_double_posinf.store(d2bits(s.call_double("retDoublePosInf")));
+        g_double_neginf.store(d2bits(s.call_double("retDoubleNegInf")));
+        g_double_pi_stat.store(d2bits(method_primitives::scall_double("sRetDoublePi")));
+        g_double_nan_stat.store(d2bits(method_primitives::scall_double("sRetDoubleNaN")));
+        g_double_neginf_stat.store(d2bits(method_primitives::scall_double("sRetDoubleNegInf")));
+        g_double_negzero_stat.store(d2bits(method_primitives::scall_double("sRetDoubleNegZero")));
+        g_double_captured.store(true);
+
+        // ---- void + introspection ----
+        // is_void() must be true for a V-signature method and the side effect
+        // (voidInstanceHits) must increment.
+        g_void_inst_is_void.store(s.is_void("retVoidBump") ? 1 : 0);
+        g_void_stat_is_void.store(method_primitives::svoid("sRetVoidBump") ? 1 : 0);
+        // is_void()/is_string() on a non-void numeric return must be false.
+        g_int_is_void.store(s.is_void("retIntFortyTwo") ? 1 : 0);
+        g_int_is_string.store(s.is_string("retIntFortyTwo") ? 1 : 0);
+
+        // ---- conversion-operator cross checks ----
+        // bool true converted to int via value_t must be 1.
+        {
+            const std::int32_t btoi = s.get_method("retBoolTrue")->call();
+            g_bool_true_to_int.store(btoi);
+        }
+        // 0.5f -> double widening must be exactly 0.5 (representable).
+        {
+            const double h = s.get_method("retFloatHalf")->call();
+            g_float_half_to_double.store(h == 0.5 ? 1 : 0);
+        }
+    }
+}
+
+VMHOOK_JVM_MODULE(method_call_primitives)
+{
+    vmhook::register_class<method_primitives>("vmhook/fixtures/MethodPrimitives");
+
+    // Record which dispatch path the live JDK will use, for diagnostics.
+    const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
+    ctx.record(std::string{ "[INFO] method_call_primitives dispatch path: " }
+               + (call_stub_present ? "call_stub fast path (StubRoutines::_call_stub_entry present)"
+                                    : "JNI fallback (call stub absent)"));
+
+    {
+        auto handle{ vmhook::scoped_hook<method_primitives>(
+            "trigger",
+            [](vmhook::return_value&,
+               const std::unique_ptr<method_primitives>& self,
+               std::int32_t /*delta*/)
+            {
+                g_detour_calls.fetch_add(1, std::memory_order_relaxed);
+                g_detour_saw_self.store(self != nullptr, std::memory_order_relaxed);
+                // Perform every method_proxy::call() from inside this detour,
+                // where current_java_thread is set.
+                run_all_calls(self);
+            }) };
+        ctx.check("mcp_hook_installed", handle.installed());
+
+        const bool done{ ctx.run_probe(
+            [](bool v) { method_primitives::set_go(v); },
+            []() { return method_primitives::get_done(); }) };
+
+        ctx.check("mcp_probe_completed", done);
+        ctx.check("mcp_detour_fired", g_detour_calls.load(std::memory_order_relaxed) >= 1);
+        ctx.check("mcp_detour_saw_self", g_detour_saw_self.load(std::memory_order_relaxed));
+
+        // =====================================================================
+        //  boolean (Z)
+        // =====================================================================
+        ctx.check("mcp_bool_true_instance",  g_bool_true_inst.load()  == 1);
+        ctx.check("mcp_bool_false_instance", g_bool_false_inst.load() == 0);
+        ctx.check("mcp_bool_true_static",    g_bool_true_stat.load()  == 1);
+        ctx.check("mcp_bool_false_static",   g_bool_false_stat.load() == 0);
+        ctx.check("mcp_bool_true_to_int_is_1", g_bool_true_to_int.load() == 1);
+
+        // =====================================================================
+        //  byte (B) — signed, -128..127, sign-extension on widening
+        // =====================================================================
+        ctx.check("mcp_byte_zero",   g_byte_zero.load()   == 0);
+        ctx.check("mcp_byte_one",    g_byte_one.load()    == 1);
+        ctx.check("mcp_byte_negone", g_byte_negone.load() == -1);
+        ctx.check("mcp_byte_max_127", g_byte_max.load()   == 127);
+        ctx.check("mcp_byte_min_neg128", g_byte_min.load() == -128);
+        ctx.check("mcp_byte_negone_static", g_byte_negone_stat.load() == -1);
+        ctx.check("mcp_byte_max_static_127", g_byte_max_stat.load() == 127);
+        ctx.check("mcp_byte_min_static_neg128", g_byte_min_stat.load() == -128);
+        ctx.check("mcp_byte_negone_sign_extends_to_int", g_byte_negone_as_int.load() == -1);
+
+        // =====================================================================
+        //  short (S) — signed, -32768..32767
+        // =====================================================================
+        ctx.check("mcp_short_zero",   g_short_zero.load()   == 0);
+        ctx.check("mcp_short_negone", g_short_negone.load() == -1);
+        ctx.check("mcp_short_max_32767",  g_short_max.load() == 32767);
+        ctx.check("mcp_short_min_neg32768", g_short_min.load() == -32768);
+        ctx.check("mcp_short_negone_static", g_short_negone_stat.load() == -1);
+        ctx.check("mcp_short_max_static_32767", g_short_max_stat.load() == 32767);
+        ctx.check("mcp_short_min_static_neg32768", g_short_min_stat.load() == -32768);
+
+        // =====================================================================
+        //  char (C) — UNSIGNED, 0..65535, zero-extension on widening
+        // =====================================================================
+        ctx.check("mcp_char_zero", g_char_zero.load() == 0);
+        ctx.check("mcp_char_A_65", g_char_a.load() == 65);
+        ctx.check("mcp_char_max_65535", g_char_max.load() == 65535);
+        ctx.check("mcp_char_A_static_65", g_char_a_stat.load() == 65);
+        ctx.check("mcp_char_max_static_65535", g_char_max_stat.load() == 65535);
+        ctx.check("mcp_char_max_zero_extends_to_int_65535", g_char_max_as_int.load() == 65535);
+
+        // =====================================================================
+        //  int (I) — full signed 32-bit range + argument passthrough
+        // =====================================================================
+        ctx.check("mcp_int_zero",   g_int_zero.load()   == 0);
+        ctx.check("mcp_int_negone", g_int_negone.load() == -1);
+        ctx.check("mcp_int_max_2147483647", g_int_max.load() == 2147483647LL);
+        ctx.check("mcp_int_min_neg2147483648", g_int_min.load() == -2147483648LL);
+        ctx.check("mcp_int_42", g_int_42.load() == 42);
+        ctx.check("mcp_int_max_static", g_int_max_stat.load() == 2147483647LL);
+        ctx.check("mcp_int_min_static", g_int_min_stat.load() == -2147483648LL);
+        ctx.check("mcp_int_42_static", g_int_42_stat.load() == 42);
+        ctx.check("mcp_int_echo_instance_passthrough", g_int_echo_inst.load() == 1234567);
+        ctx.check("mcp_int_echo_static_passthrough", g_int_echo_stat.load() == -7654321);
+        // The (I)I echo also writes lastEchoArg in Java; the last echo executed
+        // in run_all_calls was the static one with -7654321.
+        ctx.check("mcp_echo_side_effect_arg", method_primitives::get_last_echo_arg() == -7654321);
+
+        // =====================================================================
+        //  long (J) — full signed 64-bit range (two local slots per long)
+        // =====================================================================
+        ctx.check("mcp_long_zero",   g_long_zero.load()   == 0);
+        ctx.check("mcp_long_negone", g_long_negone.load() == -1);
+        ctx.check("mcp_long_max", g_long_max.load() == std::numeric_limits<std::int64_t>::max());
+        ctx.check("mcp_long_min", g_long_min.load() == std::numeric_limits<std::int64_t>::min());
+        ctx.check("mcp_long_big_pattern", g_long_big.load() == static_cast<std::int64_t>(0x0123456789ABCDEFLL));
+        ctx.check("mcp_long_max_static", g_long_max_stat.load() == std::numeric_limits<std::int64_t>::max());
+        ctx.check("mcp_long_min_static", g_long_min_stat.load() == std::numeric_limits<std::int64_t>::min());
+        ctx.check("mcp_long_big_static", g_long_big_stat.load() == static_cast<std::int64_t>(0x0123456789ABCDEFLL));
+
+        // =====================================================================
+        //  float (F) — value + IEEE-754 special-value bit fidelity
+        // =====================================================================
+        ctx.check("mcp_float_captured", g_float_captured.load());
+        ctx.check("mcp_float_zero",   bits2f(g_float_zero.load())   == 0.0f);
+        ctx.check("mcp_float_one",    bits2f(g_float_one.load())    == 1.0f);
+        ctx.check("mcp_float_negone", bits2f(g_float_negone.load()) == -1.0f);
+        ctx.check("mcp_float_half",   bits2f(g_float_half.load())   == 0.5f);
+        ctx.check("mcp_float_max",    bits2f(g_float_max.load())    == std::numeric_limits<float>::max());
+        ctx.check("mcp_float_min_subnormal", bits2f(g_float_minval.load()) == std::numeric_limits<float>::denorm_min());
+        {
+            const float nz = bits2f(g_float_negzero.load());
+            ctx.check("mcp_float_negzero_value", nz == 0.0f);
+            ctx.check("mcp_float_negzero_signbit", std::signbit(nz));
+        }
+        ctx.check("mcp_float_nan_isnan", std::isnan(bits2f(g_float_nan.load())));
+        {
+            const float pinf = bits2f(g_float_posinf.load());
+            ctx.check("mcp_float_posinf_isinf", std::isinf(pinf) && pinf > 0.0f);
+            const float ninf = bits2f(g_float_neginf.load());
+            ctx.check("mcp_float_neginf_isinf", std::isinf(ninf) && ninf < 0.0f);
+        }
+        // static float paths
+        ctx.check("mcp_float_half_static", bits2f(g_float_half_stat.load()) == 0.5f);
+        ctx.check("mcp_float_nan_static_isnan", std::isnan(bits2f(g_float_nan_stat.load())));
+        {
+            const float pinf = bits2f(g_float_posinf_stat.load());
+            ctx.check("mcp_float_posinf_static_isinf", std::isinf(pinf) && pinf > 0.0f);
+            const float nz = bits2f(g_float_negzero_stat.load());
+            ctx.check("mcp_float_negzero_static_signbit", nz == 0.0f && std::signbit(nz));
+        }
+        ctx.check("mcp_float_half_widens_to_double_exact", g_float_half_to_double.load() == 1);
+
+        // =====================================================================
+        //  double (D) — value + IEEE-754 special-value bit fidelity
+        // =====================================================================
+        ctx.check("mcp_double_captured", g_double_captured.load());
+        ctx.check("mcp_double_zero",   bits2d(g_double_zero.load())   == 0.0);
+        ctx.check("mcp_double_one",    bits2d(g_double_one.load())    == 1.0);
+        ctx.check("mcp_double_negone", bits2d(g_double_negone.load()) == -1.0);
+        ctx.check("mcp_double_pi_bits", g_double_pi.load() == d2bits(3.141592653589793));
+        ctx.check("mcp_double_max", bits2d(g_double_max.load()) == std::numeric_limits<double>::max());
+        ctx.check("mcp_double_min_subnormal", bits2d(g_double_minval.load()) == std::numeric_limits<double>::denorm_min());
+        {
+            const double nz = bits2d(g_double_negzero.load());
+            ctx.check("mcp_double_negzero_value", nz == 0.0);
+            ctx.check("mcp_double_negzero_signbit", std::signbit(nz));
+        }
+        ctx.check("mcp_double_nan_isnan", std::isnan(bits2d(g_double_nan.load())));
+        {
+            const double pinf = bits2d(g_double_posinf.load());
+            ctx.check("mcp_double_posinf_isinf", std::isinf(pinf) && pinf > 0.0);
+            const double ninf = bits2d(g_double_neginf.load());
+            ctx.check("mcp_double_neginf_isinf", std::isinf(ninf) && ninf < 0.0);
+        }
+        // static double paths
+        ctx.check("mcp_double_pi_static_bits", g_double_pi_stat.load() == d2bits(3.141592653589793));
+        ctx.check("mcp_double_nan_static_isnan", std::isnan(bits2d(g_double_nan_stat.load())));
+        {
+            const double ninf = bits2d(g_double_neginf_stat.load());
+            ctx.check("mcp_double_neginf_static_isinf", std::isinf(ninf) && ninf < 0.0);
+            const double nz = bits2d(g_double_negzero_stat.load());
+            ctx.check("mcp_double_negzero_static_signbit", nz == 0.0 && std::signbit(nz));
+        }
+
+        // =====================================================================
+        //  void (V) + value_t introspection
+        // =====================================================================
+        ctx.check("mcp_void_instance_is_void", g_void_inst_is_void.load() == 1);
+        ctx.check("mcp_void_static_is_void", g_void_stat_is_void.load() == 1);
+        // void side effects: instance bump once, static bump once.
+        ctx.check("mcp_void_instance_side_effect", method_primitives::get_void_instance_hits() == 1);
+        ctx.check("mcp_void_static_side_effect", method_primitives::get_void_static_hits() == 1);
+        // A numeric (int) return must NOT be reported as void or string.
+        ctx.check("mcp_int_return_is_not_void", g_int_is_void.load() == 0);
+        ctx.check("mcp_int_return_is_not_string", g_int_is_string.load() == 0);
+    }
+}

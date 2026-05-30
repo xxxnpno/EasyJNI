@@ -279,15 +279,26 @@ jobs:
           }
           $results = Get-Content "test_results.txt"
           $results | ForEach-Object { Write-Host $_ }
-          $fail = $results | Where-Object { $_ -match '^\[FAIL\]' }
-          if ($fail) {
+          $pass = @($results | Where-Object { $_ -match '^\[PASS\]' })
+          $fail = @($results | Where-Object { $_ -match '^\[FAIL\]' })
+          Write-Host "Summary: $($pass.Count) PASS, $($fail.Count) FAIL"
+          if ($fail.Count -gt 0) {
+            foreach ($line in $fail) { Write-Host "::error::$line" }
             Write-Error "$($fail.Count) FAIL line(s) in test_results.txt"
             exit 1
           }
           if ($java.ExitCode -ne 0) {
             Write-Host "::warning::java.exe exit=$($java.ExitCode) on the way out, but all tests in test_results.txt passed"
           }
-          Write-Host "Java ${{ matrix.java }} / ${{ matrix.compiler }}: ALL PASS"
+          Write-Host "Java ${{ matrix.java }} / ${{ matrix.compiler }}: ALL PASS ($($pass.Count) checks)"
+
+      - name: Upload test_results.txt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-windows-${{ matrix.compiler }}-java${{ matrix.java }}
+          path: test_results.txt
+          if-no-files-found: ignore
 
   jvm-linux:
     name: jvm · linux · ${{ matrix.compiler }} · java ${{ matrix.java }}

@@ -34,4 +34,8 @@ test_results.txt
 java_stdout.txt
 java_stderr.txt
 
-.claude/
+# Ignore local Claude Code settings, but DO track the committed specialized
+# feature agents — one subagent per vmhook feature, each mastering its feature
+# and owning its exhaustive JVM test module.
+.claude/*
+!.claude/agents/

@@ -1,0 +1,190 @@
+package vmhook.fixtures;
+
+import vmhook.Harness;
+
+/**
+ * Fixture for the field_arrays_primitive feature (area: fields).
+ *
+ * Exercises reading Java primitive arrays
+ *   [Z [B [S [C [I [J [F [D
+ * out of object/static fields into std::vector&lt;T&gt; via the C++
+ * get_field("a")-&gt;get() implicit-conversion path (the primitive-array read
+ * path inside field_proxy::value_t::read_array_value / append_array_value).
+ *
+ * The native module reads every field declared here and asserts the size and
+ * each element against the values frozen below.  Coverage angles per type:
+ *   - a canonical 3-element array with distinct, easily-recognised values,
+ *   - an empty array (length 0),
+ *   - a single-element array,
+ *   - a large array (256 elements) populated by a deterministic formula,
+ *   - a boundary array holding the type's MIN / MAX / special values.
+ * Both the STATIC and the INSTANCE variants of every canonical array exist so
+ * the native side covers the static-mirror read path and the instance-offset
+ * read path independently.
+ *
+ * Shape mirrors the canonical Pilot fixture: a public-static-volatile go/done
+ * handshake the native side drives through run_probe, a self-reference
+ * 'instance' the native side wraps for instance-field reads, and a static-block
+ * self-registration of a Harness.Probe.  The probe touches one element of every
+ * array through a real Java bytecode dispatch (publishing a checksum) before it
+ * raises 'done'; the native reads happen out-of-probe through direct field
+ * access, which is the real-world usage pattern for field_proxy array reads.
+ *
+ * Pure-ASCII source on purpose (no box-drawing comment glyphs, char literals
+ * written as \\uXXXX escapes) so it compiles under javac 8..25 with any
+ * -encoding.  Java 8 syntax only: no var, no records, no switch-expressions.
+ */
+public final class FieldArraysPrimitive
+{
+    /** Native sets this true to request the action; clears it after. */
+    public static volatile boolean go;
+
+    /** The action sets this true once it has run; native polls it. */
+    public static volatile boolean done;
+
+    /** Self-reference so the native side can wrap an instance for the
+     *  instance-field read path (read as a unique_ptr&lt;wrapper&gt;). */
+    public static FieldArraysPrimitive instance = new FieldArraysPrimitive();
+
+    /** Touched by the probe so the native side can confirm the bytecode
+     *  dispatch actually ran (a non-zero checksum proves run() executed). */
+    public static volatile long probeChecksum;
+
+    // --- Canonical 3-element STATIC arrays -----------------------------------
+    // Values chosen so each element is distinct and trivially recognisable on
+    // the C++ side (ascending, well inside each type's range).
+    public static boolean[] staticBoolArray   = { true, false, true };
+    public static byte[]    staticByteArray   = { (byte) 1, (byte) 2, (byte) 3 };
+    public static short[]   staticShortArray  = { (short) 100, (short) 200, (short) 300 };
+    public static char[]    staticCharArray   = { 'A', 'B', 'C' };
+    public static int[]     staticIntArray    = { 1000, 2000, 3000 };
+    public static long[]    staticLongArray   = { 1000000000L, 2000000000L, 3000000000L };
+    public static float[]   staticFloatArray  = { 1.5f, 2.5f, 3.5f };
+    public static double[]  staticDoubleArray = { 1.25, 2.25, 3.25 };
+
+    // --- Canonical 3-element INSTANCE arrays ---------------------------------
+    public boolean[] instBoolArray   = { false, true, false };
+    public byte[]    instByteArray   = { (byte) 4, (byte) 5, (byte) 6 };
+    public short[]   instShortArray  = { (short) 400, (short) 500, (short) 600 };
+    public char[]    instCharArray   = { 'X', 'Y', 'Z' };
+    public int[]     instIntArray    = { 4000, 5000, 6000 };
+    public long[]    instLongArray   = { 4000000000L, 5000000000L, 6000000000L };
+    public float[]   instFloatArray  = { 4.5f, 5.5f, 6.5f };
+    public double[]  instDoubleArray = { 4.25, 5.25, 6.25 };
+
+    // --- Empty arrays (length 0) for every type ------------------------------
+    public static boolean[] emptyBoolArray   = new boolean[0];
+    public static byte[]    emptyByteArray   = new byte[0];
+    public static short[]   emptyShortArray  = new short[0];
+    public static char[]    emptyCharArray   = new char[0];
+    public static int[]     emptyIntArray    = new int[0];
+    public static long[]    emptyLongArray   = new long[0];
+    public static float[]   emptyFloatArray  = new float[0];
+    public static double[]  emptyDoubleArray = new double[0];
+
+    // --- Single-element arrays for every type --------------------------------
+    public static boolean[] singleBoolArray   = { true };
+    public static byte[]    singleByteArray   = { (byte) 42 };
+    public static short[]   singleShortArray  = { (short) 12345 };
+    public static char[]    singleCharArray   = { 'Q' };
+    public static int[]     singleIntArray    = { 1234567 };
+    public static long[]    singleLongArray   = { 1234567890123L };
+    public static float[]   singleFloatArray  = { 3.14159f };
+    public static double[]  singleDoubleArray = { 2.718281828 };
+
+    // --- Large arrays (256 elements) by a deterministic formula --------------
+    // Filled in the static / instance initialisers below so the C++ side can
+    // recompute the expected value at each index without a second data copy.
+    public static final int LARGE_LEN = 256;
+    public static boolean[] largeBoolArray   = new boolean[LARGE_LEN];
+    public static byte[]    largeByteArray   = new byte[LARGE_LEN];
+    public static short[]   largeShortArray  = new short[LARGE_LEN];
+    public static char[]    largeCharArray   = new char[LARGE_LEN];
+    public static int[]     largeIntArray    = new int[LARGE_LEN];
+    public static long[]    largeLongArray   = new long[LARGE_LEN];
+    public static float[]   largeFloatArray  = new float[LARGE_LEN];
+    public static double[]  largeDoubleArray = new double[LARGE_LEN];
+
+    // --- Boundary-value arrays (MIN / special / MAX per type) ----------------
+    // boolean has no numeric boundary; we encode a {false,true,true} pattern.
+    public static boolean[] boundaryBoolArray   = { false, true, true };
+    public static byte[]    boundaryByteArray   = { Byte.MIN_VALUE, (byte) 0, Byte.MAX_VALUE };
+    public static short[]   boundaryShortArray  = { Short.MIN_VALUE, (short) 0, Short.MAX_VALUE };
+    public static char[]    boundaryCharArray   = { Character.MIN_VALUE, (char) 0x41, (char) 0x7F };
+    public static int[]     boundaryIntArray    = { Integer.MIN_VALUE, 0, Integer.MAX_VALUE };
+    public static long[]    boundaryLongArray   = { Long.MIN_VALUE, 0L, Long.MAX_VALUE };
+    public static float[]   boundaryFloatArray  =
+        { -Float.MAX_VALUE, 0.0f, Float.MAX_VALUE };
+    public static double[]  boundaryDoubleArray =
+        { -Double.MAX_VALUE, 0.0, Double.MAX_VALUE };
+
+    // Extra float/double special-value arrays (NaN / +Inf / -Inf / subnormal).
+    public static float[]   specialFloatArray  =
+        { Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.MIN_VALUE };
+    public static double[]  specialDoubleArray =
+        { Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, Double.MIN_VALUE };
+
+    // A long[] whose elements hold values that do NOT fit in 32 bits, so a
+    // (buggy) narrow read into vector<int32_t> would be detectable as the low
+    // 32 bits.  Used by the width-mismatch documentation check on the native
+    // side.  High word differs from low word for every element.
+    public static long[]    wideLongArray =
+        { 0x1122334455667788L, 0x7FFFFFFF00000001L, -1L };
+
+    // A char[] holding high (>0xFF) code units, written as (char) integer
+    // casts so the source stays pure ASCII (compiles under any javac -encoding,
+    // and survives source-normalisation that would otherwise un-escape a
+    // literal).  Elements: 'a'(0x61), 0x00FF, 0x0100, 0x20AC (euro sign).
+    // Lets the native side document the lossy char[] -> vector<char> narrowing
+    // (each 16-bit code unit truncated to the low 8 bits).
+    public static char[]    unicodeCharArray =
+        { 'a', (char) 0x00FF, (char) 0x0100, (char) 0x20AC };
+
+    static
+    {
+        for (int i = 0; i < LARGE_LEN; ++i)
+        {
+            largeBoolArray[i]   = (i % 2) == 0;
+            largeByteArray[i]   = (byte) (i - 128);          // spans -128..127
+            largeShortArray[i]  = (short) (i * 7 - 900);
+            largeCharArray[i]   = (char) (i + 32);           // printable-ish
+            largeIntArray[i]    = i * 3 + 1;
+            largeLongArray[i]   = (long) i * 1000000007L + 5L;
+            largeFloatArray[i]  = i + 0.5f;
+            largeDoubleArray[i] = i + 0.25;
+        }
+
+        Harness.register(new Harness.Probe()
+        {
+            @Override
+            public boolean pending()
+            {
+                return FieldArraysPrimitive.go && !FieldArraysPrimitive.done;
+            }
+
+            @Override
+            public void run()
+            {
+                // Touch one element of every array through real bytecode
+                // dispatch so the run is observable, then publish a checksum.
+                long sum = 0L;
+                sum += staticBoolArray[0] ? 1L : 0L;
+                sum += staticByteArray[0];
+                sum += staticShortArray[0];
+                sum += staticCharArray[0];
+                sum += staticIntArray[0];
+                sum += staticLongArray[0];
+                sum += (long) staticFloatArray[0];
+                sum += (long) staticDoubleArray[0];
+                sum += instance.instBoolArray[1] ? 1L : 0L;
+                sum += instance.instByteArray[0];
+                sum += instance.instIntArray[0];
+                sum += instance.instLongArray[0];
+                sum += largeIntArray[LARGE_LEN - 1];
+                sum += singleIntArray[0];
+                FieldArraysPrimitive.probeChecksum = sum;
+                FieldArraysPrimitive.done = true;
+            }
+        });
+    }
+}
