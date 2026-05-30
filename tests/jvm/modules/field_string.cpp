@@ -329,9 +329,27 @@ VMHOOK_JVM_MODULE(field_string)
               && static_cast<unsigned char>(cjk2048[6142]) == 0x97
               && static_cast<unsigned char>(cjk2048[6143]) == 0xA5);
 
-    // --- 2049 CJK chars: UTF-16 byte length 4098 > 4096 -> REJECTED -> "". ---
-    ctx.check("get_cjk2049_rejected_empty_utf16_cap_2048_BUG",
-              field_string_fixture::read_static("getCjk2049").empty());
+    // --- 2049 CJK chars: read_java_string's 4096 cap is on the backing-ARRAY
+    // length.  On JDK 9+ compact strings the UTF-16 backing is a byte[] (2 bytes
+    // per char), so 2049 chars = 4098 bytes > 4096 -> rejected -> "".  On JDK 8
+    // the backing is a char[] (1 unit per char), so 2049 <= 4096 -> the read
+    // succeeds (2049 kanji -> 2049*3 = 6147 UTF-8 bytes).  Branch on whether the
+    // String class carries the JDK-9 `coder` field (i.e. uses compact strings). ---
+    {
+        vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
+        const bool compact_strings{ string_klass != nullptr
+                                    && string_klass->find_field("coder").has_value() };
+        const std::string cjk2049{ field_string_fixture::read_static("getCjk2049") };
+        if (compact_strings)
+        {
+            ctx.check("get_cjk2049_rejected_empty_utf16_cap_2048", cjk2049.empty());
+        }
+        else
+        {
+            // JDK 8 char[]: 2049 chars are within the 4096-char cap and decode fine.
+            ctx.check("get_cjk2049_classic_char_array_read_6147", cjk2049.size() == 2049u * 3u);
+        }
+    }
 
     // ----------------------------------------------------------------------
     // PHASE 2: install the interpreter hook and run the probe, which fires a

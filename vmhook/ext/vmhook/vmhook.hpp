@@ -7619,6 +7619,25 @@ namespace vmhook
                 break;
             }
 
+            // Validate the Method's ConstMethod -> ConstantPool chain BEFORE
+            // reading its name/signature.  get_name()/get_signature() dereference
+            // that chain WITHOUT per-step pointer gates, so a valid-looking but
+            // not-real Method* — which the saved-rbp walk can land on when it
+            // strays into a non-interpreter (e.g. native/compiled) frame, observed
+            // as an AV on clang / JDK 17 — would crash here.  Resolving and
+            // validating the chain up front lets the walk break cleanly instead,
+            // and the class-name lookup below reuses the now-trusted pointers.
+            auto* const const_method{ caller_method->get_const_method() };
+            if (!const_method || !vmhook::hotspot::is_valid_pointer(const_method))
+            {
+                break;
+            }
+            auto* const constants{ const_method->get_constants() };
+            if (!constants || !vmhook::hotspot::is_valid_pointer(constants))
+            {
+                break;
+            }
+
             std::string method_name{ caller_method->get_name() };
             if (method_name.empty())
             {
@@ -7630,34 +7649,24 @@ namespace vmhook
             info.method_name = std::move(method_name);
             info.signature   = caller_method->get_signature();
 
-            // Class-name lookup is best-effort: when the stack walk
-            // strays into invalid territory the chain of pointer reads
-            // through ConstMethod / ConstantPool / Klass can land on
-            // garbage that happens to pass the not-null check.  Gate
-            // every dereference with is_valid_pointer so we leave the
-            // class name empty instead of segfaulting.
-            if (auto* const const_method{ caller_method->get_const_method() };
-                const_method && vmhook::hotspot::is_valid_pointer(const_method))
+            // Class-name lookup is best-effort: walk the now-validated
+            // ConstantPool -> _pool_holder -> Klass -> name chain, still gating
+            // every dereference with is_valid_pointer so a stray pointer leaves
+            // the class name empty instead of segfaulting.
+            if (pool_holder_entry)
             {
-                if (auto* const cp{ const_method->get_constants() };
-                    cp && vmhook::hotspot::is_valid_pointer(cp))
+                const auto* const slot{
+                    reinterpret_cast<const std::uint8_t*>(constants) + pool_holder_entry->offset };
+                if (vmhook::hotspot::is_valid_pointer(slot))
                 {
-                    if (pool_holder_entry)
+                    auto* const klass{
+                        *reinterpret_cast<vmhook::hotspot::klass* const*>(slot) };
+                    if (klass && vmhook::hotspot::is_valid_pointer(klass))
                     {
-                        const auto* const slot{
-                            reinterpret_cast<const std::uint8_t*>(cp) + pool_holder_entry->offset };
-                        if (vmhook::hotspot::is_valid_pointer(slot))
+                        if (auto* const name_symbol{ klass->get_name() };
+                            name_symbol && vmhook::hotspot::is_valid_pointer(name_symbol))
                         {
-                            auto* const klass{
-                                *reinterpret_cast<vmhook::hotspot::klass* const*>(slot) };
-                            if (klass && vmhook::hotspot::is_valid_pointer(klass))
-                            {
-                                if (auto* const name_symbol{ klass->get_name() };
-                                    name_symbol && vmhook::hotspot::is_valid_pointer(name_symbol))
-                                {
-                                    info.class_name = name_symbol->to_string();
-                                }
-                            }
+                            info.class_name = name_symbol->to_string();
                         }
                     }
                 }
