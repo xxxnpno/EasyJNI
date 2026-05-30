@@ -3207,6 +3207,10 @@ static auto run_test_suite() -> void
             };
             const std::size_t modules_ran{ vmhook_test::run_all(ctx) };
             write_result("[INFO] ran " + std::to_string(modules_ran) + " modular JVM test module(s).");
+            // Closes the verification gap: a green CI must mean the modular
+            // registry actually ran (not vacuously empty), so every module's
+            // own [FAIL]s are meaningful.
+            check("modular_registry_ran_at_least_one_module", modules_ran >= 1);
         }
 
         // ── vmhook vs pure JNI microbench ────────────────────────────
