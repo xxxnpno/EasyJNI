@@ -1650,11 +1650,16 @@ namespace
             Method calls intentionally mirror field access. The wrapper chooses
             the Java method name, and the call site passes only the C++ arguments.
         */
+        write_result("[INFO] >> call_example_methods: set_static_called");
         example_class::set_static_called(0);
+        write_result("[INFO] >> call_example_methods: set_non_static_called");
         instance.set_non_static_called(0);
 
+        write_result("[INFO] >> call_example_methods: static_call_me(1)");
         example_class::static_call_me(1);
+        write_result("[INFO] >> call_example_methods: not_static_call_me(2)");
         instance.not_static_call_me(2);
+        write_result("[INFO] >> call_example_methods: calls returned");
 
         check_equal("staticCallMe", example_class::get_static_called(), static_cast<std::int32_t>(1));
         check_equal("nonStaticCallMe", instance.get_non_static_called(), static_cast<std::int32_t>(1));
