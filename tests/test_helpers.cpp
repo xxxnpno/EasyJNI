@@ -463,7 +463,12 @@ static auto test_write_jni_arg_to_slot_unique_ptr_branch() -> void
 
     vmhook::detail::jni_value value{};
     void* storage{ nullptr };
-    vmhook::detail::write_jni_arg_to_slot(value, storage, wrapper);
+    bool needs_release{ true };
+    vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, wrapper);
+
+    // An object handle is a synthetic stack pointer, NOT a JNI local ref —
+    // the cleanup must never DeleteLocalRef it.
+    check("write_jni_arg_to_slot_unique_ptr_no_release", needs_release == false);
 
     // value.l must be a NON-NULL pointer (specifically, &storage).
     check("write_jni_arg_to_slot_unique_ptr_value_l_non_null",
@@ -496,8 +501,10 @@ static auto test_write_jni_arg_to_slot_null_unique_ptr() -> void
 
     vmhook::detail::jni_value value{};
     void* storage{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xDEADull)) };  // pre-fill to detect overwrite
-    vmhook::detail::write_jni_arg_to_slot(value, storage, wrapper);
+    bool needs_release{ true };
+    vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, wrapper);
 
+    check("write_jni_arg_to_slot_null_unique_ptr_no_release", needs_release == false);
     check("write_jni_arg_to_slot_null_unique_ptr_value_l_still_points_at_storage",
           value.l == static_cast<void*>(&storage));
     check("write_jni_arg_to_slot_null_unique_ptr_storage_cleared",
@@ -678,35 +685,67 @@ static auto test_write_jni_arg_to_slot_primitive_branches() -> void
 {
     // Sanity that the primitive branches still hit, after the static_assert
     // guard was added in the trailing else.
+    //
+    // The `needs_release` out-parameter is the critical-bug regression guard:
+    // jni_value is a union, so a primitive arg aliases .l.  If the cleanup path
+    // ever decided "is this a JNI local ref?" by reading .l back, a primitive
+    // bit pattern (e.g. jlong 0x1122334455667788) would be handed to
+    // DeleteLocalRef as a garbage pointer.  Every primitive branch MUST leave
+    // needs_release == false; only the string branches set it true.
     {
         vmhook::detail::jni_value value{};
         void* storage{};
-        vmhook::detail::write_jni_arg_to_slot(value, storage, true);
+        bool needs_release{ true };  // start true to prove the branch clears it
+        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, true);
         check("write_jni_arg_to_slot_bool", value.z == true);
+        check("write_jni_arg_to_slot_bool_no_release", needs_release == false);
     }
     {
         vmhook::detail::jni_value value{};
         void* storage{};
-        vmhook::detail::write_jni_arg_to_slot(value, storage, std::int32_t{ 42 });
+        bool needs_release{ true };
+        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, std::int32_t{ 42 });
         check("write_jni_arg_to_slot_int", value.i == 42);
+        check("write_jni_arg_to_slot_int_no_release", needs_release == false);
     }
     {
+        // The smoking-gun value: a jlong whose bits, read back as .l, look like
+        // a plausible heap pointer.  Must NOT be flagged for release.
         vmhook::detail::jni_value value{};
         void* storage{};
-        vmhook::detail::write_jni_arg_to_slot(value, storage, std::int64_t{ 0x1122334455667788ll });
+        bool needs_release{ true };
+        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, std::int64_t{ 0x1122334455667788ll });
         check("write_jni_arg_to_slot_long", value.j == 0x1122334455667788ll);
+        check("write_jni_arg_to_slot_long_no_release", needs_release == false);
     }
     {
         vmhook::detail::jni_value value{};
         void* storage{};
-        vmhook::detail::write_jni_arg_to_slot(value, storage, 3.14f);
+        bool needs_release{ true };
+        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, 3.14f);
         check("write_jni_arg_to_slot_float", value.f == 3.14f);
+        check("write_jni_arg_to_slot_float_no_release", needs_release == false);
     }
     {
         vmhook::detail::jni_value value{};
         void* storage{};
-        vmhook::detail::write_jni_arg_to_slot(value, storage, 2.71828);
+        bool needs_release{ true };
+        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, 2.71828);
         check("write_jni_arg_to_slot_double", value.d == 2.71828);
+        check("write_jni_arg_to_slot_double_no_release", needs_release == false);
+    }
+    {
+        // Object-base derived arg: value.l points at the synthetic stack handle
+        // (storage), which is NOT a JNI local ref — must not be released.
+        // We can't construct a real object_base without a JVM, but a c-string
+        // with a null pointer exercises the "string branch produced null" path:
+        // needs_release must stay false because there's nothing to delete.
+        vmhook::detail::jni_value value{};
+        void* storage{};
+        bool needs_release{ true };
+        const char* null_cstr{ nullptr };
+        vmhook::detail::write_jni_arg_to_slot(value, storage, needs_release, null_cstr);
+        check("write_jni_arg_to_slot_null_cstr_no_release", needs_release == false);
     }
 }
 

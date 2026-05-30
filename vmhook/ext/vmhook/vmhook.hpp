@@ -9556,23 +9556,33 @@ namespace vmhook
             @param arg             The C++ argument to convert.
         */
         template<typename arg_type>
-        inline auto append_jni_arg(std::vector<vmhook::detail::jni_value>& values, std::vector<void*>& object_handles, arg_type&& arg) noexcept
+        inline auto append_jni_arg(std::vector<vmhook::detail::jni_value>& values, std::vector<void*>& object_handles, std::vector<char>& needs_release, arg_type&& arg) noexcept
             -> void
         {
             using clean_t = std::decay_t<arg_type>;
             vmhook::detail::jni_value value{};
+            // Tag tracked in lockstep with `values`: 1 ONLY for jstrings from
+            // NewStringUTF (real local refs that must be DeleteLocalRef'd).
+            // Reading value.l back at cleanup time is unsound because jni_value
+            // is a union — a primitive arg aliases .l and would be deleted as a
+            // garbage pointer.  std::vector<char> (not <bool>) so &back() is a
+            // real addressable byte if ever needed.
+            char release_tag{ 0 };
 
             if constexpr (std::is_same_v<clean_t, std::string>)
             {
                 value.l = vmhook::detail::jni_new_string_utf(arg);
+                release_tag = (value.l != nullptr) ? 1 : 0;
             }
             else if constexpr (std::is_same_v<clean_t, std::string_view>)
             {
                 value.l = vmhook::detail::jni_new_string_utf(arg);
+                release_tag = (value.l != nullptr) ? 1 : 0;
             }
             else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
             {
                 value.l = vmhook::detail::jni_new_string_utf(arg ? std::string_view{ arg } : std::string_view{});
+                release_tag = (value.l != nullptr) ? 1 : 0;
             }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
@@ -9624,6 +9634,7 @@ namespace vmhook
             }
 
             values.push_back(value);
+            needs_release.push_back(release_tag);
         }
 
         /*
@@ -9641,13 +9652,14 @@ namespace vmhook
             @return  Vector of jni_value ready to pass to CallXMethodA.
         */
         template<typename... args_t>
-        inline auto make_jni_args(std::vector<void*>& object_handles, args_t&&... args) noexcept
+        inline auto make_jni_args(std::vector<void*>& object_handles, std::vector<char>& needs_release, args_t&&... args) noexcept
             -> std::vector<vmhook::detail::jni_value>
         {
             std::vector<vmhook::detail::jni_value> values{};
             values.reserve(sizeof...(args_t));
             object_handles.reserve(sizeof...(args_t));
-            (vmhook::detail::append_jni_arg(values, object_handles, std::forward<args_t>(args)), ...);
+            needs_release.reserve(sizeof...(args_t));
+            (vmhook::detail::append_jni_arg(values, object_handles, needs_release, std::forward<args_t>(args)), ...);
             return values;
         }
 
@@ -9663,26 +9675,40 @@ namespace vmhook
             @param storage  Storage for the indirect-handle pointer
                             when the arg is an object reference; the
                             jvalue.l points at this slot.
+            @param needs_release  Set to true ONLY when this slot holds a JNI
+                            local reference that the caller must DeleteLocalRef
+                            (i.e. a jstring produced by NewStringUTF).  Left
+                            false for primitives and synthetic object handles.
+                            This is a dedicated tag because jni_value is a
+                            union — reading value.l back to decide whether a
+                            slot is a reference is unsound: a primitive arg
+                            (e.g. jlong 0x4242'4242'4242'4242) aliases .l and
+                            would be handed to DeleteLocalRef as a garbage
+                            pointer.
             @param arg      C++ value to convert.
         */
         template<typename arg_type>
         inline auto write_jni_arg_to_slot(vmhook::detail::jni_value& value,
                                            void*& storage,
+                                           bool& needs_release,
                                            arg_type&& arg) noexcept -> void
         {
             using clean_t = std::decay_t<arg_type>;
             value = vmhook::detail::jni_value{};
+            needs_release = false;
 
             if constexpr (std::is_same_v<clean_t, std::string>
                        || std::is_same_v<clean_t, std::string_view>)
             {
                 value.l = vmhook::detail::jni_new_string_utf(arg);
+                needs_release = (value.l != nullptr);
             }
             else if constexpr (std::is_same_v<clean_t, const char*>
                             || std::is_same_v<clean_t, char*>)
             {
                 value.l = arg ? vmhook::detail::jni_new_string_utf(std::string_view{ arg })
                               : nullptr;
+                needs_release = (value.l != nullptr);
             }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
@@ -9774,37 +9800,33 @@ namespace vmhook
             void* const klass{ vmhook::detail::jni_oop_handle(class_mirror, class_handle_storage) };
 
             std::vector<void*> object_handles{};
-            std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, std::forward<args_t>(args)...) };
+            std::vector<char>  arg_needs_release{};
+            std::vector<vmhook::detail::jni_value> values{ vmhook::detail::make_jni_args(object_handles, arg_needs_release, std::forward<args_t>(args)...) };
 
-            // RAII release of any JNI local refs picked up by make_jni_args
-            // (string-typed args go through jni_new_string_utf which returns a
-            // local ref; object args store an indirect handle that points
-            // INTO object_handles).  The discriminator is "value.l falls
-            // outside the object_handles storage range" - those are string
-            // refs that need DeleteLocalRef.  object_handle from NewObjectA
-            // is also a JNI local ref; release it after we decode the OOP
-            // (the OOP itself is a GC root via the wrapper_type unique_ptr
-            // we hand back, so dropping the local ref does not lose the
-            // object).
+            // RAII release of any JNI local refs picked up by make_jni_args.
+            // The per-slot `arg_needs_release[i]` tag is 1 ONLY for jstrings
+            // from NewStringUTF; object args (whose value.l points INTO
+            // object_handles) and primitives are tagged 0.  We MUST NOT read
+            // value.l back to make this decision: jni_value is a union, so a
+            // primitive arg (jlong / jint / jdouble) aliases .l and a
+            // range-check against object_handles can spuriously decide a
+            // primitive bit pattern is an out-of-range "string ref", handing
+            // garbage to DeleteLocalRef.  object_handle from NewObjectA is
+            // released after we decode the OOP (the OOP stays a GC root via
+            // the wrapper_type unique_ptr we hand back).
             struct jni_arg_cleanup
             {
-                const std::vector<void*>* obj_handles;
+                const std::vector<char>* needs_release;
                 std::vector<vmhook::detail::jni_value>* values_vec;
                 void* object_handle{ nullptr };
 
                 ~jni_arg_cleanup() noexcept
                 {
-                    const void* const begin{ obj_handles->data() };
-                    const void* const end{ obj_handles->data() + obj_handles->size() };
-                    for (auto& v : *values_vec)
+                    for (std::size_t i{ 0 }; i < values_vec->size(); ++i)
                     {
-                        if (!v.l)
+                        if (i < needs_release->size() && (*needs_release)[i])
                         {
-                            continue;
-                        }
-                        if (v.l < begin || v.l >= end)
-                        {
-                            vmhook::detail::jni_delete_local_ref(v.l);
+                            vmhook::detail::jni_delete_local_ref((*values_vec)[i].l);
                         }
                     }
                     if (object_handle)
@@ -9812,7 +9834,7 @@ namespace vmhook
                         vmhook::detail::jni_delete_local_ref(object_handle);
                     }
                 }
-            } cleanup{ &object_handles, &values, nullptr };
+            } cleanup{ &arg_needs_release, &values, nullptr };
 
             std::string signature{ "(" };
             ((signature += vmhook::detail::jni_signature_for_arg<std::remove_cvref_t<args_t>>()), ...);
@@ -11161,6 +11183,36 @@ namespace vmhook
         {
             using clean_value_type = std::remove_cvref_t<value_type>;
 
+            // Reject string / vector / unique_ptr writes when the field is a primitive.
+            // Without this guard, `set(std::string{"42"})` on an "I" field would walk
+            // through set_str_field -> field_oop -> decode_array_oop, reinterpreting
+            // the int's bytes as a compressed OOP and writing into wherever that
+            // decoded address points.  The trivially-copyable branch below has its
+            // own size guard; this is the symmetric one for the non-primitive arms.
+            //
+            // Helper returns 0 for L / [ / V / unknown / empty signatures (i.e.
+            // reference / array / void), so this fires only for genuine primitive
+            // descriptors (Z B C S I J F D).
+            if constexpr (std::is_same_v<clean_value_type, std::string>
+                       || (std::is_convertible_v<value_type, std::string_view> && !std::is_same_v<clean_value_type, std::string>)
+                       || vmhook::detail::is_vector_v<clean_value_type>
+                       || vmhook::detail::is_unique_ptr_v<clean_value_type>)
+            {
+                if (vmhook::detail::jvm_primitive_byte_width(this->signature_text) != 0)
+                {
+                    VMHOOK_LOG("{} field_proxy::set: refusing to write a non-primitive "
+                               "C++ value (string / vector / unique_ptr) into a primitive "
+                               "JVM field (sig='{}') at {:p} ({} field) - the legacy code "
+                               "path would have reinterpreted the field's bytes as a "
+                               "compressed OOP and written to a wild heap address.  Pass "
+                               "the matching primitive type instead.",
+                               vmhook::error_tag, this->signature_text,
+                               this->field_pointer,
+                               this->static_field ? "static" : "instance");
+                    return;
+                }
+            }
+
             if constexpr (std::is_same_v<clean_value_type, std::string>)
             {
                 vmhook::set_str_field(*this, value);
@@ -11238,10 +11290,13 @@ namespace vmhook
                     vmhook::detail::jvm_primitive_byte_width(this->signature_text) };
                 if (field_size != 0 && value_size != field_size)
                 {
-                    VMHOOK_LOG("{} field_proxy::set: size mismatch (value={}B, field={}B, "
-                               "sig='{}') - refusing the write to avoid clobbering adjacent "
-                               "fields.  Convert the value to the matching primitive type.",
-                               vmhook::error_tag, value_size, field_size, this->signature_text);
+                    VMHOOK_LOG("{} field_proxy::set: size mismatch at {:p} ({} field, "
+                               "value={}B, field={}B, sig='{}') - refusing the write to "
+                               "avoid clobbering adjacent fields.  Convert the value to "
+                               "the matching primitive type.",
+                               vmhook::error_tag, this->field_pointer,
+                               this->static_field ? "static" : "instance",
+                               value_size, field_size, this->signature_text);
                     return;
                 }
 
@@ -11251,11 +11306,11 @@ namespace vmhook
             {
                 static_assert(vmhook::detail::dependent_false_v<clean_value_type>,
                               "field_proxy::set: unsupported value type.  Previously, types that "
-                              "weren't string / string_view / std::vector / unique_ptr<wrapper> / "
-                              "trivially_copyable silently no-op'd - the set call returned and the "
-                              "field was unchanged with no compile-time error or runtime warning.  "
-                              "Convert the value to one of those, or extend the if-constexpr chain "
-                              "above with a specific branch.");
+                              "weren't string / string_view / const char* / std::vector / "
+                              "unique_ptr<wrapper> / trivially_copyable silently no-op'd - the "
+                              "set call returned and the field was unchanged with no compile-time "
+                              "error or runtime warning.  Convert the value to one of those, or "
+                              "extend the if-constexpr chain above with a specific branch.");
             }
         }
 
@@ -11294,6 +11349,29 @@ namespace vmhook
             -> bool
         {
             return this->static_field;
+        }
+
+        /*
+            @brief Returns true if this field's JVM descriptor is a reference / array (L or [).
+            @details
+            Provided so callers can branch on "is this a reference field?" without
+            inspecting signature()[0] by hand.  get_compressed_oop() only makes sense
+            for reference / array fields; calling it on a primitive field reads the
+            first 4 bytes of the primitive's storage as if they were a compressed
+            OOP, which decodes to garbage.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns false on empty signature.
+        */
+        auto is_reference() const noexcept
+            -> bool
+        {
+            if (this->signature_text.empty())
+            {
+                return false;
+            }
+            const char first{ this->signature_text.front() };
+            return first == 'L' || first == '[';
         }
 
         /*
@@ -11684,9 +11762,11 @@ namespace vmhook
                           "method_proxy::call: max 8 arguments");
             vmhook::detail::jni_value values[arg_cap]{};
             void*                     handle_storage[arg_cap]{};
+            bool                      arg_needs_release[arg_cap]{};
             std::size_t               arg_index{ 0 };
             ((vmhook::detail::write_jni_arg_to_slot(values[arg_index],
                                                      handle_storage[arg_index],
+                                                     arg_needs_release[arg_index],
                                                      std::forward<args_t>(args)),
               ++arg_index), ...);
             (void)arg_index;
@@ -11702,29 +11782,31 @@ namespace vmhook
             // loop with string args eventually trips "local reference
             // table overflow" warnings and starts losing object identity.
             //
-            // The discriminator `values[i].l != &handle_storage[i]`
-            // distinguishes "real JNI local ref" from "synthetic stack
-            // handle"; only the former needs DeleteLocalRef.  Null slots
-            // (primitive args, or string args where NewStringUTF failed)
-            // are skipped by jni_delete_local_ref's null guard.
+            // The per-slot `needs_release[i]` tag — set by write_jni_arg_to_slot
+            // ONLY for jstrings produced by NewStringUTF — is the discriminator.
+            // We must NOT read `values[i].l` back to decide this: jni_value is a
+            // union, so a primitive arg (jlong 0x4242'4242'4242'4242, jint, even
+            // jboolean true -> 0x01) aliases `.l` and would be handed to
+            // DeleteLocalRef as a garbage pointer.  Synthetic object handles
+            // (value.l == &handle_storage[i]) and primitives both leave the tag
+            // false; only real string local refs get released.
             struct string_handle_cleanup
             {
                 vmhook::detail::jni_value*  values_ptr;
-                void**                      storage_ptr;
+                const bool*                 needs_release_ptr;
                 std::size_t                 count;
 
                 ~string_handle_cleanup() noexcept
                 {
                     for (std::size_t i{ 0 }; i < this->count; ++i)
                     {
-                        void* const candidate{ this->values_ptr[i].l };
-                        if (candidate && candidate != &this->storage_ptr[i])
+                        if (this->needs_release_ptr[i])
                         {
-                            vmhook::detail::jni_delete_local_ref(candidate);
+                            vmhook::detail::jni_delete_local_ref(this->values_ptr[i].l);
                         }
                     }
                 }
-            } cleanup{ values, handle_storage, sizeof...(args_t) };
+            } cleanup{ values, arg_needs_release, sizeof...(args_t) };
 
             void** const table{ *reinterpret_cast<void***>(env_void) };
             void* const  method_id{ this->cached_method_id };
@@ -12330,6 +12412,29 @@ namespace vmhook
         }
 
         /*
+            @brief Returns true if this method's return type is a reference / array (L or [).
+            @details
+            Mirrors field_proxy::is_reference() so callers using the method-vs-field
+            parity helpers (raw_method / raw_address / get_compressed_oop) can branch
+            on "is this an object?" without parsing the descriptor by hand.  Reads the
+            character that follows the closing ')' of the signature.
+
+            Complexity: O(1).
+            Exception safety: noexcept — returns false on a malformed/empty signature.
+        */
+        auto is_reference() const noexcept
+            -> bool
+        {
+            const auto close{ this->signature_text.find(')') };
+            if (close == std::string::npos || close + 1 >= this->signature_text.size())
+            {
+                return false;
+            }
+            const char ret{ this->signature_text[close + 1] };
+            return ret == 'L' || ret == '[';
+        }
+
+        /*
             @brief Returns the compressed OOP of the receiver object.
             @details
             Reads the first 4 bytes of the object pointer as a compressed OOP.
@@ -12348,6 +12453,26 @@ namespace vmhook
             std::uint32_t value{};
             std::memcpy(&value, this->object, sizeof(value));
             return value;
+        }
+
+        /*
+            @brief Returns the underlying HotSpot Method* (for advanced consumers).
+            @details
+            Mirror of field_proxy::raw_address.  Lets users who want to drive
+            lower-level HotSpot APIs (custom hook trampolines, deopt sweeps,
+            interpreter-entry rewrites) reach the Method* without going through
+            vmhook::hook<T>().  Most code should prefer call() / hook<T>().
+
+            Complexity: O(1).
+            Exception safety: noexcept.
+
+            @return The HotSpot Method*, or nullptr if the proxy holds no method
+                    (e.g. constructed with a null method pointer).
+        */
+        auto raw_method() const noexcept
+            -> vmhook::hotspot::method*
+        {
+            return this->method;
         }
 
     private:

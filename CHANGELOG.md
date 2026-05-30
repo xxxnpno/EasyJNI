@@ -7,6 +7,33 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **CRITICAL**: `method_proxy::call_jni` and `detail::jni_make_unique` could
+  call `DeleteLocalRef` on a garbage pointer for any non-zero primitive
+  argument.  `vmhook::detail::jni_value` is a `union`, so a primitive store
+  (`value.j = jlong`, `value.i = jint`, `value.z = true`, `value.f`, `value.d`)
+  aliases the `.l` (jobject) member.  Both arg-cleanup paths decided "is this
+  slot a JNI local ref that needs releasing?" by reading `.l` back — the
+  stack path compared `.l != &handle_storage[i]`, the heap path range-checked
+  `.l` against the `object_handles` vector.  For a primitive arg such as
+  `int64_t{0x4242'4242'4242'4242}`, `.l` reads back as that bit pattern:
+  non-null, outside every storage range, so it was handed to `DeleteLocalRef`
+  as a wild jobject (→ `-Xcheck:jni` "Invalid local ref" warnings, internal
+  assertions on fastdebug HotSpot, or an access violation).  Replaced the
+  union read-back with an explicit per-slot release tag set by
+  `write_jni_arg_to_slot` / `append_jni_arg` ONLY for jstrings produced by
+  `NewStringUTF`.  `make_jni_args` now threads a `std::vector<char>` tag
+  array; `call_jni` threads a `bool[]`.  Object handles and primitives are
+  never released.
+- `field_proxy::set` now also rejects writing a non-primitive C++ value
+  (`std::string` / `std::string_view` / `const char*` / `std::vector<T>` /
+  `std::unique_ptr<wrapper>`) into a *primitive* JVM field.  Previously the
+  type-based dispatch fired the string / array / OOP branch regardless of the
+  field's actual signature, so `set(std::string{"42"})` on an `"I"` field
+  reinterpreted the int's 4 bytes as a compressed OOP and forwarded the
+  decoded (wild) address into `write_java_string`.  The new guard mirrors the
+  size guard below: if `jvm_primitive_byte_width(signature) != 0`, refuse with
+  a diagnostic.  The diagnostic now also reports the field address and
+  static/instance flag.
 - `field_proxy::set` silently corrupted adjacent fields when the C++ value
   type was wider than the JVM field.  Writing `int64_t{...}` to an `"I"`
   field memcpy'd 8 bytes into a 4-byte slot, trampling the next 4 bytes
@@ -113,6 +140,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
+- `method_proxy::raw_method()` — returns the underlying HotSpot `method*`,
+  mirroring `field_proxy::raw_address()`.  Closes a method-vs-field parity
+  gap: advanced consumers driving low-level HotSpot APIs (custom trampolines,
+  deopt sweeps) can now reach the `Method*` through the public API instead of
+  only via `vmhook::hook<T>()`.
+- `field_proxy::is_reference()` and `method_proxy::is_reference()` — `true`
+  when the field's / method-return's JVM descriptor is a reference or array
+  (`L` / `[`).  Lets callers gate `get_compressed_oop()` (which only makes
+  sense for reference types) without hand-parsing `signature()[0]`.
 - `vmhook::detail::jvm_primitive_byte_width(signature)` — JVM-spec byte
   width of a primitive type descriptor (Z/B=1, S/C=2, I/F=4, J/D=8;
   references / arrays / void return 0).  Used by `field_proxy::set`'s
