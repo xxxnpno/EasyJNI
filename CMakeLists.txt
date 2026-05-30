@@ -115,13 +115,22 @@ elseif(VMHOOK_PLATFORM_MACOS OR VMHOOK_PLATFORM_IOS)
 endif()
 
 # ── Helper: apply our standard warning set to a target ──────────────────────
+# Pass NO_WERROR as a second argument to keep the warning set but skip the
+# -Werror / /WX escalation.  Used for the example DLL: its tests/jvm/modules/*
+# are voluminous, multi-author test code where a style warning (an unused index
+# constant, an unused local) is noise, not a defect — it must not fail CI, while
+# the library and the first-party standalone tests stay strict.
 function(vmhook_apply_warnings target)
+    set(_no_werror FALSE)
+    if(ARGC GREATER 1 AND "${ARGV1}" STREQUAL "NO_WERROR")
+        set(_no_werror TRUE)
+    endif()
     if(MSVC)
         target_compile_options(${target} PRIVATE
             /W4 /permissive- /Zc:__cplusplus /utf-8
             /wd4505     # unreferenced static function (header carries multiple by design)
             /wd4101)    # unreferenced local (release builds compile out VMHOOK_LOG)
-        if(VMHOOK_WARNINGS_AS_ERRORS)
+        if(VMHOOK_WARNINGS_AS_ERRORS AND NOT _no_werror)
             target_compile_options(${target} PRIVATE /WX)
         endif()
         target_compile_definitions(${target} PRIVATE
@@ -134,7 +143,14 @@ function(vmhook_apply_warnings target)
             -Wno-unused-local-typedefs
             -Wno-unused-but-set-variable
             -Wno-cast-function-type)
-        if(VMHOOK_WARNINGS_AS_ERRORS)
+        if(_no_werror)
+            # Test-module noise: named index constants / locals that aren't used
+            # in every build configuration.
+            target_compile_options(${target} PRIVATE
+                -Wno-unused-variable
+                -Wno-unused-const-variable)
+        endif()
+        if(VMHOOK_WARNINGS_AS_ERRORS AND NOT _no_werror)
             target_compile_options(${target} PRIVATE -Werror)
         endif()
     endif()
@@ -186,7 +202,7 @@ if(VMHOOK_BUILD_EXAMPLE)
         target_include_directories(vmhook_example PRIVATE ${JNI_INCLUDE_DIRS})
         target_compile_definitions(vmhook_example PRIVATE VMHOOK_BENCH_USE_JNI=1)
     endif()
-    vmhook_apply_warnings(vmhook_example)
+    vmhook_apply_warnings(vmhook_example NO_WERROR)
     set_target_properties(vmhook_example PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

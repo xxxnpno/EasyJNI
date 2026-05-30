@@ -274,7 +274,7 @@ VMHOOK_JVM_MODULE(method_call_object)
                     auto sm{ method_object::static_method("staticMakeChild") };
                     if (sm)
                     {
-                        std::unique_ptr<child_object> sc{ sm->call() };
+                        std::unique_ptr<child_object> sc = sm->call();
                         g_static_nonnull.store(sc != nullptr, std::memory_order_relaxed);
                         if (sc)
                         {
@@ -287,7 +287,7 @@ VMHOOK_JVM_MODULE(method_call_object)
                     auto sn{ method_object::static_method("staticNullChild") };
                     if (sn)
                     {
-                        std::unique_ptr<child_object> sc{ sn->call() };
+                        std::unique_ptr<child_object> sc = sn->call();
                         g_static_null_is_null.store(sc == nullptr, std::memory_order_relaxed);
                     }
                 }

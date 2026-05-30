@@ -206,7 +206,10 @@ VMHOOK_JVM_MODULE(field_string)
             // Confirm the instance read path agrees immediately (pre-probe).
             if (inst_proxy.has_value())
             {
-                const std::string after{ inst_proxy->get() };
+                // Copy-init (not brace-init): field_proxy::value_t has a
+                // templated conversion operator, so std::string x{ value_t } is
+                // ambiguous on MSVC; `= value_t` matches the working baseline.
+                const std::string after = inst_proxy->get();
                 ctx.check("instance_set_native_readback_java", after == "java!");
             }
         }
