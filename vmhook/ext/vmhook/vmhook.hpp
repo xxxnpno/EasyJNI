@@ -8457,6 +8457,7 @@ namespace vmhook
     namespace detail::auto_repair
     {
         inline std::atomic<bool>        g_started{ false };
+        inline std::atomic<bool>        g_watchdog_running{ false };
         inline std::mutex               g_cv_mutex{};
         inline std::condition_variable  g_cv{};
 
@@ -8470,6 +8471,8 @@ namespace vmhook
 #endif
             } };
 
+            g_watchdog_running.store(true, std::memory_order_release);
+
             for (;;)
             {
                 {
@@ -8481,6 +8484,7 @@ namespace vmhook
                 }
                 if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire))
                 {
+                    g_watchdog_running.store(false, std::memory_order_release);
                     return;
                 }
                 try
@@ -8491,6 +8495,19 @@ namespace vmhook
                 {
                     // verify_hooks already swallows internally; this is belt-and-braces.
                 }
+            }
+        }
+
+        // Bounded wait for the watchdog to exit after a shutdown request.  MUST
+        // run WITHOUT g_hooked_methods_mutex held — the watchdog may be in
+        // verify_hooks() (which takes that mutex), so waiting under it deadlocks.
+        static auto wait_for_exit() noexcept -> void
+        {
+            for (int spins{ 0 };
+                 g_watchdog_running.load(std::memory_order_acquire) && spins < 2000;
+                 ++spins)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
             }
         }
 
@@ -8560,6 +8577,16 @@ namespace vmhook
         // brief lock-held wait.
         vmhook::detail::auto_repair::notify_shutdown();
 
+        // Wait for the watchdog to actually exit BEFORE taking the teardown
+        // lock, so shutdown is reversible without spawning a duplicate watchdog:
+        // we clear g_shutdown_requested / g_started at the end so a later
+        // hook<T>() is fully live again, and that's only safe once the old
+        // watchdog has exited (otherwise it keeps looping when we flip the flag
+        // back to false, and the next install spawns a second one).  Must run
+        // OUTSIDE g_hooked_methods_mutex — the watchdog can be mid-verify_hooks()
+        // holding that mutex.
+        vmhook::detail::auto_repair::wait_for_exit();
+
         // Lock for the whole tear-down so no in-flight vmhook::hook<T>() call
         // can push a new entry between our trampoline-delete loop and our
         // entry-restore loop.  Once the lock is released, common_detour
@@ -8573,6 +8600,17 @@ namespace vmhook
 
         for (const vmhook::hotspot::hooked_method& hooked_method_entry : vmhook::hotspot::g_hooked_methods)
         {
+            // Skip a Method* that was freed / aliased before teardown (a JVMTI
+            // RedefineClasses between install and shutdown) — set_dont_inline /
+            // get_access_flags deref it unconditionally, so restoring flags on a
+            // stale slot would AV or scribble into a recycled Method.
+            if (!hooked_method_entry.method
+                || !vmhook::hotspot::is_valid_pointer(hooked_method_entry.method)
+                || !hooked_method_entry.method->get_const_method())
+            {
+                continue;
+            }
+
             vmhook::hotspot::set_dont_inline(hooked_method_entry.method, false);
 
             std::uint32_t* const flags{ hooked_method_entry.method->get_access_flags() };
@@ -8609,6 +8647,18 @@ namespace vmhook
 
         vmhook::hotspot::g_hooked_methods.clear();
         vmhook::hotspot::g_hooked_i2i_entries.clear();
+
+        // Make shutdown_hooks() REVERSIBLE.  Previously g_shutdown_requested was
+        // latched true forever: after a teardown, a fresh vmhook::hook<T>() would
+        // return true but common_detour's early-out on the flag meant the detour
+        // never fired — silently dead.  The mod-loader "tear down + re-init on
+        // world switch" pattern hits exactly this, and so did the integration
+        // suite (every test after the first shutdown_hooks() observed its hook
+        // not firing once the call_jni crash that masked it was fixed).  Clear
+        // both latches so a subsequent install is fully live again; the
+        // wait_for_exit() above guarantees the old watchdog is gone first.
+        vmhook::detail::auto_repair::g_started.store(false, std::memory_order_release);
+        vmhook::hotspot::g_shutdown_requested.store(false, std::memory_order_release);
     }
 
     inline auto hook_handle::stop() noexcept -> void
