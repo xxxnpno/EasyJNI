@@ -7606,6 +7606,26 @@ namespace vmhook
                 break;
             }
 
+            // Enforce the stack-growth invariant: callers live at HIGHER
+            // addresses, so a valid saved-rbp chain is strictly increasing and
+            // each frame is a sane size apart.  A caller_rbp that is not above
+            // the current slot — or absurdly far above it — means the chain has
+            // strayed off the interpreter frames (into a native/compiled frame
+            // or garbage); stop instead of dereferencing [caller_rbp - 24] at an
+            // arbitrary address.  This is the load-bearing guard that keeps the
+            // walk from AV-ing when it runs past the interpreted region (the
+            // is_valid_pointer checks alone accept any mapped page, including a
+            // garbage frame that happens to be readable) — observed crashing the
+            // suite on Windows mingw/clang + JDK 17.
+            {
+                const std::uintptr_t cur_addr{ reinterpret_cast<std::uintptr_t>(current_rbp_slot) };
+                const std::uintptr_t cal_addr{ reinterpret_cast<std::uintptr_t>(caller_rbp) };
+                if (cal_addr <= cur_addr || (cal_addr - cur_addr) > (std::uintptr_t{ 1 } << 20))
+                {
+                    break;
+                }
+            }
+
             void* const caller_method_slot{
                 reinterpret_cast<std::uint8_t*>(caller_rbp) - 24 };
             if (!vmhook::hotspot::is_valid_pointer(caller_method_slot))
