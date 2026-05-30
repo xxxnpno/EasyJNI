@@ -7,6 +7,29 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **CRITICAL**: `method_proxy::call()` (the call-stub fast path) silently dropped
+  every `Ljava/lang/String;` return.  On JDKs where `StubRoutines::_call_stub_entry`
+  IS exposed (typically JDK 8/11/17), a String-returning `call()` fell into the
+  reference-return `default:` arm, which did `static_cast<std::uint32_t>(result_holder)`
+  — truncating the 64-bit oop AND mislabelling an *uncompressed* oop as the
+  compressed-oop that `value_t`'s uint32 alternative is documented to hold.  The
+  net effect: `get_method("toString")->call()` returned `""` on JDK 8/11/17 while
+  the JNI fallback path (JDK 21+) returned the real text — the same wrapper line
+  silently broke on one JDK and worked on another.  Now the reference-return arm
+  decodes `java.lang.String` straight to UTF-8 (parity with `call_jni`) and
+  re-encodes any other reference to a real compressed oop so `value_t` round-trips
+  through `decode_oop_pointer` instead of truncating; a null oop returns monostate.
+- `method_proxy::is_static()` always returned `false` — the constructor's
+  `static_field` member is never wired to any caller, so the accessor reported
+  garbage for every method.  It now reads `JVM_ACC_STATIC` (0x0008) from the live
+  Method's `_access_flags` (the low byte is stable across every supported JDK),
+  falling back to the stored member only when the flags slot can't be resolved.
+- `on_class_loaded()` and `on_exception()` returned a watch_handle whose
+  `running()` reported `true` even when the underlying hook never armed (e.g. no
+  JVM in-process, or the method couldn't be resolved) — a caller had no way to
+  tell a working watcher from a dead one.  They now return an inert
+  `watch_handle{}` (`running() == false`) and drop the optimistically-registered
+  callback when the install fails, matching `watch_static_field`'s contract.
 - **CRITICAL**: `method_proxy::call_jni` and `detail::jni_make_unique` could
   call `DeleteLocalRef` on a garbage pointer for any non-zero primitive
   argument.  `vmhook::detail::jni_value` is a `union`, so a primitive store
@@ -140,6 +163,27 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
+- `method_proxy::value_t` can now convert to `std::unique_ptr<wrapper>` and to
+  `std::string`, mirroring `field_proxy::value_t`.  Previously an Object-returning
+  Java method assigned into a `std::unique_ptr<my_wrapper>` silently yielded
+  `nullptr`, and a String-returning method via the call-stub path yielded `""` —
+  the exact method-vs-field parity gap the user flagged.  The conversion operator
+  decodes the compressed-oop alternative into the wrapper (with klass validity
+  check) and decodes String returns to UTF-8.  Added `value_t::is_void()` and
+  `value_t::is_string()` so callers can distinguish "returned void / call failed"
+  from a primitive zero or empty string.
+- 16 new standalone (no-JVM) unit-test executables, run by the full CI matrix on
+  every OS/compiler: `field_proxy_value_conversions`, `field_proxy_set_guards`,
+  `method_proxy_value_t`, `jni_arg_packing`, `signature_parsing`,
+  `decode_oop_and_pointers`, `decode_u5`, `iterate_entries_safety`,
+  `os_release_and_protect_edges`, `array_element_helpers`, `version_macros`,
+  `platform_capability_macros`, `traits_extra`, `api_surface_extended`,
+  `logging_format`, `collection_type_tags`.  They exercise the no-JVM-testable
+  surface of each feature from every angle — value_t conversions, the union
+  release-tag regression guard, signature/descriptor parsing, compressed-oop and
+  is_valid_pointer boundaries, UNSIGNED5 decoding, never-throw collection
+  conversions, compile-time platform/capability macro invariants, and null-safety
+  of every public entry point when no JVM is loaded.
 - `method_proxy::raw_method()` — returns the underlying HotSpot `method*`,
   mirroring `field_proxy::raw_address()`.  Closes a method-vs-field parity
   gap: advanced consumers driving low-level HotSpot APIs (custom trampolines,

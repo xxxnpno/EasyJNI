@@ -11548,14 +11548,61 @@ namespace vmhook
             template<typename target_type>
             operator target_type() const noexcept
             {
-                return std::visit([](auto v) noexcept
+                return std::visit([](const auto& v) noexcept
                     -> target_type
                     {
                         using stored_type = std::remove_cvref_t<decltype(v)>;
 
+                        // unique_ptr<wrapper> <- compressed-OOP reference return.
+                        // Mirrors field_proxy::value_t::cast_for_variant so an
+                        // Object-returning Java method can be assigned straight
+                        // into a std::unique_ptr<my_wrapper> instead of silently
+                        // yielding null.  The uint32_t alternative is the
+                        // compressed OOP (the call_stub / call_jni reference paths
+                        // store encode_oop_pointer(result)); decode + validate +
+                        // wrap.
+                        if constexpr (vmhook::detail::is_unique_ptr_v<target_type>)
+                        {
+                            using wrapper_type = typename vmhook::detail::is_unique_ptr<target_type>::value_type_t;
+                            static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
+                                          "method_proxy::value_t -> std::unique_ptr<T>: T must derive "
+                                          "from vmhook::object_base.  Return-by-wrapper only works for "
+                                          "registered vmhook wrapper types.");
+                            if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                            {
+                                void* const decoded{ vmhook::hotspot::decode_oop_pointer(v) };
+                                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+                                {
+                                    return target_type{};
+                                }
+                                return target_type{ new wrapper_type{ decoded } };
+                            }
+                            else
+                            {
+                                return target_type{};
+                            }
+                        }
+                        // std::string <- either the eagerly-decoded std::string
+                        // alternative (call_jni / call_stub String path) or a
+                        // compressed OOP pointing at a java.lang.String.
+                        else if constexpr (std::is_same_v<target_type, std::string>)
+                        {
+                            if constexpr (std::is_same_v<stored_type, std::string>)
+                            {
+                                return v;
+                            }
+                            else if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                            {
+                                return vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(v));
+                            }
+                            else
+                            {
+                                return target_type{};
+                            }
+                        }
                         // Compressed-OOP -> raw heap pointer conversion.
-                        if constexpr (std::is_same_v<target_type, void*>
-                                   && std::is_same_v<stored_type, std::uint32_t>)
+                        else if constexpr (std::is_same_v<target_type, void*>
+                                        && std::is_same_v<stored_type, std::uint32_t>)
                         {
                             return vmhook::hotspot::decode_oop_pointer(v);
                         }
@@ -11569,6 +11616,25 @@ namespace vmhook
                         }
                     }
                 , data);
+            }
+
+            /*
+                @brief True when the call returned void or failed (variant holds monostate).
+                Distinguishes "method returned void / the call failed" from a
+                primitive zero or an empty string.  Parity with the richer
+                introspection field_proxy::value_t users have asked for.
+            */
+            auto is_void() const noexcept -> bool
+            {
+                return std::holds_alternative<std::monostate>(data);
+            }
+
+            /*
+                @brief True when the call produced a java.lang.String (decoded eagerly).
+            */
+            auto is_string() const noexcept -> bool
+            {
+                return std::holds_alternative<std::string>(data);
             }
         };
 
@@ -12370,7 +12436,32 @@ namespace vmhook
                 return value_t{ d };
             }
             case 'V': return value_t{ std::monostate{} };
-            default:  return value_t{ static_cast<std::uint32_t>(result_holder) };
+            default:
+            {
+                // Reference / array return ('L' / '[').  The call stub leaves an
+                // UNCOMPRESSED oop in result_holder (see the params[] comment
+                // above).  The previous `static_cast<std::uint32_t>(result_holder)`
+                // both TRUNCATED the 64-bit pointer to 32 bits AND mislabelled an
+                // uncompressed oop as the compressed-oop that value_t's uint32_t
+                // alternative is documented to hold - so on JDKs where the call
+                // stub IS available (JDK 8/11/17) a `Ljava/lang/String;`-returning
+                // call() silently produced "" while the JNI fallback path (JDK 21+)
+                // returned the real text.  Now: decode java.lang.String straight
+                // to UTF-8 for parity with call_jni, and re-encode any other
+                // reference to a real compressed oop so value_t round-trips
+                // through decode_oop_pointer instead of truncating.
+                void* const result_oop{ reinterpret_cast<void*>(result_holder) };
+                if (!result_oop)
+                {
+                    return value_t{ std::monostate{} };
+                }
+                if (rparen != std::string_view::npos
+                    && sig.substr(rparen + 1) == "Ljava/lang/String;")
+                {
+                    return value_t{ vmhook::read_java_string(result_oop) };
+                }
+                return value_t{ vmhook::hotspot::encode_oop_pointer(result_oop) };
+            }
             }
         }
 
@@ -12400,14 +12491,27 @@ namespace vmhook
             @brief Returns true if this method is a static Java method.
             @details
             Static methods do not receive a 'this' pointer as the first argument.
-            The object field of this proxy is null when the method is static.
+            The constructor's `static_field` member is always false (it is not
+            wired to any caller), so report the JVM truth directly: read
+            JVM_ACC_STATIC (0x0008) from the live Method's _access_flags.  The
+            static bit lives in the low byte and is stable across every
+            supported JDK, so reading the flags word as u4 and masking 0x0008
+            is width-independent.  Falls back to the stored member if the
+            access-flags slot can't be resolved (no VMStructs / no JVM).
 
-            Complexity: O(1).
+            Complexity: O(1) after the first VMStruct lookup (cached).
             Exception safety: noexcept.
         */
         auto is_static() const noexcept
             -> bool
         {
+            if (this->method)
+            {
+                if (const std::uint32_t* const flags{ this->method->get_access_flags() })
+                {
+                    return (*flags & 0x0008u) != 0u;
+                }
+            }
             return this->static_field;
         }
 
@@ -15339,6 +15443,25 @@ namespace vmhook
             }
         }
 
+        // If the defineClass hook never armed (e.g. no JVM in-process, or the
+        // method couldn't be resolved), this watcher can never fire.  Match
+        // watch_static_field's contract: return an inert handle whose
+        // running() == false, and drop the callback we optimistically pushed
+        // so it doesn't linger in the registry.  Without this, a caller has no
+        // way to tell a working watcher from a dead one — the exact
+        // method-vs-field-style inconsistency we want to avoid.
+        {
+            std::lock_guard<std::mutex> guard{ detail::class_load_mutex };
+            if (!detail::class_load_hook_installed)
+            {
+                detail::class_load_callbacks.erase(
+                    std::remove(detail::class_load_callbacks.begin(),
+                                detail::class_load_callbacks.end(), cb),
+                    detail::class_load_callbacks.end());
+                return watch_handle{};
+            }
+        }
+
         auto block{ std::make_shared<watch_handle::control_block>() };
         block->on_stop = [cb]() noexcept
         {
@@ -15493,6 +15616,21 @@ namespace vmhook
                     VMHOOK_LOG("{} on_exception: Throwable.fillInStackTrace hook installation failed",
                                vmhook::error_tag);
                 }
+            }
+        }
+
+        // Inert-watcher parity (see on_class_loaded): if the fillInStackTrace
+        // hook never armed, return an empty handle (running() == false) and
+        // drop the optimistically-pushed callback.
+        {
+            std::lock_guard<std::mutex> guard{ detail::exception_mutex };
+            if (!detail::exception_hook_installed)
+            {
+                detail::exception_callbacks.erase(
+                    std::remove(detail::exception_callbacks.begin(),
+                                detail::exception_callbacks.end(), cb),
+                    detail::exception_callbacks.end());
+                return watch_handle{};
             }
         }
 

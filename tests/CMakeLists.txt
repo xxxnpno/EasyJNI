@@ -71,3 +71,31 @@ target_compile_definitions("vmhook_test_helpers" PRIVATE
 #    page_size relationship, query_region attributes on a freshly allocated
 #    RWX block.  Pure OS-layer checks, no JVM required.
 vmhook_add_test(os_protect_interaction SOURCES test_os_protect_interaction.cpp)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Expanded coverage (9+): one standalone executable per feature cluster.
+# These exercise the no-JVM-testable surface of each feature from every
+# angle — pure logic, null-safety, signature parsing, value_t conversions,
+# boundary helpers, compile-time capability macros.  All run on every
+# OS/compiler in the CI matrix.
+# ─────────────────────────────────────────────────────────────────────────
+vmhook_add_test(field_proxy_value_conversions SOURCES test_field_proxy_value_conversions.cpp)
+vmhook_add_test(field_proxy_set_guards         SOURCES test_field_proxy_set_guards.cpp)
+vmhook_add_test(method_proxy_value_t           SOURCES test_method_proxy_value_t.cpp)
+vmhook_add_test(jni_arg_packing                SOURCES test_jni_arg_packing.cpp)
+vmhook_add_test(signature_parsing              SOURCES test_signature_parsing.cpp)
+vmhook_add_test(decode_oop_and_pointers        SOURCES test_decode_oop_and_pointers.cpp)
+vmhook_add_test(decode_u5                       SOURCES test_decode_u5.cpp)
+vmhook_add_test(iterate_entries_safety         SOURCES test_iterate_entries_safety.cpp)
+vmhook_add_test(os_release_and_protect_edges   SOURCES test_os_release_and_protect_edges.cpp)
+vmhook_add_test(array_element_helpers          SOURCES test_array_element_helpers.cpp)
+vmhook_add_test(version_macros                  SOURCES test_version_macros.cpp)
+target_compile_definitions("vmhook_test_version_macros" PRIVATE
+    VMHOOK_CMAKE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    VMHOOK_CMAKE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    VMHOOK_CMAKE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
+vmhook_add_test(platform_capability_macros     SOURCES test_platform_capability_macros.cpp)
+vmhook_add_test(traits_extra                    SOURCES test_traits_extra.cpp)
+vmhook_add_test(api_surface_extended           SOURCES test_api_surface_extended.cpp)
+vmhook_add_test(logging_format                  SOURCES test_logging_format.cpp)
+vmhook_add_test(collection_type_tags           SOURCES test_collection_type_tags.cpp)
