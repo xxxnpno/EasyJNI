@@ -60,7 +60,7 @@ int main()
         // every conversion the operator could produce (const char*, string_view,
         // ...) and picks a surprising one — a known C++ gotcha unrelated to the
         // operator's logic.  static_cast<std::string> names the target exactly.
-        const auto s = static_cast<std::string>(value_t{ std::monostate{} });
+        const auto s = value_t{ std::monostate{} }.as_string();
         check("monostate_to_string_is_empty", s.empty());
     }
 
@@ -110,11 +110,11 @@ int main()
     // arm, since static_cast<int>(std::string) is ill-formed).
     // -------------------------------------------------------------------------
     {
-        const auto s = static_cast<std::string>(value_t{ std::string{ "hello" } });
+        const auto s = value_t{ std::string{ "hello" } }.as_string();
         check("string_alternative_round_trips", s == "hello");
     }
     {
-        const auto s = static_cast<std::string>(value_t{ std::string{ "" } });
+        const auto s = value_t{ std::string{ "" } }.as_string();
         check("empty_string_alternative_round_trips", s.empty());
     }
     check("string_alternative_to_int_is_zero",

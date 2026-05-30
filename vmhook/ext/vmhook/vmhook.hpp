@@ -6833,6 +6833,148 @@ namespace vmhook
     }
 
     // -------------------------------------------------------------------------
+    // Method enumeration / introspection.
+    //
+    // The motivating problem (from real obfuscated-build hooking): the JVM
+    // method NAME rotates per client / per build, but its descriptor stays
+    // stable.  So "hook the method whose descriptor is S" is the operation you
+    // actually need — and that requires being able to list a class's methods.
+    // These helpers expose the InstanceKlass::_methods walk that hook<T> already
+    // runs privately, as public data (not just a log line, which is compiled out
+    // in release).  No JNI; safe from any thread once the class is loaded.
+    // -------------------------------------------------------------------------
+
+    namespace detail
+    {
+        /*
+            @brief Walks a klass's _methods array into (name, JVM-descriptor) pairs.
+            @details Skips slots that fail is_valid_pointer.  noexcept; empty on
+            null klass.  Shared by every get_class_methods overload.
+        */
+        inline auto collect_klass_methods(vmhook::hotspot::klass* const target_klass) noexcept
+            -> std::vector<std::pair<std::string, std::string>>
+        {
+            std::vector<std::pair<std::string, std::string>> result{};
+            try
+            {
+                if (!target_klass)
+                {
+                    return result;
+                }
+                const std::int32_t method_count{ target_klass->get_methods_count() };
+                vmhook::hotspot::method** const methods_array{ target_klass->get_methods_ptr() };
+                if (!methods_array || method_count <= 0)
+                {
+                    return result;
+                }
+                result.reserve(static_cast<std::size_t>(method_count));
+                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
+                {
+                    vmhook::hotspot::method* const method_ptr{ methods_array[method_index] };
+                    if (!method_ptr || !vmhook::hotspot::is_valid_pointer(method_ptr))
+                    {
+                        continue;
+                    }
+                    result.emplace_back(method_ptr->get_name(), method_ptr->get_signature());
+                }
+            }
+            catch (...)
+            {
+            }
+            return result;
+        }
+    }
+
+    /*
+        @brief Lists every declared method of a class (by internal name) as
+               (name, JVM-descriptor) pairs.
+        @details
+        Reads InstanceKlass::_methods directly — no JNI — so it works for classes
+        you have NOT wrapped with register_class<T>() (useful while you are still
+        discovering an obfuscated class's shape).  noexcept; empty vector if the
+        class isn't loaded.
+
+            for (auto& [name, descriptor] : vmhook::get_class_methods("net/minecraft/Foo"))
+                VMHOOK_LOG("{}{}", name, descriptor);
+    */
+    inline auto get_class_methods(const std::string_view class_name) noexcept
+        -> std::vector<std::pair<std::string, std::string>>
+    {
+        return vmhook::detail::collect_klass_methods(vmhook::find_class(class_name));
+    }
+
+    /*
+        @brief Lists every declared method of a registered wrapper's class.
+        @details Same as the by-name overload, resolving the class through the
+        wrapper's register_class<T>() entry.  Empty if T is unregistered.
+    */
+    template<class wrapper_type>
+    inline auto get_class_methods() noexcept
+        -> std::vector<std::pair<std::string, std::string>>
+    {
+        try
+        {
+            const auto type_map_entry{
+                vmhook::type_to_class_map.find(std::type_index{ typeid(wrapper_type) }) };
+            if (type_map_entry == vmhook::type_to_class_map.end())
+            {
+                return {};
+            }
+            return vmhook::detail::collect_klass_methods(vmhook::find_class(type_map_entry->second));
+        }
+        catch (...)
+        {
+            return {};
+        }
+    }
+
+    /*
+        @brief Debug convenience: VMHOOK_LOGs every (name, descriptor) of T's class.
+        @details Compiled out in release (VMHOOK_LOG is a no-op); use
+        get_class_methods<T>() for a release-safe data channel.
+    */
+    template<class wrapper_type>
+    inline auto log_class_methods() noexcept
+        -> void
+    {
+        const auto methods{ vmhook::get_class_methods<wrapper_type>() };
+        VMHOOK_LOG("{} log_class_methods<{}>(): {} method(s):",
+                   vmhook::info_tag, typeid(wrapper_type).name(), methods.size());
+        std::size_t method_index{ 0 };
+        for (const auto& [name, descriptor] : methods)
+        {
+            VMHOOK_LOG("    [{}] {}{}", method_index++, name, descriptor);
+        }
+    }
+
+    /*
+        @brief Names of every method on T's class whose JVM descriptor equals
+               `descriptor`.
+        @details The obfuscated-build selector: the name rotates, the descriptor
+        is stable.  Returns ALL matches so callers can detect a non-unique
+        descriptor instead of silently taking the first.  Empty if none / T
+        unregistered.
+
+            auto names = vmhook::find_methods_by_signature<foo>("()Ljava/util/Collection;");
+            if (names.size() == 1)
+                vmhook::hook<foo>(names.front(), "()Ljava/util/Collection;", detour);
+    */
+    template<class wrapper_type>
+    inline auto find_methods_by_signature(const std::string_view descriptor) noexcept
+        -> std::vector<std::string>
+    {
+        std::vector<std::string> names{};
+        for (const auto& [name, candidate] : vmhook::get_class_methods<wrapper_type>())
+        {
+            if (candidate == descriptor)
+            {
+                names.push_back(name);
+            }
+        }
+        return names;
+    }
+
+    // -------------------------------------------------------------------------
     // Watchers: event-driven hooks for field-value changes and for
     // newly-loaded Java classes.  No background polling, no idle CPU —
     // the field watcher installs a hardware data breakpoint that fires
@@ -8533,6 +8675,48 @@ namespace vmhook
     }
 
     /*
+        @brief Hooks the method on T selected by JVM descriptor alone.
+        @details
+        The obfuscated-build entry point: when the method NAME rotates per
+        client/build but the descriptor is stable, you cannot call
+        hook<T>(name, ...) because you don't have the name.  This resolves the
+        name from the descriptor (via find_methods_by_signature<T>) and installs
+        the signature-filtered hook<T>(name, descriptor, detour).
+
+        Multi-match policy: if more than one method on T shares the descriptor,
+        this REFUSES the install (logs + returns false) rather than silently
+        hooking an arbitrary overload — disambiguate by name in that case.
+
+            vmhook::hook_by_signature<net_handler>(
+                "()Ljava/util/Collection;", &on_player_info_map);
+
+        @return true on a successful single-match install; false if no method
+                (or more than one) matches, or the install itself fails.
+    */
+    template<class wrapper_type>
+    inline auto hook_by_signature(const std::string_view jvm_descriptor,
+                                  auto&&                  user_detour) -> bool
+    {
+        const auto names{ vmhook::find_methods_by_signature<wrapper_type>(jvm_descriptor) };
+        if (names.empty())
+        {
+            VMHOOK_LOG("{} hook_by_signature<{}>('{}'): no method matches that descriptor "
+                       "(class not loaded / not registered, or the descriptor is wrong).",
+                       vmhook::error_tag, typeid(wrapper_type).name(), jvm_descriptor);
+            return false;
+        }
+        if (names.size() > 1)
+        {
+            VMHOOK_LOG("{} hook_by_signature<{}>('{}'): {} methods share that descriptor - "
+                       "refusing to guess.  Hook by name with hook<T>(name, descriptor, detour).",
+                       vmhook::error_tag, typeid(wrapper_type).name(), jvm_descriptor, names.size());
+            return false;
+        }
+        return vmhook::hook<wrapper_type>(names.front(), jvm_descriptor,
+                                          std::forward<decltype(user_detour)>(user_detour));
+    }
+
+    /*
         @brief RAII-style hook install: same as vmhook::hook<T>() but
                returns a hook_handle that uninstalls just this hook on
                destruction.
@@ -9611,6 +9795,13 @@ namespace vmhook
         {
             using clean_t = std::decay_t<arg_type>;
             vmhook::detail::jni_value value{};
+            // Deterministic full-width clear.  jni_value is a union; value-init
+            // ({}) only guarantees the FIRST member (bool z, 1 byte) + padding
+            // are zeroed — the upper 7 bytes are left unspecified and differ by
+            // compiler (MinGW zeroes them, Clang does not).  Writing the widest
+            // member zeroes the whole 8-byte cell, so a narrow primitive (bool /
+            // int / float) never leaves stale high bits in the slot.
+            value.j = 0;
             // Tag tracked in lockstep with `values`: 1 ONLY for jstrings from
             // NewStringUTF (real local refs that must be DeleteLocalRef'd).
             // Reading value.l back at cleanup time is unsound because jni_value
@@ -9744,7 +9935,12 @@ namespace vmhook
                                            arg_type&& arg) noexcept -> void
         {
             using clean_t = std::decay_t<arg_type>;
-            value = vmhook::detail::jni_value{};
+            // Deterministic full-width clear of the union cell — value-init of a
+            // union ({}) only zeroes the first member (bool z) + padding on some
+            // compilers, leaving the upper 7 bytes unspecified.  Writing the
+            // widest member zeroes all 8 bytes so a narrow primitive leaves no
+            // stale high bits behind.
+            value.j = 0;
             needs_release = false;
 
             if constexpr (std::is_same_v<clean_t, std::string>
@@ -11685,6 +11881,39 @@ namespace vmhook
             auto is_string() const noexcept -> bool
             {
                 return std::holds_alternative<std::string>(data);
+            }
+
+            /*
+                @brief The result as a std::string, unambiguously.
+                @details
+                Prefer this over `std::string s = call()` / `static_cast<std::string>`:
+                the templated conversion operator can also yield `const char*`
+                (which std::string constructs from), so the implicit/cast forms are
+                ambiguous on MSVC.  as_string() names the extraction directly:
+                returns the eagerly-decoded String alternative as-is, decodes a
+                compressed-OOP alternative through read_java_string, and returns ""
+                for any other (numeric / monostate) alternative.
+            */
+            auto as_string() const noexcept -> std::string
+            {
+                return std::visit([](const auto& v) noexcept
+                    -> std::string
+                    {
+                        using stored_type = std::remove_cvref_t<decltype(v)>;
+                        if constexpr (std::is_same_v<stored_type, std::string>)
+                        {
+                            return v;
+                        }
+                        else if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                        {
+                            return vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(v));
+                        }
+                        else
+                        {
+                            return std::string{};
+                        }
+                    }
+                , data);
             }
         };
 

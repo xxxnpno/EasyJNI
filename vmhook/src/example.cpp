@@ -2909,6 +2909,60 @@ namespace
         check("globalRefDoubleResetSafe", !static_cast<bool>(pinned));
     }
 
+    // Exercises method enumeration against a live klass: get_class_methods reads
+    // the real (name, descriptor) pairs out of InstanceKlass::_methods, and the
+    // descriptor selector resolves an obfuscation-stable descriptor back to its
+    // (here, un-obfuscated) name — the pattern real consumers use to hook
+    // methods whose names rotate per build.
+    auto test_method_enumeration() -> void
+    {
+        // vmhook/A declares protectedAdd(int):int -> "(I)I" plus two <init>s.
+        const auto methods{ vmhook::get_class_methods<a_class>() };
+        check("enumMethodsNonEmpty", !methods.empty());
+
+        bool found_protected_add{ false };
+        bool all_well_formed{ true };
+        for (const auto& [name, descriptor] : methods)
+        {
+            if (name.empty() || descriptor.empty() || descriptor.front() != '(')
+            {
+                all_well_formed = false;
+            }
+            if (name == "protectedAdd" && descriptor == "(I)I")
+            {
+                found_protected_add = true;
+            }
+        }
+        check("enumMethodsAllWellFormed", all_well_formed);
+        check("enumFoundProtectedAddDescriptor", found_protected_add);
+
+        // The by-name overload (no register_class needed) agrees with the
+        // templated one for the same class.
+        const auto by_name{ vmhook::get_class_methods("vmhook/A") };
+        check("enumByNameMatchesTemplate", by_name.size() == methods.size());
+
+        // "(I)I" is unique on A (only protectedAdd), so the descriptor selector
+        // resolves to exactly that one name.
+        const auto matches{ vmhook::find_methods_by_signature<a_class>("(I)I") };
+        check("enumFindBySignatureUnique", matches.size() == 1);
+        if (matches.size() == 1)
+        {
+            check_equal("enumFindBySignatureName", matches.front(), std::string{ "protectedAdd" });
+        }
+        else
+        {
+            check("enumFindBySignatureName", false);
+        }
+
+        // A descriptor that exists on no method resolves to nothing, and
+        // hook_by_signature refuses it (returns false) rather than crashing.
+        check("enumFindBySignatureAbsentEmpty",
+              vmhook::find_methods_by_signature<a_class>("(DDD)Ljava/lang/Void;").empty());
+        check("enumHookBySignatureAbsentFalse",
+              vmhook::hook_by_signature<a_class>("(DDD)Ljava/lang/Void;",
+                  [](vmhook::return_value&, const std::unique_ptr<a_class>&) {}) == false);
+    }
+
     auto test_for_each_instance() -> void
     {
         // Walk the heap for instances of Example.  At least one
@@ -3119,6 +3173,7 @@ static auto run_test_suite() -> void
         test_for_each_thread();
         test_read_java_string();
         test_global_ref();
+        test_method_enumeration();
 
         // Newer feature surface: caller info, field watcher, class-load watcher.
         // on_exception is exercised BEFORE test_caller_info because the

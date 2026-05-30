@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- `write_jni_arg_to_slot` / `append_jni_arg` now clear the full 8-byte
+  `jni_value` union cell (`value.j = 0`) before writing the active member,
+  instead of relying on `value = jni_value{}`.  Value-initialising a union only
+  guarantees the first member (`bool z`) plus padding are zeroed; the upper 7
+  bytes were left unspecified and differed by compiler (MinGW zeroed them, Clang
+  did not), so a narrow primitive (bool/int/float) could leave stale high bits in
+  the slot.  Harmless for the call itself (the A-variant JNI calls read only the
+  active member) but made the packing non-deterministic across platforms.
 - **CRITICAL**: `method_proxy::call()` (the call-stub fast path) silently dropped
   every `Ljava/lang/String;` return.  On JDKs where `StubRoutines::_call_stub_entry`
   IS exposed (typically JDK 8/11/17), a String-returning `call()` fell into the
@@ -163,6 +171,23 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   size for `MEM_RELEASE`.
 
 ### Added
+- Method enumeration / descriptor-based hooking — `vmhook::get_class_methods<T>()`
+  / `get_class_methods("internal/Name")` return every declared method of a class
+  as `(name, JVM-descriptor)` pairs by walking `InstanceKlass::_methods` directly
+  (no JNI, any thread once loaded).  `vmhook::find_methods_by_signature<T>(desc)`
+  returns the names of all methods whose descriptor matches, and
+  `vmhook::hook_by_signature<T>(desc, detour)` hooks the single method selected by
+  descriptor alone — refusing to guess if more than one matches.
+  `vmhook::log_class_methods<T>()` is the debug-log convenience.  These close a
+  real obfuscated-build gap surfaced by the NPNOQOL deep-dive: hook resolution was
+  name-keyed, but obfuscated / mixin method names rotate per build while the
+  descriptor stays stable — so "hook the method whose descriptor is S" is the
+  operation you actually need, and it requires being able to list a class's
+  methods (which the library previously only did privately inside `hook<T>`, and
+  only via `VMHOOK_LOG`, which is compiled out in release).  Covered by a new
+  standalone `method_enumeration` suite and a `test_method_enumeration`
+  JVM-integration scenario that reads `vmhook/A`'s real methods and resolves
+  `(I)I` back to `protectedAdd`.
 - `vmhook::jni::global_ref` + `vmhook::pin()` — the missing GC-pin lifetime
   primitive.  Every other handle in the library (`oop_t`, `object_base`, wrapper
   `unique_ptr`, `method_proxy::call()` results) is valid only for the duration of
@@ -186,9 +211,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `nullptr`, and a String-returning method via the call-stub path yielded `""` —
   the exact method-vs-field parity gap the user flagged.  The conversion operator
   decodes the compressed-oop alternative into the wrapper (with klass validity
-  check) and decodes String returns to UTF-8.  Added `value_t::is_void()` and
-  `value_t::is_string()` so callers can distinguish "returned void / call failed"
-  from a primitive zero or empty string.
+  check) and decodes String returns to UTF-8.  Added `value_t::is_void()`,
+  `value_t::is_string()`, and `value_t::as_string()` — the last names the string
+  extraction directly so it works on MSVC, where `std::string s = call()` /
+  `static_cast<std::string>` are ambiguous (the templated conversion operator can
+  also yield `const char*`, which std::string constructs from).
 - 16 new standalone (no-JVM) unit-test executables, run by the full CI matrix on
   every OS/compiler: `field_proxy_value_conversions`, `field_proxy_set_guards`,
   `method_proxy_value_t`, `jni_arg_packing`, `signature_parsing`,
