@@ -10,8 +10,13 @@ extern "C" auto run_vmhook_vs_jni_speedtest() -> void;
 #endif
 
 // Modular JVM test harness: per-feature test modules under tests/jvm/modules/
-// self-register and are run by run_test_suite() once the JVM is live.
+// self-register and are run by run_test_suite() once the JVM is live.  Gated on
+// VMHOOK_MODULAR_HARNESS (defined by the CMake example target) so the legacy
+// MSBuild vcxproj — which has a hardcoded source list and can't glob the
+// modules — still builds example.cpp on its own.
+#if defined(VMHOOK_MODULAR_HARNESS)
 #include "../../tests/jvm/harness.hpp"
+#endif
 
 #include <array>
 #include <atomic>
@@ -3193,7 +3198,9 @@ static auto run_test_suite() -> void
         // Every tests/jvm/modules/*.cpp self-registers and runs here against
         // the live JVM, recording into the same test_results.txt.  This is the
         // authoritative, JVM-based unit-test surface; the monolithic tests
-        // above are being decomposed into modules.
+        // above are being decomposed into modules.  Gated so the legacy MSBuild
+        // build (no modules) still links.
+#if defined(VMHOOK_MODULAR_HARNESS)
         {
             vmhook_test::context ctx{};
             ctx.check  = [](const std::string& name, bool ok) { check(name, ok); };
@@ -3212,6 +3219,7 @@ static auto run_test_suite() -> void
             // own [FAIL]s are meaningful.
             check("modular_registry_ran_at_least_one_module", modules_ran >= 1);
         }
+#endif // VMHOOK_MODULAR_HARNESS
 
         // ── vmhook vs pure JNI microbench ────────────────────────────
         // Lives in a separate translation unit (speedtest.cpp) so the

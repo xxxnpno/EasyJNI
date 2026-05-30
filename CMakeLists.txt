@@ -178,6 +178,10 @@ if(VMHOOK_BUILD_EXAMPLE)
         set_target_properties(vmhook_example PROPERTIES PREFIX "lib")
     endif()
     target_link_libraries(vmhook_example PRIVATE vmhook::vmhook)
+    # The modular JVM harness (tests/jvm/harness.cpp + modules/*.cpp) is part of
+    # the CMake example build only; the macro lets example.cpp skip it under the
+    # legacy MSBuild vcxproj, which has a hardcoded source list.
+    target_compile_definitions(vmhook_example PRIVATE VMHOOK_MODULAR_HARNESS=1)
     if(JNI_FOUND)
         target_include_directories(vmhook_example PRIVATE ${JNI_INCLUDE_DIRS})
         target_compile_definitions(vmhook_example PRIVATE VMHOOK_BENCH_USE_JNI=1)
