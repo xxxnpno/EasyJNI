@@ -228,9 +228,14 @@ VMHOOK_JVM_MODULE(method_enumeration)
     ctx.check("descriptor_JJ_unique",   count_descriptor(by_type, "(J)J") == 1);
     ctx.check("descriptor_II_shared_3", count_descriptor(by_type, "(I)I") == 3);
     ctx.check("descriptor_V_shared_ge3", count_descriptor(by_type, "()V") >= 3);
-    // javac's emission for this final class is stable across JDK 8..25:
-    // <init>, <clinit>, noop, tick, runIdLong, runIdInt == 6.
-    ctx.check("descriptor_V_shared_exactly_6", count_descriptor(by_type, "()V") == 6);
+    // The six DECLARED void methods (<init>, <clinit>, noop, tick, runIdLong,
+    // runIdInt) are present on every JDK, but JDK 8's javac emits extra synthetic
+    // methods for this class (18 total vs 16 on JDK 9+), some void — so the TOTAL
+    // ()V multiplicity is a portable LOWER bound of 6, not exactly 6 everywhere.
+    ctx.check("descriptor_V_shared_at_least_6", count_descriptor(by_type, "()V") >= 6);
+    ctx.record(std::string{ "[INFO] ()V descriptor multiplicity = " } +
+               std::to_string(count_descriptor(by_type, "()V")) +
+               " (>=6: 6 declared void methods + any JDK-specific synthetics).");
     ctx.check("descriptor_strI_unique", count_descriptor(by_type, "(Ljava/lang/String;)I") == 1);
     ctx.check("descriptor_arrII_unique", count_descriptor(by_type, "([I)I") == 1);
     ctx.check("descriptor_IJDD_unique", count_descriptor(by_type, "(IJD)D") == 1);
