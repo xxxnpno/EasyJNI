@@ -11719,6 +11719,18 @@ namespace vmhook
                 {
                     if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
                     {
+                        // FLAW B fix: a unique_ptr<T> target reads a SINGLE object
+                        // reference field ('L...;').  If the field is actually an
+                        // ARRAY ('[...;'), decoding its compressed OOP as a single
+                        // wrapper points the wrapper at the ARRAY oop, not an
+                        // element — and any field read through that wrapper is UB.
+                        // Reject non-'L' signatures (arrays / primitives) so the
+                        // mis-typed read yields nullptr instead of a wild wrapper.
+                        // (Use to_vector<T>() to read a '[L' field as elements.)
+                        if (this->signature.empty() || this->signature.front() != 'L')
+                        {
+                            return nullptr;
+                        }
                         using wrapper_type = typename clean_target_type::element_type;
                         void* const decoded{ vmhook::hotspot::decode_oop_pointer(value) };
                         if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))

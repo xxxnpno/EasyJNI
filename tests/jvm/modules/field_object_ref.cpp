@@ -467,19 +467,18 @@ VMHOOK_JVM_MODULE(field_object_ref)
             void* const arr_oop{ holder->ref_field_oop("refArray") };
             ctx.check("array_field_decodes_to_non_null_oop", arr_oop != nullptr);
 
+            (void) arr_oop;
             const auto as_ref{ holder->ref_array_as_ref() };
-            ctx.check("array_as_object_wrapper_non_null_documented_flaw",
-                      as_ref != nullptr);
-            if (as_ref)
-            {
-                ctx.check("array_as_object_wrapper_points_at_array_oop",
-                          as_ref->get_instance() == arr_oop);
-                ctx.record("[INFO] FLAW B (no signature-shape check, "
-                           "vmhook.hpp:11433-11444): '[' field refArray decoded "
-                           "as unique_ptr<ref_object> was ACCEPTED; wrapper points "
-                           "at the ARRAY oop (0x" + std::to_string(as_uptr(arr_oop))
-                           + "), not an element. Any field read through it is UB.");
-            }
+            // FLAW B FIXED: decoding a '[' (array) field as a SINGLE
+            // unique_ptr<ref_object> is now REJECTED by the signature-shape guard
+            // in cast_for_variant (returns nullptr) instead of yielding a wrapper
+            // pointing at the ARRAY oop whose field reads would be UB.  Read array
+            // elements with to_vector<T>() instead.
+            ctx.check("array_as_object_wrapper_rejected_returns_null",
+                      as_ref == nullptr);
+            ctx.record("[INFO] FLAW B FIXED (signature-shape guard in cast_for_variant): a '[' field "
+                       "decoded as a single unique_ptr is now rejected (nullptr), not a wrapper around "
+                       "the array oop.");
         }
 
         // ==================================================================
