@@ -2512,6 +2512,19 @@ namespace vmhook
             std::uint32_t offset;
             bool          is_static;
             std::string   signature;
+
+            // The klass that actually DECLARES this field, set by
+            // vmhook::find_field() while it walks the super chain.  For an
+            // instance field the offset is object-absolute (laid out cumulatively
+            // from the super down), so the declaring klass is informational only.
+            // For a STATIC field the offset is relative to the declaring class's
+            // own java.lang.Class mirror, so callers MUST add `offset` to
+            // `declaring_klass->get_java_mirror()` — NOT to the mirror of the
+            // (sub)class the lookup started from, whose mirror is a different,
+            // differently-sized oop.  May be nullptr for entries built by the
+            // per-klass klass::find_field() helper directly (the field is then
+            // known to be declared on that very klass).
+            vmhook::hotspot::klass* declaring_klass{ nullptr };
         };
 
         /*
@@ -10922,9 +10935,17 @@ namespace vmhook
         // every field lookup serialising on each other.
         for (vmhook::hotspot::klass* k{ target_klass }; k != nullptr; k = k->get_super())
         {
-            const auto entry{ k->find_field(name) };
+            auto entry{ k->find_field(name) };
             if (entry)
             {
+                // Record WHICH klass in the chain declared the field.  This is
+                // load-bearing for inherited STATIC fields: their offset is
+                // relative to the declaring class's own mirror, so the static
+                // accessors below resolve `declaring_klass->get_java_mirror()`
+                // rather than the start klass's (smaller, different) mirror —
+                // reading the latter returned garbage and could run off the end
+                // of the subclass mirror oop into adjacent heap (a fatal AV).
+                entry->declaring_klass = k;
                 std::lock_guard<std::mutex> lock{ vmhook::g_field_cache_mutex };
                 vmhook::g_field_cache[target_klass].emplace(name_str, *entry);
                 return entry;
@@ -10965,7 +10986,12 @@ namespace vmhook
 
             if (entry->is_static)
             {
-                void* const mirror{ target_klass->get_java_mirror() };
+                // A static field's offset is relative to the DECLARING class's
+                // mirror, not target_klass's — they differ for an inherited
+                // static (different, differently-sized mirror oops).  Fall back
+                // to target_klass only when the declaring klass is unknown.
+                vmhook::hotspot::klass* const mirror_klass{ entry->declaring_klass ? entry->declaring_klass : target_klass };
+                void* const mirror{ mirror_klass->get_java_mirror() };
                 if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
                 {
                     throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
@@ -11019,7 +11045,11 @@ namespace vmhook
 
             if (entry->is_static)
             {
-                void* const mirror{ target_klass->get_java_mirror() };
+                // Static offset is relative to the DECLARING class's mirror; see
+                // the matching note in get_field<value_type>.  Inherited statics
+                // would otherwise be written into the wrong (subclass) mirror.
+                vmhook::hotspot::klass* const mirror_klass{ entry->declaring_klass ? entry->declaring_klass : target_klass };
+                void* const mirror{ mirror_klass->get_java_mirror() };
                 if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
                 {
                     throw vmhook::exception{ "Failed to retrieve java.lang.Class mirror." };
@@ -13846,7 +13876,12 @@ namespace vmhook
 
             if (entry->is_static)
             {
-                void* const mirror{ resolved_klass->get_java_mirror() };
+                // Inherited static fields live on the DECLARING class's mirror,
+                // whose offset basis differs from resolved_klass's mirror; using
+                // the latter read/wrote garbage (and could fault past the end of
+                // a subclass mirror).  find_field() records the declaring klass.
+                vmhook::hotspot::klass* const mirror_klass{ entry->declaring_klass ? entry->declaring_klass : resolved_klass };
+                void* const mirror{ mirror_klass->get_java_mirror() };
                 if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
                 {
                     VMHOOK_LOG("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
@@ -13908,7 +13943,11 @@ namespace vmhook
                 return std::nullopt;
             }
 
-            void* const mirror{ resolved_klass->get_java_mirror() };
+            // Resolve the mirror of the klass that DECLARES the static, not the
+            // wrapper's start klass: for an inherited static they are different
+            // mirror oops and `entry->offset` only indexes the declaring one.
+            vmhook::hotspot::klass* const mirror_klass{ entry->declaring_klass ? entry->declaring_klass : resolved_klass };
+            void* const mirror{ mirror_klass->get_java_mirror() };
             if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
             {
                 VMHOOK_LOG("{} object::get_field('{}') failed to get java.lang.Class mirror.", vmhook::error_tag, name);
@@ -14454,7 +14493,12 @@ namespace vmhook
             }
             if (entry->is_static)
             {
-                void* const mirror{ k->get_java_mirror() };
+                // Inherited static: use the declaring klass's mirror (see the
+                // note on field_entry_t::declaring_klass).  `k` here is the live
+                // OOP's leaf klass; for a static inherited from a super the
+                // offset only indexes the super's mirror.
+                vmhook::hotspot::klass* const mirror_klass{ entry->declaring_klass ? entry->declaring_klass : k };
+                void* const mirror{ mirror_klass->get_java_mirror() };
                 if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
                 {
                     return std::nullopt;
@@ -14788,7 +14832,12 @@ namespace vmhook
             }
             if (entry->is_static)
             {
-                void* const mirror{ k->get_java_mirror() };
+                // Inherited static: use the declaring klass's mirror (see the
+                // note on field_entry_t::declaring_klass).  `k` here is the live
+                // OOP's leaf klass; for a static inherited from a super the
+                // offset only indexes the super's mirror.
+                vmhook::hotspot::klass* const mirror_klass{ entry->declaring_klass ? entry->declaring_klass : k };
+                void* const mirror{ mirror_klass->get_java_mirror() };
                 if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
                 {
                     return std::nullopt;
