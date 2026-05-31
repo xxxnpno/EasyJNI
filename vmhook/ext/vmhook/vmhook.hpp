@@ -12497,22 +12497,14 @@ namespace vmhook
                        this->cached_effective_signature)
                     : this->signature_text };
 
-            // FAIL-SAFE: if neither the bound signature nor any hierarchy-walked
-            // overload matches the C++ argument pack, dispatching would write a
-            // mismatched value into a JNI argument slot — a primitive into a
-            // reference slot stores a bogus oop the JVM later dereferences (a
-            // fatal AV).  Refuse the dispatch instead of crashing.  Valid calls
-            // (the fast path where the bound signature matches, or a walk that
-            // selected a matching overload) always satisfy this check, so only a
-            // genuine no-overload-matches mis-call is rejected.
-            if (!signature_matches_arguments<std::remove_cvref_t<args_t>...>(effective_signature))
-            {
-                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): no overload matches the C++ argument "
-                           "types (effective signature '{}') — refusing dispatch to avoid a wrong-slot "
-                           "write / JVM crash.",
-                           vmhook::error_tag, this->name(), this->signature_text, effective_signature);
-                return value_t{ std::monostate{} };
-            }
+            // NOTE: a fail-safe "refuse dispatch when no overload matches the C++
+            // args" guard was tried here but signature_matches_arguments() has a
+            // false-NEGATIVE for unique_ptr<T> / object arguments (it does not map
+            // a wrapper type to its 'L...;' parameter), so the guard wrongly
+            // refused valid object-argument calls.  The static-overload crash is
+            // fixed by the resolve_compatible_method() hierarchy walk above (it now
+            // covers statics); a proper fail-safe needs signature_matches_arguments
+            // to recognise object/unique_ptr args first (tracked separately).
 
             // Return-type char is parsed once from effective_signature
             // and cached on the proxy.  Skips the rfind() on every
@@ -13112,20 +13104,10 @@ namespace vmhook
             vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
             const std::string selected_signature{ selected_method ? selected_method->get_signature() : this->signature_text };
 
-            // FAIL-SAFE (same as call_jni): refuse to dispatch when no overload
-            // matches the C++ argument pack — packing a mismatched value into the
-            // call-stub parameters[] (which the interpreter reads as typed locals)
-            // would store a primitive where a reference is expected (a bogus oop
-            // the GC/interpreter dereferences -> JVM AV).  Only a genuine
-            // no-overload-matches mis-call is rejected here.
-            if (!signature_matches_arguments<std::remove_cvref_t<args_t>...>(selected_signature))
-            {
-                VMHOOK_LOG("{} method_proxy::call('{}{}'): no overload matches the C++ argument types "
-                           "(selected signature '{}') — refusing dispatch to avoid a wrong-slot write / "
-                           "JVM crash.",
-                           vmhook::error_tag, this->name(), this->signature_text, selected_signature);
-                return value_t{ std::monostate{} };
-            }
+            // (See call_jni: a no-overload-matches fail-safe guard was removed
+            // because signature_matches_arguments() false-negatives on
+            // unique_ptr<T> / object args.  The static-overload crash is fixed by
+            // the resolve_compatible_method() hierarchy walk now covering statics.)
 
             if (!vmhook::hotspot::ensure_current_java_thread())
             {
