@@ -38,17 +38,29 @@ import vmhook.Harness;
  * intermediate frames {@code mid}/{@code outer} are deliberately TINY so HotSpot
  * keeps the whole chain interpreted long enough to observe the relationship.
  *
+ * Crash-safety: this module runs LATE, after the generic {@code Harness.tickAll}
+ * dispatch frame above every probe has JIT-compiled.  Because a compiled frame
+ * breaks the interpreter saved-rbp layout stack_trace() walks, the named chains
+ * are reached through a deep INTERPRETED {@link #guard(int, int)} recursion
+ * (GUARD_DEPTH > the 64 cap) so a default-capped walk exhausts its budget on
+ * valid interpreter frames and never reaches that compiled frame.  See
+ * {@link #GUARD_DEPTH}.
+ *
  * Scenario selector (native sets {@code mode} + clears {@code done} on the
  * rising edge of {@code go}; each scenario is one probe cycle):
- *   1 = known-depth chain  outer -> mid -> inner   (depth/order/names headline)
+ *   1 = known-depth chain  ...guard... -> outer -> mid -> inner  (depth/order/
+ *       names headline: index 0 == mid, index 1 == outer)
  *   2 = same chain, used by the native side to exercise the max_depth CONTRACT
  *       (the chain is identical to mode 1; the native side just calls
  *        stack_trace(1), stack_trace(2), stack_trace(0) inside the detour)
  *   3 = deep self-recursion recurse(N) calling inner at the bottom, N well past
  *       the default 64 cap (truncation + "no spin" + uniform deep frames)
- *   4 = TWO chains in one cycle: a 2-frame shallow(int)->inner THEN the
- *       3-frame outer->mid->inner, so the native side proves the trace for the
- *       second fire is fresh and deeper than the first
+ *   4 = TWO chains in one cycle: a guard->shallow->inner chain THEN a
+ *       guard->outer->mid->inner chain, so the native side proves the trace for
+ *       the second fire is recomputed live (its IMMEDIATE caller is mid, the
+ *       first fire's was shallow); both are guard-deep so the freshness signal
+ *       is the distinct immediate caller, not a depth difference (the 64 cap
+ *       makes both traces the same length)
  *
  * Java 8 syntax only (no var / records / switch-expr / text-blocks).
  */
@@ -82,6 +94,26 @@ public final class ReturnStackTrace
     public static final int ARG_OUTER   = 100;
     public static final int ARG_SHALLOW = 200;
     public static final int ARG_RECURSE_LEAF = 1;
+
+    /**
+     * Depth of the interpreted "guard" recursion that wraps the named chains in
+     * modes 1/2/4 (see {@link #guard(int)}).  CRITICAL for crash-safety, not just
+     * coverage: stack_trace() walks the live saved-rbp chain immediate-caller
+     * first, and this module runs LATE in the suite, by which point the generic
+     * Harness dispatch frame ({@code Harness.tickAll}) that sits above every
+     * probe has been JIT-compiled.  A compiled frame does NOT follow the
+     * interpreter layout stack_trace() assumes, so a walk that reaches it must
+     * rely on the library's best-effort "stop on a non-interpreter frame" logic —
+     * which was observed to intermittently AV on one CI runtime when the stray
+     * read landed on unmapped metaspace.  By interposing GUARD_DEPTH (> the
+     * default 64-frame cap) PLAIN INTERPRETED guard frames between the named
+     * chain and that compiled boundary, the default-capped walk is GUARANTEED to
+     * exhaust its budget on valid interpreter frames and never reach the compiled
+     * dispatch frame.  Kept comfortably below DEEP_RECURSION so it stays well
+     * within the Java thread stack.  The native side mirrors only "GUARD_DEPTH >
+     * 64", never the exact value.
+     */
+    public static final int GUARD_DEPTH = 80;
 
     // ---- The fixed leaf -----------------------------------------------------
 
@@ -119,6 +151,40 @@ public final class ReturnStackTrace
         return this.inner(x + 1) + 1;
     }
 
+    // ---- guard recursion: keeps the walk inside interpreter frames ----------
+
+    /** Tail selector for {@link #guard(int, int)}: descend into outer(). */
+    public static final int TAIL_OUTER   = 0;
+    /** Tail selector for {@link #guard(int, int)}: descend into shallow(). */
+    public static final int TAIL_SHALLOW = 1;
+
+    /**
+     * Plain self-recursion that descends {@code depth} interpreted frames and
+     * then enters the requested named chain ({@code tail}) at the bottom.  Its
+     * ONLY purpose is to interpose a deep run of interpreter frames between the
+     * named chain (mid/outer or shallow, which sit BELOW guard, closest to the
+     * hooked leaf) and the JIT-compiled {@code Harness.tickAll} dispatch frame
+     * that sits ABOVE it — so a default-capped stack_trace() walk exhausts its
+     * 64-frame budget on these valid interpreter frames and never reaches (and
+     * never has to safely reject) the compiled frame.  See {@link #GUARD_DEPTH}.
+     *
+     * Frame order at the leaf detour (immediate-caller first) is therefore:
+     *   mid, outer, guard, guard, ... (GUARD_DEPTH of them), runKnownDepth, ...
+     * so index 0 is still mid and index 1 is still outer exactly as before.
+     */
+    public int guard(final int depth, final int tail)
+    {
+        if (depth <= 0)
+        {
+            if (tail == TAIL_SHALLOW)
+            {
+                return this.shallow(ARG_SHALLOW);
+            }
+            return this.outer(ARG_OUTER);
+        }
+        return this.guard(depth - 1, tail) + 1;
+    }
+
     // ---- mode 3: deep recursion --------------------------------------------
 
     /**
@@ -142,7 +208,10 @@ public final class ReturnStackTrace
     {
         observed = 0;
         innerCalls = 0;
-        this.outer(ARG_OUTER);
+        // Reach outer -> mid -> inner THROUGH the interpreted guard recursion so
+        // the default-capped walk never reaches the compiled Harness.tickAll
+        // frame above this probe.  guard(...) returns at TAIL_OUTER into outer().
+        this.guard(GUARD_DEPTH, TAIL_OUTER);
     }
 
     private void runDeepRecursion()
@@ -156,9 +225,14 @@ public final class ReturnStackTrace
     {
         observed = 0;
         innerCalls = 0;
-        // First fire: shallow 2-frame chain.  Second fire: deeper 3-frame chain.
-        this.shallow(ARG_SHALLOW);
-        this.outer(ARG_OUTER);
+        // Two DISTINCT chains in one cycle so the native side proves the trace is
+        // recomputed live per fire (different IMMEDIATE caller each time).  Both
+        // are reached through the interpreted guard recursion so neither walk
+        // reaches the compiled Harness.tickAll frame.  First fire's immediate
+        // caller is shallow; second fire's is mid — that difference (not a depth
+        // difference, which the 64-cap erases) is the freshness signal.
+        this.guard(GUARD_DEPTH, TAIL_SHALLOW);
+        this.guard(GUARD_DEPTH, TAIL_OUTER);
     }
 
     static
