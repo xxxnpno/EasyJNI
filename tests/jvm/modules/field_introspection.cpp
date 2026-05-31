@@ -663,34 +663,31 @@ VMHOOK_JVM_MODULE(field_introspection)
             }
         }
 
-        // F.2 — FLAW: get_compressed_oop has NO signature guard.  Called on a
-        //       primitive "I" field it returns the raw 4 int bytes verbatim (it
-        //       does not refuse or zero).  We prove it equals the int's value.
+        // F.2 — FLAW C FIXED: get_compressed_oop() now guards on is_reference(),
+        //       so on a primitive "I" field it returns 0 instead of the raw int
+        //       bytes (which would decode to a wild OOP).
         {
             auto fp{ fi_fixture::static_field("sInt") };
             if (fp)
             {
                 const std::uint32_t raw{ fp->get_compressed_oop() };
-                ctx.check("cmp_oop_FLAW_no_guard_on_primitive_returns_raw_bytes",
-                          raw == static_cast<std::uint32_t>(fi_fixture::s_int_raw()));
-                ctx.check("cmp_oop_FLAW_primitive_raw_is_0x0BADF00D",
-                          raw == 0x0BADF00Du);
+                ctx.check("cmp_oop_FIXED_primitive_int_field_guarded_zero", raw == 0u);
+                ctx.record("[INFO] FLAW C FIXED: get_compressed_oop() on primitive 'I' field returns 0 "
+                           "(was the raw int bytes 0x0BADF00D).");
             }
         }
 
-        // F.3 — FLAW: get_compressed_oop reads EXACTLY 4 bytes.  On an 8-byte
-        //       "J" field it returns ONLY the low 32 bits (this is also exactly
-        //       why it truncates a real 64-bit oop under -XX:-UseCompressedOops).
+        // F.3 — FLAW C FIXED: a primitive "J" (long) field is not a reference, so
+        //       get_compressed_oop() now returns 0 (it used to read only the low
+        //       32 bits of the 8-byte field).
         {
             auto fp{ fi_fixture::static_field("sLong") };
             if (fp)
             {
                 const std::uint32_t raw{ fp->get_compressed_oop() };
-                const std::int64_t full{ fi_fixture::s_long_raw() };
-                ctx.check("cmp_oop_FLAW_reads_only_low_4_bytes_of_long",
-                          raw == static_cast<std::uint32_t>(full & 0xFFFFFFFFull));
-                ctx.check("cmp_oop_FLAW_low_half_is_0x55667788",
-                          raw == 0x55667788u);
+                ctx.check("cmp_oop_FIXED_primitive_long_field_guarded_zero", raw == 0u);
+                ctx.record("[INFO] FLAW C FIXED: get_compressed_oop() on primitive 'J' field returns 0 "
+                           "(was the low 4 bytes 0x55667788).");
             }
         }
 
