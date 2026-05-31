@@ -104,7 +104,13 @@ public class Example
         Double.longBitsToDouble(0x4008000000000000L)
     };
     public static char[]    staticCharArray   = { 'A', 'B', 'C' };
-    public static String[]  staticStringArray = { "hello", "world", "!" };
+    // Non-interned backings: the legacy driver writes "omega" IN PLACE over
+    // element [1] (set_static_string_array), and if these were interned string
+    // literals that write would corrupt the shared, JVM-wide interned "world"
+    // constant other tests rely on (e.g. field_static's `"world".equals(setStr)`).
+    // new String(...) gives each element a private backing array so the in-place
+    // write can never alias an interned literal.
+    public static String[]  staticStringArray = { new String("hello".toCharArray()), new String("world".toCharArray()), new String("!".toCharArray()) };
 
     public boolean[] notStaticBoolArray   = { true, false, true };
     public byte[]    notStaticByteArray   = { 0x1, 0x2, 0x3 };

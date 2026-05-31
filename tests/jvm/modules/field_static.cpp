@@ -628,21 +628,22 @@ VMHOOK_JVM_MODULE(field_static)
             // ---- String, as seen by Java ----
             ctx.check("java_seenStr_world", fs::get_string("seenStr") == "world");
             ctx.check("java_seenStr_len_5", fs::seen_i32("seenStrLen") == 5);
-            // CHARACTERIZED (real vmhook bug): the native reads above prove
-            // setStr's backing holds "world" (java_seenStr_world passes on EVERY
-            // platform), yet the Java probe's `"world".equals(setStr)` returns
-            // FALSE uniformly — the native byte-view and Java's String.equals
-            // disagree after an in-place write_java_string.  The write leaves the
-            // String Java-inconsistent (no coder/length/metadata reconciliation),
-            // so equality against an interned literal fails even though the bytes
-            // match.  Assert the ACTUAL (buggy) result so a regression is still
-            // caught and flip to ==true when write_java_string is fixed; the robust
-            // content proof is java_seenStr_world above.
-            ctx.check("java_seenStr_eq_world_is_false_KNOWN_write_consistency_bug",
-                      fs::seen_bool("seenStrEqWorld") == false);
-            ctx.record("[INFO] field_static: native setStr content == \"world\" but Java "
-                       "\"world\".equals(setStr) == false -> write_java_string leaves the String "
-                       "Java-inconsistent (real vmhook write-path bug; native byte-view is correct).");
+            // FIXED (was misdiagnosed as a write_java_string bug): the native
+            // reads above prove setStr's backing holds "world", and Java's
+            // `"world".equals(setStr)` now also returns TRUE.  The earlier uniform
+            // FALSE was a TEST-FIXTURE bug, not a library bug: the legacy driver's
+            // set_static_string_array({"alpha","omega","?"}) wrote "omega" IN PLACE
+            // over Example.staticStringArray[1], which was the *interned* "world"
+            // literal — corrupting the very "world" constant this probe compares
+            // against (so the comparison became "omega".equals("world")).  Fixed by
+            // giving staticStringArray non-interned backings in Example.java;
+            // write_java_string itself was always correct (proven by a live
+            // build+inject investigation: setStr equals a char-array-built "world").
+            ctx.check("java_seenStr_eq_world",
+                      fs::seen_bool("seenStrEqWorld") == true);
+            ctx.record("[INFO] field_static: setStr == \"world\" both natively and via Java "
+                       ".equals (write_java_string is correct; the prior mismatch was an interned-"
+                       "literal corruption from a legacy in-place array write, now fixed).");
             ctx.check("java_seenStrShort_hirld", fs::get_string("seenStrShort") == "hirld");
             ctx.check("java_seenStrShort_len_5", fs::seen_i32("seenStrShortLen") == 5);
 
