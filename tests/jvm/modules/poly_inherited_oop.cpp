@@ -167,13 +167,22 @@ namespace
     constexpr std::int32_t B_INT         { 42 };     // B.bInt init
     constexpr std::int32_t ADD_ARG       { 3 };      // protectedAdd argument
     constexpr std::int32_t ADD_RESULT    { 1340 };   // protectedAdd(3) == 1337 + 3
+
+    // ---- Internal (JVM, slash-separated) class names.  javac emits the nested
+    //      static classes as PolyInherited$A / PolyInherited$B (confirmed via
+    //      javap), so these are the names register_class<>() and find_class()
+    //      key on.  Centralised so the registration calls and the no-instance
+    //      resolution checks below can never drift apart.
+    constexpr const char* FIXTURE_NAME { "vmhook/fixtures/PolyInherited" };
+    constexpr const char* A_NAME       { "vmhook/fixtures/PolyInherited$A" };
+    constexpr const char* B_NAME       { "vmhook/fixtures/PolyInherited$B" };
 }
 
 VMHOOK_JVM_MODULE(poly_inherited_oop)
 {
-    vmhook::register_class<pi_fixture>("vmhook/fixtures/PolyInherited");
-    vmhook::register_class<pi_a>("vmhook/fixtures/PolyInherited$A");
-    vmhook::register_class<pi_b>("vmhook/fixtures/PolyInherited$B");
+    vmhook::register_class<pi_fixture>(FIXTURE_NAME);
+    vmhook::register_class<pi_a>(A_NAME);
+    vmhook::register_class<pi_b>(B_NAME);
 
     // Record which dispatch path the live JDK uses for call(), for diagnostics.
     const bool call_gate_present{ vmhook::detail::find_call_stub_entry() != nullptr };
@@ -186,16 +195,34 @@ VMHOOK_JVM_MODULE(poly_inherited_oop)
     //  Registration / resolution sanity for both hierarchy levels.
     // =====================================================================
     {
+        // The fixture's go/done handshake fields ARE static, so static_field()
+        // (the portable type_index-keyed accessor) is the right probe here: it
+        // proves the fixture wrapper is registered and its klass is found.
         ctx.check("fixture_class_registered_static_resolves",
                   pi_fixture::static_field("go").has_value());
-        // static_field() is the portable type_index-keyed accessor; it resolves
-        // INSTANCE fields too (JVM_ACC_STATIC is read off the field entry), so
-        // this proves the B / A wrappers are registered and their klasses found
-        // without needing a live instance.
+
+        // bInt (own on B) and protectedInt (own on A) are INSTANCE fields, so
+        // static_field() is the WRONG probe for them: object_base::get_field(
+        // type_index, name) deliberately returns nullopt for a non-static entry
+        // ("needs an object instance", vmhook.hpp:14049) — it never resolves an
+        // instance field regardless of registration.  To prove "the wrapper is
+        // registered AND its klass is found AND its OWN field resolves" without
+        // a live instance, resolve the registered klass via find_class() and
+        // confirm find_field() (the same super-chain walker the instance path
+        // uses, which DOES find instance fields) locates the own field.  Each
+        // klass is null-checked before use and find_field() is is_valid_pointer-
+        // gated internally (vmhook.hpp:10932).
+        vmhook::hotspot::klass* const b_klass{ vmhook::find_class(B_NAME) };
+        ctx.check("sub_class_b_klass_resolved", b_klass != nullptr);
         ctx.check("sub_class_b_registered_own_field_resolves",
-                  pi_b::static_field("bInt").has_value());
+                  b_klass != nullptr
+                      && vmhook::find_field(b_klass, "bInt").has_value());
+
+        vmhook::hotspot::klass* const a_klass{ vmhook::find_class(A_NAME) };
+        ctx.check("super_class_a_klass_resolved", a_klass != nullptr);
         ctx.check("super_class_a_registered_own_field_resolves",
-                  pi_a::static_field("protectedInt").has_value());
+                  a_klass != nullptr
+                      && vmhook::find_field(a_klass, "protectedInt").has_value());
     }
 
     // =====================================================================
