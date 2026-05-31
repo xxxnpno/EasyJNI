@@ -12145,7 +12145,14 @@ namespace vmhook
         auto get_compressed_oop() const noexcept
             -> std::uint32_t
         {
-            if (!this->field_pointer)
+            // FLAW C fix: only reference/array fields hold a compressed OOP.  On a
+            // PRIMITIVE field, memcpy'ing the first 4 bytes returns the primitive's
+            // raw value bytes as a bogus "OOP" that later decodes to a wild pointer
+            // (the docstring above warns of exactly this).  Guard on is_reference()
+            // so a misused proxy yields null, not garbage.  Valid callers only ask
+            // for the compressed OOP of reference/array fields, so this is a no-op
+            // for them.
+            if (!this->field_pointer || !this->is_reference())
             {
                 return 0;
             }

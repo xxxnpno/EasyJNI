@@ -492,12 +492,13 @@ VMHOOK_JVM_MODULE(field_object_ref)
             const std::int32_t prim_val{ holder->primitive_value("primitiveInt") };
             const std::uint32_t prim_compressed{ holder->primitive_compressed("primitiveInt") };
             ctx.check("primitive_field_value_is_expected", prim_val == PRIMITIVE_INT_VALUE);
-            ctx.check("primitive_get_compressed_oop_returns_raw_int_bytes_documented_flaw",
-                      prim_compressed == static_cast<std::uint32_t>(prim_val));
-            ctx.record("[INFO] FLAW C (no signature guard in get_compressed_oop, "
-                       "vmhook.hpp:11820): on primitive 'I' field primitiveInt it "
-                       "returned 0x" + std::to_string(prim_compressed)
-                       + " = the int bytes, not a reference OOP.");
+            // FLAW C FIXED: get_compressed_oop() now guards on is_reference() and
+            // returns 0 for a primitive field instead of the int's raw bytes as a
+            // bogus compressed OOP.  (Was: prim_compressed == (uint32_t)prim_val.)
+            ctx.check("primitive_get_compressed_oop_guarded_returns_zero",
+                      prim_compressed == 0u);
+            ctx.record("[INFO] FLAW C FIXED (get_compressed_oop is_reference() guard): on primitive "
+                       "'I' field primitiveInt it now returns 0, not the int bytes / a wild OOP.");
             // is_reference() correctly says false for the primitive (the guard a
             // careful caller SHOULD use before get_compressed_oop()).
             ctx.check("primitive_field_is_reference_false",
