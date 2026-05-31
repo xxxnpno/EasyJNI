@@ -15524,6 +15524,39 @@ namespace vmhook
             return {};
         }
 
+        // An OBJECT-ARRAY field ('[L...;' or '[[...') is a raw Java array, NOT a
+        // collection object.  Routing it through vmhook::collection (which probes
+        // the oop's klass as an InstanceKlass for "size"/"elementData"/"first"/...
+        // and finds none on an ObjArrayKlass) silently returns an EMPTY vector —
+        // the documented Object[] entry point was broken.  Walk the array directly
+        // here; only 'L...;' reference fields (ArrayList / HashSet / LinkedList /
+        // ... collection OBJECTS) fall through to collection::to_vector.
+        if (this->signature.size() >= 2u && this->signature.front() == '['
+            && (this->signature[1] == 'L' || this->signature[1] == '['))
+        {
+            std::vector<std::unique_ptr<element_type>> result;
+            const std::int32_t n{ vmhook::array_length(collection_oop) };
+            if (n > 0)
+            {
+                result.reserve(static_cast<std::size_t>(n));
+                for (std::int32_t index{ 0 }; index < n; ++index)
+                {
+                    const std::uint32_t compressed_element{
+                        vmhook::get_array_element<std::uint32_t>(collection_oop, index) };
+                    void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed_element) };
+                    if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
+                    {
+                        result.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(element_oop)));
+                    }
+                    else
+                    {
+                        result.push_back(nullptr);
+                    }
+                }
+            }
+            return result;
+        }
+
         return vmhook::collection{ collection_oop }.to_vector<element_type>();
     }
 
