@@ -11305,7 +11305,21 @@ namespace vmhook
             return nullptr;
         }
 
-        vmhook::hotspot::klass* const array_klass{ vmhook::find_class(class_name) };
+        vmhook::hotspot::klass* array_klass{ vmhook::find_class(class_name) };
+        // JDK 8 fallback: find_class resolves names through ClassLoader.loadClass,
+        // which rejects array descriptors ("[B", "[Ljava/lang/Object;").  On JDK 9+
+        // the array klass is reachable by name so this branch never triggers; on
+        // JDK 8 it misses, so fall back to JNIEnv::FindClass, which DOES accept
+        // array descriptors, and convert the returned jclass mirror to its Klass*.
+        if (!array_klass && !class_name.empty() && class_name.front() == '[')
+        {
+            if (void* const h{ vmhook::detail::jni_find_class(class_name) })
+            {
+                array_klass = vmhook::detail::jni_klass_from_class_mirror(h);
+                vmhook::detail::jni_delete_local_ref(h);
+                vmhook::detail::jni_exception_clear();
+            }
+        }
         if (!array_klass)
         {
             VMHOOK_LOG("{} vmhook::make_java_array('{}'): array klass not found - the array "
