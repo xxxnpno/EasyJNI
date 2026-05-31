@@ -504,6 +504,23 @@ VMHOOK_JVM_MODULE(scoped_hook_raii)
     //      long overload in scenario 11.)
     // =====================================================================
     {
+        // The name-only scoped_hook(name, cb) installs on the FIRST "over" overload
+        // in HotSpot's _methods ARRAY order — which is Symbol-ADDRESS order
+        // (Symbol::fast_compare), interning-dependent and NOT source-declaration
+        // order.  So whether driving over(int) fires the detour depends on which
+        // "over" overload sorts first on THIS JDK/build.  Determine it portably via
+        // vmhook's own enumeration (it walks the identical _methods array).
+        const auto first_over_descriptor{ []() -> std::string
+        {
+            for (const std::pair<std::string, std::string>& m :
+                     vmhook::get_class_methods<shr_fixture>())
+            {
+                if (m.first == "over") { return m.second; }
+            }
+            return {};
+        }() };
+        const bool bound_to_over_i{ first_over_descriptor == "(I)I" };
+
         auto handle{ vmhook::scoped_hook<shr_fixture>("over", over_i_detour()) };
         ctx.check("short_overload_installed", handle.installed());
 
@@ -512,8 +529,22 @@ VMHOOK_JVM_MODULE(scoped_hook_raii)
         ctx.check("short_overload_probe_completed", done);
         ctx.check("short_overload_java_called_over_i",
                   shr_fixture::get_over_i_calls() - before == 1);
-        ctx.check("short_overload_detour_fired", g_over_i_fires.load() == 1);
-        ctx.check("short_overload_decoded_arg", g_over_i_arg_ok.load());
+        ctx.record(std::string{ "[INFO] name-only hook on 'over' bound to first array-order overload '" } +
+                   (first_over_descriptor.empty() ? std::string{ "<none>" } : first_over_descriptor) +
+                   "'; driving over(int) " + (bound_to_over_i ? "DOES" : "does NOT") + " fire it.");
+        // The detour fires iff the name-only hook bound to over(int) — the form we
+        // drive.  Either branch is a deterministic, portable assertion.
+        if (bound_to_over_i)
+        {
+            ctx.check("short_overload_detour_fired_when_bound_to_over_i", g_over_i_fires.load() == 1);
+            ctx.check("short_overload_decoded_arg", g_over_i_arg_ok.load());
+        }
+        else
+        {
+            ctx.check("short_overload_detour_silent_when_bound_to_over_ii", g_over_i_fires.load() == 0);
+        }
+        // allow-through: over(int)'s original body runs regardless of which overload
+        // the name-only hook targeted (the detour never cancels).
         ctx.check("short_overload_allow_through",
                   shr_fixture::get_over_i_result() == (OVER_I_ARG + 1));
     }

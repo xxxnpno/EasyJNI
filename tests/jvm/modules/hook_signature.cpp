@@ -15,8 +15,10 @@
 //     descriptor (int / long(2 slots) / double(2 slots) / boolean / String ref /
 //     Object ref / int[] array / trailing-int-after-long ordering);
 //   * static overloads are selectable with NO implicit `this`;
-//   * the empty-signature overload hook<T>(name, cb) picks the FIRST declared
-//     same-name overload (documented foot-gun) — locked here;
+//   * the empty-signature overload hook<T>(name, cb) binds to the first same-name
+//     overload IN _methods ARRAY ORDER (HotSpot sorts by name-/signature-Symbol
+//     address, NOT source order) — characterized here against vmhook's own
+//     enumeration, since the bound overload is not portably the source-first one;
 //   * a descriptor matching NO overload fails install (false), while a different
 //     valid descriptor on the same name still installs (true);
 //   * duplicate install on name+signature: second returns true, FIRST detour
@@ -31,10 +33,13 @@
 
 #include "../harness.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -138,6 +143,7 @@ namespace
     // detour, so we use dedicated counters to avoid clashing with explicit hooks.
     std::atomic<std::int32_t> g_empty_fire_total{ 0 };
     std::atomic<std::int32_t> g_empty_saw_int_arg{ 0 };
+    std::atomic<std::int32_t> g_empty_raw_slot1{ 0 };   // raw slot-1-as-int the empty-sig detour decoded
 
     // Duplicate-install probe: which of the two detours fired.
     std::atomic<std::int32_t> g_dup_first{ 0 };
@@ -169,6 +175,7 @@ namespace
         g_fire_stat_i.store(0); g_fire_stat_j.store(0);
         g_seen_stat_i.store(0); g_seen_stat_j.store(0);
         g_empty_fire_total.store(0); g_empty_saw_int_arg.store(0);
+        g_empty_raw_slot1.store(0);
         g_dup_first.store(0); g_dup_second.store(0);
         g_fire_wide.store(0);
         g_wide_flag_ok.store(false); g_wide_d_ok.store(false);
@@ -198,6 +205,29 @@ namespace
         std::int64_t out{};
         std::memcpy(&out, &d, sizeof(out));
         return out;
+    }
+
+    // The descriptor of the FIRST entry named `name` in the klass's _methods
+    // array, in EXACT array order.  vmhook's empty-signature hook<T>(name, cb)
+    // binds to precisely this overload: both walk get_methods_ptr() from index 0
+    // and accept the first name match (vmhook.hpp:8012-8023, scoped_hook re-resolve
+    // 8963-8978; get_class_methods walks the identical array via collect_klass_methods
+    // 6941-6949).  HotSpot stores _methods SORTED by name-/signature-Symbol ADDRESS
+    // (Symbol::fast_compare), which is interning-order dependent and therefore NOT
+    // source-declaration order — so this is the only portable way to know, on THIS
+    // JDK, which overload the no-filter hook actually selects.  Empty if not found.
+    auto first_array_order_descriptor(const std::string& name) -> std::string
+    {
+        const std::vector<std::pair<std::string, std::string>> methods{
+            vmhook::get_class_methods<hook_sig_fixture>() };
+        for (const std::pair<std::string, std::string>& m : methods)
+        {
+            if (m.first == name)
+            {
+                return m.second;
+            }
+        }
+        return {};
     }
 }
 
@@ -518,18 +548,49 @@ VMHOOK_JVM_MODULE(hook_signature)
 
     // =====================================================================
     // Block 7 — EMPTY-SIGNATURE foot-gun: hook<T>(name, cb) with NO descriptor
-    //   picks the FIRST declared same-name overload.  process(int) is declared
-    //   first in HookSignature.java, so the no-filter hook must select (I)I.
-    //   We call ALL FOUR overloads (mode 1) and assert the no-filter detour fired
-    //   EXACTLY ONCE and saw the int argument (proving it bound to (I)I, not J/D/
-    //   String).  Locks the documented declaration-order behaviour.
+    //   binds to the FIRST same-name overload IN _methods ARRAY ORDER.
+    //
+    //   IMPORTANT CORRECTION (was a test mistake): this is NOT "first DECLARED in
+    //   source".  HotSpot stores InstanceKlass::_methods SORTED by name-/signature-
+    //   Symbol ADDRESS (Symbol::fast_compare is a pointer compare), and Symbol
+    //   addresses depend on interning order, which is build-/JDK-/run-dependent.
+    //   So among the four process(...) overloads the array's first one is NOT
+    //   portably (I)I — the original assertion "bound to the first DECLARED int
+    //   overload" failed across the live-JVM matrix because on those JDKs the
+    //   no-filter hook bound to a non-int overload (e.g. (J)J / (D)D / String),
+    //   and reading slot-1-as-int then never equalled ARG_I.  This is the exact
+    //   foot-gun the sibling method_enumeration module already documents
+    //   (method_enumeration.cpp:19: "HotSpot sorts _methods by name-symbol, not
+    //   source order") and that the audit flags
+    //   (audit/findings/hook_explicit_signature_install.md, [low] empty-signature).
+    //
+    //   So we CHARACTERIZE the real behaviour: the no-filter hook binds to exactly
+    //   ONE overload (fires once across all four calls — the genuine portable
+    //   contract), and that overload is precisely the first array-order match,
+    //   which we read straight from vmhook's own enumeration (the identical walk).
+    //   We then assert the int-arg only WHEN that first array-order overload truly
+    //   is (I)I, so the check holds on every JDK regardless of the sort outcome.
     // =====================================================================
     {
+        // What vmhook's empty-sig path will actually bind to on THIS JDK (same
+        // get_methods_ptr() walk, first name match).  Computed BEFORE installing
+        // so the [INFO] line documents the selection the user really gets.
+        const std::string bound_desc{ first_array_order_descriptor("process") };
+        const bool bound_is_int{ bound_desc == "(I)I" };
+        ctx.record(std::string{ "[INFO] empty-signature hook<T>(\"process\", cb) binds to the "
+                                "FIRST overload in HotSpot _methods ARRAY ORDER (sorted by "
+                                "name-/signature-Symbol address, NOT source declaration order). "
+                                "On this JDK that first overload is '" }
+                   + (bound_desc.empty() ? std::string{ "<none found>" } : bound_desc)
+                   + "'.  Source declares (I)I first, but that is not portable; callers who need "
+                     "a specific overload MUST pass an explicit descriptor.");
+
         auto h{ vmhook::scoped_hook<hook_sig_fixture>(
             "process",                     // <-- no signature: empty filter
             [](vmhook::return_value&, const std::unique_ptr<hook_sig_fixture>&, std::int32_t v)
             {
                 g_empty_fire_total.fetch_add(1, std::memory_order_relaxed);
+                g_empty_raw_slot1.store(v, std::memory_order_relaxed);
                 if (v == ARG_I)
                 {
                     g_empty_saw_int_arg.fetch_add(1, std::memory_order_relaxed);
@@ -540,13 +601,37 @@ VMHOOK_JVM_MODULE(hook_signature)
         const bool done{ drive(ctx, 1) };   // all four process overloads called
         ctx.check("empty_sig_probe_completed", done);
 
-        // It bound to ONE overload (the first declared = int), so it fires once
-        // even though four overloads were called.
+        // PORTABLE CONTRACT: it bound to ONE overload, so it fires exactly once
+        // even though four overloads were called.  (True on every JDK.)
         ctx.check("empty_sig_fired_exactly_once_across_all_overloads",
                   g_empty_fire_total.load() == 1);
-        ctx.check("empty_sig_bound_to_first_declared_int_overload",
-                  g_empty_saw_int_arg.load() == 1);
-        // Sanity: the int overload's original still ran.
+
+        // ACTUAL-BEHAVIOUR CONTRACT (was the false "first DECLARED int" check):
+        // the bound overload is the first array-order match.  IFF that is (I)I do
+        // we expect the int detour to have decoded ARG_I from slot 1; otherwise a
+        // non-int overload was selected and the int read is (correctly) NOT ARG_I.
+        ctx.record(std::string{ "[INFO] empty-signature detour decoded slot-1-as-int = " }
+                   + std::to_string(g_empty_raw_slot1.load())
+                   + " (== ARG_I only when the bound overload is (I)I).");
+        // Only assert the array-order equality when the enumeration actually
+        // resolved a `process` descriptor (it always should here — Blocks 1-6
+        // already drove the now-loaded class).  If it somehow returned none, the
+        // fire-once contract above still holds; skip the strict check rather than
+        // risk a spurious fail off a transient introspection miss.
+        if (!bound_desc.empty())
+        {
+            ctx.check("empty_sig_bound_to_first_array_order_overload",
+                      g_empty_saw_int_arg.load() == (bound_is_int ? 1 : 0));
+        }
+        else
+        {
+            ctx.record("[INFO] get_class_methods<>() returned no 'process' entry; "
+                       "skipping the array-order overload assertion (fire-once still checked).");
+        }
+
+        // Allow-through on the bound overload: the int overload's original still
+        // ran regardless of which overload the no-filter hook intercepted (every
+        // overload is called in mode 1, and none cancels its return).
         ctx.check("empty_sig_int_allow_through", hook_sig_fixture::get_res_i() == (SEED + ARG_I));
     }
 

@@ -292,13 +292,31 @@ VMHOOK_JVM_MODULE(field_object_ref)
                           r->get_instance() != nullptr);
 
                 // ── nested object-ref field ON the decoded wrapper ─────────
+                // ORDERING: the fixture wires `ref.next` (and `self`) only inside
+                // the probe's run() on the Java thread (FieldObjectRef.java
+                // run(): "if (s.ref.next == null) s.ref.next = makeRef(...)").
+                // PART 1 runs BEFORE PART 2's run_probe, so at this point the
+                // `next` slot is still its constructor default (null).  Reading a
+                // genuinely-null nested object-ref slot must therefore decode to a
+                // null unique_ptr — the SAME null-slot invariant as nullRef, now
+                // proven one level deep through a field-decoded wrapper.  This is
+                // NOT a vmhook flaw: the slot really is null pre-probe, and the
+                // decode correctly refuses to fabricate a wrapper.  The non-null
+                // nested read is asserted post-probe in PART 3, once run() has
+                // wired the slot.
                 const auto n{ r->next() };
-                ctx.check("nested_ref_non_null", n != nullptr);
-                if (n)
-                {
-                    ctx.check("nested_ref_int_read", n->val() == NESTED_REF_VAL);
-                    ctx.check("nested_ref_string_read", n->label() == NESTED_REF_LABEL);
-                }
+                ctx.check("nested_ref_slot_null_pre_probe_decodes_to_nullptr",
+                          n == nullptr);
+                // The unwired slot's raw compressed OOP is exactly 0 (guarded
+                // has_value() access — the null-slot invariant, one level deep).
+                const auto next_proxy{ r->get_field("next") };
+                ctx.check("nested_ref_slot_compressed_zero_pre_probe",
+                          next_proxy.has_value()
+                          && next_proxy->get_compressed_oop() == 0u);
+                ctx.record("[INFO] nested ref `next` is unwired (null) until the "
+                           "probe's run() executes on the Java thread; pre-probe it "
+                           "correctly decodes to a null unique_ptr. Non-null nested "
+                           "read + value/string are asserted post-probe in PART 3.");
             }
         }
 
@@ -409,7 +427,15 @@ VMHOOK_JVM_MODULE(field_object_ref)
             const auto wrong{ holder->ref_as_decoy() };
             ctx.check("wrong_wrapper_type_still_non_null_documented_flaw",
                       wrong != nullptr);
-            if (wrong)
+            // CRASH-PROOFING: the cross-klass field read below (Decoy.poison on a
+            // Ref oop) reads at refOop + Decoy's poison-offset.  The Ref oop is a
+            // real heap object, so the small-offset read stays inside mapped JVM
+            // heap, but we still gate it on is_valid_pointer so a hypothetical
+            // edge layout can never turn the documented mis-decode into an AV that
+            // truncates the suite.
+            if (wrong
+                && wrong->get_instance() != nullptr
+                && vmhook::hotspot::is_valid_pointer(wrong->get_instance()))
             {
                 const std::int32_t poison{ wrong->poison() };
                 const auto correct{ holder->ref() };
@@ -562,14 +588,22 @@ VMHOOK_JVM_MODULE(field_object_ref)
         ctx.check("java_ref_and_alias_identity_equal",
                   holder_object::ref_identity() == holder_object::ref_alias_identity());
 
-        // Nested ref reachable post-probe and carries the wired value.
+        // Nested ref reachable post-probe and carries the wired value.  This is
+        // the proper home for the "nested object-ref field decodes to a usable
+        // wrapper" promise: run() has now wired `ref.next`, so the recursive
+        // object-ref decode through a field-decoded wrapper yields a live Ref.
         {
             const auto r{ holder2->ref() };
+            ctx.check("ref_non_null_post_probe", r != nullptr);
             if (r)
             {
                 const auto n{ r->next() };
-                ctx.check("nested_ref_post_probe_value",
-                          n != nullptr && n->val() == NESTED_REF_VAL);
+                ctx.check("nested_ref_non_null_post_probe", n != nullptr);
+                if (n)
+                {
+                    ctx.check("nested_ref_post_probe_value", n->val() == NESTED_REF_VAL);
+                    ctx.check("nested_ref_post_probe_string", n->label() == NESTED_REF_LABEL);
+                }
             }
         }
 

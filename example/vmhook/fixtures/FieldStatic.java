@@ -45,6 +45,12 @@ import vmhook.Harness;
  *     equal-or-shorter ASCII value, so the in-place backing-array write is
  *     deterministic across JDK 8 (char[]) and JDK 9+ (compact LATIN1/UTF-16),
  *     where write_java_string keeps the existing length and never resizes.
+ *   - String SET targets are built with new String(char[]) (freshAscii), NOT
+ *     bare literals, so each owns a PRIVATE backing array.  write_java_string
+ *     mutates the backing array in place; a literal-initialised target would
+ *     share its backing with the interned constant-pool String, and the write
+ *     would corrupt that literal everywhere it is used in the JVM (including
+ *     the "world" literal in seenStrEqWorld).  Mirrors FieldString.java.
  *
  * Java 8 syntax only (anonymous class, no var/lambda-in-field/switch-expr).
  */
@@ -91,11 +97,24 @@ public final class FieldStatic
 
     // String SET target: ASCII, length 5, overwritten with an equal-length
     // ASCII value ("world").  In-place write keeps length on all JDKs.
-    public static String  setStr = "AAAAA";       // native writes "world"
+    //
+    // CRITICAL: built with new String(char[]) (via freshAscii) so it owns a
+    // PRIVATE, non-interned backing array.  A bare literal ("AAAAA") would be
+    // the SAME interned String object as every other "AAAAA" in the constant
+    // pool, and write_java_string's in-place backing-array mutation would then
+    // silently corrupt that shared literal process-wide (verified on JDK 21:
+    // a literal-initialised setStr left "AAAAA" reading "world" even after
+    // resetTargets() re-assigned setStr = "AAAAA", because the assignment just
+    // re-aliased the already-mutated interned object).  See FieldString.java's
+    // identical precaution and audit/findings/field_proxy_string_set.md.
+    public static String  setStr = freshAscii("AAAAA");       // native writes "world"
 
     // String SET target overwritten with a SHORTER value ("hi") -> partial
     // overwrite leaves the tail: Java should see "hirld" (length unchanged).
-    public static String  setStrShort = "world";  // native writes "hi" -> "hirld"
+    // Same private-backing requirement: a bare "world" literal aliases the
+    // interned "world" used by seenStrEqWorld = "world".equals(setStr) in
+    // snapshot(), so the shorter write would corrupt that comparison literal.
+    public static String  setStrShort = freshAscii("world");  // native writes "hi" -> "hirld"
 
     // =====================================================================
     //  PRIMITIVE-vs-PRIMITIVE TYPE/SIZE GUARD targets (audit:
@@ -235,6 +254,18 @@ public final class FieldStatic
     public static boolean objRefIsB() { return objRef == objB; }
     public static boolean objRefIsNull() { return objRef == null; }
 
+    /**
+     * Builds a String from the chars of {@code text} via new String(char[]),
+     * guaranteeing a PRIVATE backing array never shared with an interned
+     * constant-pool literal.  Essential for the String SET targets, which
+     * write_java_string mutates in place: an interned-literal backing would be
+     * corrupted process-wide by that write (see the setStr/setStrShort notes).
+     */
+    private static String freshAscii(final String text)
+    {
+        return new String(text.toCharArray());
+    }
+
     private static void snapshot()
     {
         // getstatic each set* target, putstatic into the witness -- genuine
@@ -289,8 +320,12 @@ public final class FieldStatic
 
     private static void resetTargets()
     {
-        setStr = "AAAAA";
-        setStrShort = "world";
+        // freshAscii (not bare literals): assigning a literal here would re-alias
+        // the interned "AAAAA"/"world" objects that the phase-2 native writes
+        // already mutated in place, so the "restored" field would still read the
+        // post-mutation content.  A private backing array gives a clean reset.
+        setStr = freshAscii("AAAAA");
+        setStrShort = freshAscii("world");
         guardInt = 0x11223344;
         guardLong = 0x1122334455667788L;
         guardChar = 0x0000;

@@ -296,7 +296,9 @@ VMHOOK_JVM_MODULE(field_arrays_object)
         ctx.check("str_mixed_elem0_x",        v.size() == 3 && v[0] == "x");
         ctx.check("str_mixed_elem1_null_as_empty", v.size() == 3 && v[1].empty());
         ctx.check("str_mixed_elem2_z",        v.size() == 3 && v[2] == "z");
-        // Count must match the Java oracle exactly.
+        // Count must match the Java oracle exactly.  The oracle (mixedStringsLen)
+        // is published in the fixture's static initializer at class-load time, so
+        // it is already valid here in PART A (which runs before the PART C probe).
         ctx.check("str_mixed_count_matches_java",
                   static_cast<std::int32_t>(v.size()) == wrapper::j_mixed_strings_len());
     }
@@ -342,6 +344,8 @@ VMHOOK_JVM_MODULE(field_arrays_object)
     }
 
     // ---- A10: count oracle for the canonical case ----------------------------
+    // Oracle (staticStringsLen) is published at fixture class-init, so it is live
+    // here even though the PART C probe has not run yet.
     {
         const std::vector<std::string> v{ wrapper::s_strings() };
         ctx.check("str_canonical_count_matches_java",
@@ -435,6 +439,8 @@ VMHOOK_JVM_MODULE(field_arrays_object)
         const std::vector<std::unique_ptr<item_object>> v{
             manual_item_walk_static("staticItems") };
         ctx.check("item_manual_canonical_size3", v.size() == 3);
+        // Oracle (staticItemsLen) published at fixture class-init; valid in PART B
+        // before the PART C probe runs.
         ctx.check("item_manual_canonical_count_matches_java",
                   static_cast<std::int32_t>(v.size()) == wrapper::j_static_items_len());
         if (v.size() == 3)
@@ -521,6 +527,8 @@ VMHOOK_JVM_MODULE(field_arrays_object)
         const std::vector<std::unique_ptr<item_object>> v{
             manual_item_walk_static("mixedItems") };
         ctx.check("item_manual_mixed_size3", v.size() == 3);
+        // Oracle (mixedItemsLen) published at fixture class-init; valid in PART B
+        // before the PART C probe runs.
         ctx.check("item_manual_mixed_count_matches_java",
                   static_cast<std::int32_t>(v.size()) == wrapper::j_mixed_items_len());
         if (v.size() == 3)

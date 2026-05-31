@@ -400,6 +400,32 @@ VMHOOK_JVM_MODULE(field_static)
     // =====================================================================
     //  2. STRING static SET (ASCII, length-preserving on all JDKs).
     // =====================================================================
+    // CONTRACT of the write path exercised here (field_proxy::set(std::string)
+    // -> vmhook::set_str_field -> vmhook::write_java_string, vmhook.hpp ~15667):
+    // write_java_string is an IN-PLACE, LENGTH-PRESERVING, MIN-LENGTH overwrite.
+    // It overwrites exactly min(value.size(), existing_backing_length) code units
+    // of the String's existing backing array and NEVER changes the String's
+    // logical length, never reallocates, and never replaces the String reference.
+    // Consequences proven by this phase:
+    //   * equal-length write ("AAAAA" <- "world") fully replaces the content;
+    //   * SHORTER write ("world" <- "hi") overwrites only the first 2 units and
+    //     LEAVES THE TAIL, so the field reads back "hi"+"rld" == "hirld" with
+    //     length still 5 (NOT "hi" with length 2) -- a real ergonomic limitation:
+    //     callers who need to truly shorten/grow/replace a String must build a
+    //     new String and rewrite the reference (the field still aliases the old
+    //     backing otherwise).  A longer-than-backing write would be truncated.
+    // The fixture's setStr/setStrShort are deliberately new String(char[])
+    // (private backing), never bare interned literals: an in-place write into an
+    // interned-literal backing corrupts that shared constant-pool String JVM-wide
+    // (see FieldStatic.java + audit/findings/field_proxy_string_set.md).
+    ctx.record("[INFO] field_static: write_java_string is in-place + "
+               "length-preserving + min-length overwrite -- a SHORTER write "
+               "leaves the tail (\"world\"<-\"hi\" reads back \"hirld\", len stays "
+               "5) and a longer write truncates; it never resizes or replaces the "
+               "String reference (vmhook.hpp ~15667). Targets must own a private "
+               "backing (new String(char[])) or the write corrupts the shared "
+               "interned literal process-wide.");
+
     ctx.check("set_str_resolved", fs::set_string("setStr", "world"));        // "AAAAA" <- "world" (len 5)
     ctx.check("set_str_short_resolved", fs::set_string("setStrShort", "hi")); // "world" <- "hi" -> "hirld"
 

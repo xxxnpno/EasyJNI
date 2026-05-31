@@ -170,6 +170,17 @@ public final class FieldArraysObject
 
     static
     {
+        // Publish the length oracles at CLASS-INIT time (this static block runs
+        // when Main.loadFixtures() Class.forName's the fixture, long before any
+        // native test runs).  The native count checks (str_*_count_matches_java,
+        // item_manual_*_count_matches_java) read these as a Java oracle from the
+        // side-effect-free PART A / PART B reads, which execute BEFORE the probe
+        // handshake in PART C.  Publishing only inside the probe's run() left the
+        // oracles at their default 0 for those earlier reads, so every
+        // size-vs-oracle check compared 3 == 0 and failed.  The values are
+        // compile-time-constant array lengths, so eager publication is correct.
+        publishLengths();
+
         Harness.register(new Harness.Probe()
         {
             @Override
@@ -183,6 +194,8 @@ public final class FieldArraysObject
             {
                 final FieldArraysObject instance = new FieldArraysObject();
                 FieldArraysObject.self = instance;
+                // Idempotent re-publish (lengths are constants); kept so the
+                // oracle is correct even if a future probe mutates the arrays.
                 publishLengths();
                 // Drive a real bytecode dispatch so the interpreter hook fires.
                 FieldArraysObject.observed = instance.touch(1000);

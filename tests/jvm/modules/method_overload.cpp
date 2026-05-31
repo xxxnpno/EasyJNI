@@ -181,9 +181,23 @@ namespace
 
     constexpr std::int64_t k_unset = static_cast<std::int64_t>(0xDEADBEEFCAFEF00Dull);
 
+    // Distinct from k_unset: marks a static name-only call that was DELIBERATELY
+    // skipped because the dispatch path is the call_jni fallback, on which a
+    // static-overload call AVs the JVM (see the SAFETY note in run_all()).
+    constexpr std::int64_t k_skipped_unsafe = static_cast<std::int64_t>(0x5EED5A1F5A1FD00Dull);
+
     // ── Observations captured inside the tick() detour ─────────────────────
     std::atomic<int>  g_detour_calls{ 0 };
     std::atomic<bool> g_saw_self{ false };
+
+    // True iff method_proxy::call() will take the call_jni fallback (the call
+    // stub is absent).  Set ONCE in the module body before the probe runs, read
+    // inside the detour.  On that path the static-overload resolver bails
+    // (object==nullptr) and a static name-only call dispatches a MISMATCHED
+    // overload — which AVs the JVM when the latched overload has a reference
+    // parameter and we pass a primitive (the primitive bits become a bogus oop
+    // that the JVM dereferences on the field store).  See run_all().
+    std::atomic<bool> g_call_jni_fallback_active{ false };
 
     // single-arg primitive resolution: which sentinel came back
     std::atomic<std::int64_t> g_r_int{ k_unset };
@@ -339,15 +353,45 @@ namespace
         // whatever int comes back (documents the fallback, never asserts a value).
         g_only_int_mismatch.store(s.only_int_mismatch_double(99.0));
 
-        // ===== STATIC overload resolution (KNOWN-broken on call_jni) =======
-        // Recorded only; the explicit-signature static path below is the hard
-        // assertion that the methods exist + dispatch.
-        g_s_int.store(overload_fixture::static_method("spick")->call(static_cast<std::int32_t>(1)));
-        g_s_long.store(overload_fixture::static_method("spick")->call(static_cast<std::int64_t>(2)));
-        g_s_double.store(overload_fixture::static_method("spick")->call(3.14));
-        g_s_float.store(overload_fixture::static_method("spick")->call(3.14f));
-        g_s_bool.store(overload_fixture::static_method("spick")->call(true));
-        g_s_string.store(overload_fixture::static_method("spick")->call(std::string{ "s" }));
+        // ===== STATIC name-only overload resolution (KNOWN-broken + UNSAFE) =
+        //
+        // SAFETY (do NOT remove the guard): static-overload resolution is DEAD on
+        // BOTH dispatch paths.  resolve_compatible_method() returns this->method
+        // unconditionally for a static proxy because object==nullptr
+        // (vmhook.hpp:13652-13656 — the hierarchy walk is skipped).  So a static
+        // name-only call dispatches whatever overload get_method() latched onto
+        // FIRST by name, NOT the one matching the C++ arg type.  HotSpot orders
+        // InstanceKlass._methods by the name Symbol's identity, so "which spick
+        // is first" is effectively arbitrary across JDK/compiler builds.
+        //
+        // When that first-by-name overload has a REFERENCE parameter (here the
+        // only candidate is spick(String) -> (Ljava/lang/String;)I) and we pass a
+        // primitive, the primitive bits are blasted into a reference slot:
+        //   * call_jni fallback: write_jni_arg_to_slot puts the raw int bits in
+        //     jvalue.l (vmhook.hpp:10160) and CallStaticIntMethodA hands the JVM a
+        //     bogus oop (e.g. 0x1);
+        //   * call_stub fast path: pack() memcpy's the int bits into params[i]
+        //     (vmhook.hpp:13187) which the interpreter reads as an oop.
+        // Either way the callee's `lastStringArg = a` store runs the GC
+        // reference-store barrier on that bogus oop and the JVM takes an access
+        // violation that tears the whole process down.  This is exactly what
+        // crashed windows-clang-java8 (call_jni path, methods array ordered the
+        // String overload first) on the very FIRST static call, spick(int 1).
+        //
+        // A crash truncates the ENTIRE test artifact (no TOTAL line) — strictly
+        // worse than a FAIL — and the broken behaviour is already only recorded
+        // as [INFO], never asserted.  So we DO NOT perform the static name-only
+        // calls at all; we mark every outcome as deliberately-skipped-unsafe and
+        // characterize the bug below.  The explicit-signature static path that
+        // follows (arg type matches the slot, no reference-slot blasting) is safe
+        // on every path and remains the hard assertion that the static methods
+        // exist + dispatch on this JDK.
+        g_s_int.store(k_skipped_unsafe);
+        g_s_long.store(k_skipped_unsafe);
+        g_s_double.store(k_skipped_unsafe);
+        g_s_float.store(k_skipped_unsafe);
+        g_s_bool.store(k_skipped_unsafe);
+        g_s_string.store(k_skipped_unsafe);
 
         // explicit-signature static path: bypasses resolution -> MUST be exact.
         g_s_sig_int.store(overload_fixture::static_method("spick", "(I)I")->call(static_cast<std::int32_t>(1)));
@@ -372,6 +416,12 @@ VMHOOK_JVM_MODULE(method_overload)
     vmhook::register_class<java_object>("java/lang/Object");
 
     const bool call_stub_present{ vmhook::detail::find_call_stub_entry() != nullptr };
+    // Publish the path to the detour BEFORE the probe runs so run_all() can label
+    // its [INFO] correctly.  NOTE: the static name-only calls are skipped on BOTH
+    // paths (the static resolver is dead regardless of call_stub vs call_jni, and
+    // a mis-resolved reference-slot dispatch can AV on either), so this flag is
+    // diagnostic only — it does not gate the skip.
+    g_call_jni_fallback_active.store(!call_stub_present, std::memory_order_relaxed);
     ctx.record(std::string{ "[INFO] method_overload dispatch path: " }
                + (call_stub_present ? "call_stub fast path (StubRoutines::_call_stub_entry present)"
                                     : "call_jni fallback (call stub absent — static-overload bug is LIVE)"));
@@ -510,9 +560,15 @@ VMHOOK_JVM_MODULE(method_overload)
         ctx.check("mo_static_sig_string_exact", g_s_sig_string.load() == RET_STRING + SBIAS);
 
         // =====================================================================
-        //  STATIC NAME-ONLY overload resolution — KNOWN-BROKEN on the call_jni
-        //  path (resolve_compatible_method bails when object==nullptr).  Record
-        //  every outcome; emit ONE soft signal; NEVER fail CI here.
+        //  STATIC NAME-ONLY overload resolution — KNOWN-BROKEN *and* UNSAFE.
+        //  resolve_compatible_method bails when object==nullptr (vmhook.hpp:13652)
+        //  so a static name-only call dispatches the first-by-name overload; when
+        //  that overload has a reference parameter and we pass a primitive, the
+        //  JVM dereferences a bogus oop and AVs (crashed windows-clang-java8).  We
+        //  DELIBERATELY SKIP these calls (run_all stores k_skipped_unsafe) — a
+        //  crash truncates the whole artifact, which is far worse than a FAIL, and
+        //  the outcome was only ever recorded as [INFO] anyway.  Record the skip;
+        //  emit ONE soft signal; NEVER fail CI here.
         // =====================================================================
         const std::int64_t s_int{ g_s_int.load() };
         const std::int64_t s_long{ g_s_long.load() };
@@ -520,36 +576,60 @@ VMHOOK_JVM_MODULE(method_overload)
         const std::int64_t s_float{ g_s_float.load() };
         const std::int64_t s_bool{ g_s_bool.load() };
         const std::int64_t s_string{ g_s_string.load() };
-        ctx.record("[INFO] STATIC name-only resolution (expected int/long/double/float/bool/string sentinels "
-                   + std::to_string(RET_INT + SBIAS) + "/" + std::to_string(RET_LONG + SBIAS) + "/"
-                   + std::to_string(RET_DOUBLE + SBIAS) + "/" + std::to_string(RET_FLOAT + SBIAS) + "/"
-                   + std::to_string(RET_BOOLEAN + SBIAS) + "/" + std::to_string(RET_STRING + SBIAS) + "):");
-        ctx.record("[INFO]   spick(int)="    + std::to_string(s_int)
-                   + " spick(long)="          + std::to_string(s_long)
-                   + " spick(double)="        + std::to_string(s_double)
-                   + " spick(float)="         + std::to_string(s_float)
-                   + " spick(bool)="          + std::to_string(s_bool)
-                   + " spick(String)="        + std::to_string(s_string));
-        const bool static_resolution_correct{
-            s_int == RET_INT + SBIAS
-            && s_long == RET_LONG + SBIAS
-            && s_double == RET_DOUBLE + SBIAS
-            && s_float == RET_FLOAT + SBIAS
-            && s_bool == RET_BOOLEAN + SBIAS
-            && s_string == RET_STRING + SBIAS };
-        ctx.record(std::string{ "[INFO] static_overload_resolution_works = " }
-                   + (static_resolution_correct
-                          ? "true (this JDK/path resolved statics correctly)"
-                          : "false (KNOWN flaw: resolve_compatible_method bails for object==nullptr, "
-                            "vmhook.hpp:13312 — static_method(name)->call(typed) cannot re-pick the overload)"));
-        // A weaker invariant that DOES hold even with the bug: at least one
-        // static call returned a valid static sentinel (the fixture + dispatch
-        // are wired), proving the [INFO] above reflects resolution, not a dead
-        // pipeline.
-        ctx.check("mo_static_pipeline_alive",
-                  s_int >= RET_NOARG + SBIAS && s_int <= RET_INT_STRING + SBIAS
-                  ? true
-                  : (s_int >= RET_NOARG && s_int <= RET_INT_STRING));
+        const bool static_name_only_skipped{ s_int == k_skipped_unsafe };
+        const bool call_jni_path{ g_call_jni_fallback_active.load() };
+        if (static_name_only_skipped)
+        {
+            ctx.record(std::string{ "[INFO] STATIC name-only resolution: SKIPPED (not executed) — calling a "
+                       "static overloaded method by name is UNSAFE on this build (dispatch path: " }
+                       + (call_jni_path ? "call_jni fallback" : "call_stub fast path")
+                       + ").  resolve_compatible_method() bails for object==nullptr (vmhook.hpp:13652), so "
+                         "spick(<primitive>) dispatches the first-by-name overload; if that overload takes a "
+                         "reference (e.g. spick(String)=(Ljava/lang/String;)I) the primitive bits become a bogus "
+                         "oop and the callee's reference-store barrier AVs the JVM.  This crashed "
+                         "windows-clang-java8 on the FIRST call, spick(int 1).  The explicit-signature static "
+                         "path below is the hard proof that the static methods exist + dispatch on this JDK.");
+            ctx.record("[INFO] static_overload_resolution_works = unknown (calls skipped to avoid the JVM-AV "
+                       "described above; the underlying flaw is real — see the vmhook bug report)");
+            // Pipeline-alive proof when the name-only calls are skipped: the
+            // explicit-signature static calls (asserted above as
+            // mo_static_sig_*_exact) prove the static dispatch pipeline is live.
+            ctx.check("mo_static_pipeline_alive",
+                      g_s_sig_int.load() == RET_INT + SBIAS);
+        }
+        else
+        {
+            ctx.record("[INFO] STATIC name-only resolution (expected int/long/double/float/bool/string sentinels "
+                       + std::to_string(RET_INT + SBIAS) + "/" + std::to_string(RET_LONG + SBIAS) + "/"
+                       + std::to_string(RET_DOUBLE + SBIAS) + "/" + std::to_string(RET_FLOAT + SBIAS) + "/"
+                       + std::to_string(RET_BOOLEAN + SBIAS) + "/" + std::to_string(RET_STRING + SBIAS) + "):");
+            ctx.record("[INFO]   spick(int)="    + std::to_string(s_int)
+                       + " spick(long)="          + std::to_string(s_long)
+                       + " spick(double)="        + std::to_string(s_double)
+                       + " spick(float)="         + std::to_string(s_float)
+                       + " spick(bool)="          + std::to_string(s_bool)
+                       + " spick(String)="        + std::to_string(s_string));
+            const bool static_resolution_correct{
+                s_int == RET_INT + SBIAS
+                && s_long == RET_LONG + SBIAS
+                && s_double == RET_DOUBLE + SBIAS
+                && s_float == RET_FLOAT + SBIAS
+                && s_bool == RET_BOOLEAN + SBIAS
+                && s_string == RET_STRING + SBIAS };
+            ctx.record(std::string{ "[INFO] static_overload_resolution_works = " }
+                       + (static_resolution_correct
+                              ? "true (this JDK/path resolved statics correctly)"
+                              : "false (KNOWN flaw: resolve_compatible_method bails for object==nullptr, "
+                                "vmhook.hpp:13652 — static_method(name)->call(typed) cannot re-pick the overload)"));
+            // A weaker invariant that DOES hold even with the bug: at least one
+            // static call returned a valid static sentinel (the fixture + dispatch
+            // are wired), proving the [INFO] above reflects resolution, not a dead
+            // pipeline.
+            ctx.check("mo_static_pipeline_alive",
+                      s_int >= RET_NOARG + SBIAS && s_int <= RET_INT_STRING + SBIAS
+                      ? true
+                      : (s_int >= RET_NOARG && s_int <= RET_INT_STRING));
+        }
 
         // =====================================================================
         //  AMBIGUOUS unregistered-wrapper resolution — first-match-wins, no
