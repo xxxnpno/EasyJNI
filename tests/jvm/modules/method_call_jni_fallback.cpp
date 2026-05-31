@@ -357,7 +357,10 @@ namespace
 
         // ───────── Object returns (identity + null contract) ─────────
         {
-            std::unique_ptr<method_call_jni> sp{ s.get_method("retSelf")->call() };
+            // copy-init (=), NOT brace-init: value_t's templated conversion
+            // operator makes std::unique_ptr<T>{ value_t } ambiguous under MSVC
+            // (C2440).  Copy-init resolves the user-defined conversion cleanly.
+            std::unique_ptr<method_call_jni> sp = s.get_method("retSelf")->call();
             g_self_nonnull.store(sp != nullptr);
             if (sp)
             {
@@ -371,7 +374,7 @@ namespace
             }
         }
         {
-            std::unique_ptr<method_call_jni> np{ s.get_method("retNullObject")->call() };
+            std::unique_ptr<method_call_jni> np = s.get_method("retNullObject")->call();  // copy-init (MSVC C2440)
             g_null_obj_is_null.store(np == nullptr);
             auto p{ s.get_method("retNullObject") };
             if (p.has_value())
