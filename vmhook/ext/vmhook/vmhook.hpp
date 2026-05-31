@@ -8440,6 +8440,16 @@ namespace vmhook
                         {
                             new_method->set_from_compiled_entry(c2i_entry);
                         }
+                        // Restore the interpreted entry to the i2i stub, mirroring
+                        // the install path.  Re-anchoring onto a freshly-resolved
+                        // Method whose _code is set means _from_interpreted_entry
+                        // points at the i2c adapter; clearing _code below without
+                        // this leaves interpreted dispatch bypassing the detour, so
+                        // the re-installed hook would never fire.
+                        if (void* const i2i{ new_method->get_i2i_entry() })
+                        {
+                            new_method->set_from_interpreted_entry(i2i);
+                        }
                         new_method->set_code(nullptr);
                     }
 
@@ -8587,6 +8597,18 @@ namespace vmhook
                         if (c2i_entry && vmhook::hotspot::is_valid_pointer(c2i_entry))
                         {
                             hm.method->set_from_compiled_entry(c2i_entry);
+                        }
+                        // Redirect interpreted callers back through the patched
+                        // i2i stub, exactly as the install path does (see the
+                        // set_from_interpreted_entry(i2i) at hook() install).
+                        // When HotSpot re-JITs and then this repair clears _code,
+                        // _from_interpreted_entry can still point at the i2c
+                        // adapter from the compiled epoch; without restoring it to
+                        // the i2i stub even interpreted dispatch sails past the
+                        // detour and the hook silently dies after the re-JIT.
+                        if (void* const i2i{ hm.method->get_i2i_entry() })
+                        {
+                            hm.method->set_from_interpreted_entry(i2i);
                         }
                         hm.method->set_code(nullptr);
                     }
