@@ -428,9 +428,17 @@ VMHOOK_JVM_MODULE(return_frame_raw_access)
                 // Cross-check against the PUBLIC typed accessor, which widens
                 // long/double across two slots internally.  Both raw and typed
                 // paths must agree (audit: typed-matches-autodetect).
+                //
+                // `wide(...)` is an INSTANCE method, so slot 0 holds `this`.
+                // get_arguments<Ts...> maps each Ti to a consecutive slot
+                // (advancing +2 per long/double), so the receiver MUST be the
+                // first template parameter or every subsequent arg is read one
+                // slot too early.  The raw path above already accounts for
+                // this (a@slot1); mirror it here with an oop placeholder.
                 {
-                    auto [a, b, c, d] =
-                        fr->get_arguments<std::int32_t, std::int64_t, double, std::int32_t>();
+                    auto [self_unused, a, b, c, d] =
+                        fr->get_arguments<vmhook::oop_t, std::int32_t, std::int64_t, double, std::int32_t>();
+                    (void)self_unused;
                     g_wide_typed_a_ok.store(a == WIDE_A, std::memory_order_relaxed);
                     g_wide_typed_b_ok.store(b == WIDE_B, std::memory_order_relaxed);
                     g_wide_typed_c_ok.store(c == WIDE_C, std::memory_order_relaxed);
