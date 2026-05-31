@@ -617,25 +617,23 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
 
             ctx.record("[INFO] combo: explicit-signature get_method() LOOKUP is exact "
                        "(CS proxy sig=" + cs.sig_text + ", ST proxy sig=" + st.sig_text
-                       + ") but call(std::string) RE-RESOLVES via "
-                       "resolve_compatible_method<std::string> (vmhook.hpp:12493/13095); "
-                       "std::string -> Ljava/lang/String; only, so BOTH proxies dispatch "
-                       "combo(String).  Explicit signature does NOT pin the overload at "
-                       "call() time.");
+                       + ") and is now PINNED at call() time (FIXED #5): a pinned proxy's "
+                       "overload is honoured verbatim, so call(std::string) on the CS proxy "
+                       "dispatches combo(CharSequence) (String IS-A CharSequence), not "
+                       "combo(String).");
             ctx.record("[INFO] combo observed: comboCsHits=" + std::to_string(method_explicit_sig::comboCsHits())
                        + " comboStHits=" + std::to_string(method_explicit_sig::comboStHits())
                        + " cs.sval=\"" + cs.sval + "\" st.sval=\"" + st.sval + "\"");
 
-            // -- DISPATCH characterization: the C++ arg type (std::string) drove
-            //    BOTH calls to combo(String).  The CS proxy never reached
-            //    combo(CharSequence).  Assert the ACTUAL behavior.
-            ctx.check("combo_CS_dispatch_falls_to_string_overload_KNOWN",
-                      method_explicit_sig::comboCsHits() == 0);
-            ctx.check("combo_ST_overload_ran_for_both_probes_KNOWN",
-                      method_explicit_sig::comboStHits() == 2);
-            // The CS probe RETURNS the String overload's result (proof the explicit
-            // CharSequence signature was overridden by arg-type re-resolution).
-            ctx.check("combo_CS_returns_st_prefixed_KNOWN", cs.sval == "ST:Z");
+            // -- DISPATCH (FIXED #5): the explicit signature is PINNED, so each
+            //    proxy dispatches ITS exact overload — the CS proxy reaches
+            //    combo(CharSequence) and the ST proxy reaches combo(String).
+            ctx.check("combo_CS_dispatch_pinned_to_charsequence",
+                      method_explicit_sig::comboCsHits() == 1);
+            ctx.check("combo_ST_dispatch_to_string",
+                      method_explicit_sig::comboStHits() == 1);
+            // Each probe returns ITS OWN overload's result.
+            ctx.check("combo_CS_returns_cs_prefixed", cs.sval == "CS:Z");
             ctx.check("combo_ST_returns_st_prefixed", st.sval == "ST:Z");
             // Total dispatches across both combo probes is still exactly two.
             ctx.check("combo_total_two_dispatches",
@@ -739,12 +737,11 @@ VMHOOK_JVM_MODULE(method_explicit_signature)
         ctx.check("isolation_proc_II_b_intact",  method_explicit_sig::procIntIntB() == PROC_II_B);
         ctx.check("isolation_proc_J_intact",     method_explicit_sig::procLongArg() == PROC_J_ARG);
         ctx.check("isolation_proc_V_one_hit",    method_explicit_sig::procVoidHits() == 1);
-        // combo: arg-type re-resolution sent BOTH probes to combo(String) (see the
-        // combo block above for the full explanation + REPORTED bug).  The stable
-        // invariant that survives is the TOTAL: exactly two combo dispatches, both
-        // on the String overload (comboStHits==2, comboCsHits==0).
-        ctx.check("isolation_combo_cs_zero_KNOWN", method_explicit_sig::comboCsHits() == 0);
-        ctx.check("isolation_combo_st_two_KNOWN",  method_explicit_sig::comboStHits() == 2);
+        // combo (FIXED #5): the explicit signature is now PINNED, so each probe
+        // dispatched ITS overload exactly once — combo(CharSequence) once and
+        // combo(String) once (total two dispatches).
+        ctx.check("isolation_combo_cs_one", method_explicit_sig::comboCsHits() == 1);
+        ctx.check("isolation_combo_st_one", method_explicit_sig::comboStHits() == 1);
         ctx.check("isolation_combo_sum_two",
                   method_explicit_sig::comboCsHits() + method_explicit_sig::comboStHits() == 2);
         // static smap each exactly once.

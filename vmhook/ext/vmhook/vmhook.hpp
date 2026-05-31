@@ -12459,11 +12459,13 @@ namespace vmhook
             @param method_pointer Pointer to the HotSpot Method object.
             @param signature     JVM method descriptor, e.g. "(I)Ljava/lang/String;"
         */
-        method_proxy(void* owning_object, vmhook::hotspot::method* method_ptr, std::string sig) noexcept
+        method_proxy(void* owning_object, vmhook::hotspot::method* method_ptr, std::string sig,
+                     const bool pinned = false) noexcept
             : object{ owning_object }
             , method{ method_ptr }
             , signature_text{ std::move(sig) }
             , static_field{ false }
+            , signature_pinned{ pinned }
         {
         }
 
@@ -13677,6 +13679,17 @@ namespace vmhook
         auto resolve_compatible_method() const noexcept
             -> vmhook::hotspot::method*
         {
+            // Explicit-signature proxies (get_method/static_method(name, SIGNATURE))
+            // pinned an EXACT overload; honour it verbatim.  Do NOT re-pick a
+            // different overload from the C++ argument types — a std::string arg
+            // must NOT turn an explicit combo(CharSequence) request into
+            // combo(String).  Name-only proxies leave signature_pinned false so the
+            // arg-driven resolution below still runs for them.
+            if (this->signature_pinned)
+            {
+                return this->method;
+            }
+
             if (signature_matches_arguments<args_t...>(this->signature_text))
             {
                 return this->method;
@@ -13756,6 +13769,13 @@ namespace vmhook
         vmhook::hotspot::method* method;
         std::string signature_text;
         bool        static_field;
+        // True when this proxy was created via get_method(name, SIGNATURE) /
+        // static_method(name, SIGNATURE): the caller pinned an EXACT overload, so
+        // resolve_compatible_method() must NOT re-pick a different overload from
+        // the C++ argument types (which would silently dispatch e.g. combo(String)
+        // for an explicit combo(CharSequence) request).  Name-only proxies leave
+        // it false so their arg-driven overload resolution keeps working.
+        bool        signature_pinned{ false };
 
         // Lazy caches for the JNI fallback path.  Resolving
         // jmethodID / jclass once and reusing them across calls is
@@ -14125,7 +14145,8 @@ namespace vmhook
                     const std::string current_signature{ current_method->get_signature() };
                     if (current_method->get_name() == method_name && current_signature == method_signature)
                     {
-                        return vmhook::method_proxy{ this->instance, current_method, current_signature };
+                        return vmhook::method_proxy{ this->instance, current_method, current_signature,
+                                                     /*signature_pinned=*/true };
                     }
                 }
             }
@@ -14235,7 +14256,8 @@ namespace vmhook
                     const std::string current_signature{ current_method->get_signature() };
                     if (current_method->get_name() == method_name && current_signature == method_signature)
                     {
-                        return vmhook::method_proxy{ nullptr, current_method, current_signature };
+                        return vmhook::method_proxy{ nullptr, current_method, current_signature,
+                                                     /*signature_pinned=*/true };
                     }
                 }
             }
