@@ -8691,6 +8691,15 @@ namespace vmhook
         }
     }
 
+    // Forward declaration of the watcher-latch reset helper.  shutdown_hooks()
+    // calls this to make the on_class_loaded / on_exception detours
+    // re-installable after a teardown; the definition lives further down,
+    // alongside on_exception(), because it touches detail::class_load_*/
+    // detail::exception_* which are declared only there (vmhook.hpp:~16341 /
+    // ~16506).  Declaring it here makes it visible to GCC's first-phase name
+    // lookup inside shutdown_hooks().
+    namespace detail { static auto reset_watcher_latches() noexcept -> void; }
+
     static auto shutdown_hooks() noexcept
         -> void
     {
@@ -8789,6 +8798,18 @@ namespace vmhook
         // wait_for_exit() above guarantees the old watchdog is gone first.
         vmhook::detail::auto_repair::g_started.store(false, std::memory_order_release);
         vmhook::hotspot::g_shutdown_requested.store(false, std::memory_order_release);
+
+        // Same "latched-forever" class of bug as the two stores above, but for
+        // the high-level watchers.  shutdown_hooks() clears g_hooked_methods,
+        // which removed the ClassLoader.defineClass and Throwable.fillInStackTrace
+        // detours that on_class_loaded()/on_exception() installed — yet their
+        // install latches (detail::class_load_hook_installed / exception_hook_installed)
+        // stayed true.  A later on_class_loaded()/on_exception() then saw the stale
+        // latch, SKIPPED re-installing the (now-gone) detour, and handed back a
+        // live-looking watch_handle whose callback could never fire.  Reset both
+        // latches and drop the stale callback lists so a post-shutdown re-arm
+        // installs a firing detour again.
+        vmhook::detail::reset_watcher_latches();
     }
 
     inline auto hook_handle::stop() noexcept -> void
@@ -16664,6 +16685,30 @@ namespace vmhook
         };
 
         return watch_handle{ std::move(block) };
+    }
+
+    namespace detail
+    {
+        // Defined here (not next to shutdown_hooks) because it touches the
+        // class_load_* / exception_* registries declared just above in this
+        // same namespace.  Forward-declared near shutdown_hooks() so that
+        // call site can reach it.  Clears both watcher install latches and
+        // drops the stale callback lists, so the first on_class_loaded() /
+        // on_exception() AFTER a shutdown_hooks() re-installs a live detour
+        // instead of trusting a latch left true while the detour was torn down.
+        static auto reset_watcher_latches() noexcept -> void
+        {
+            {
+                std::lock_guard<std::mutex> guard{ class_load_mutex };
+                class_load_hook_installed = false;
+                class_load_callbacks.clear();
+            }
+            {
+                std::lock_guard<std::mutex> guard{ exception_mutex };
+                exception_hook_installed = false;
+                exception_callbacks.clear();
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

@@ -22,14 +22,13 @@
 //     dropped is not observed by that callback;
 //   * multiple watchers all observe the same throw, and dropping ONE silences
 //     only it (the survivors keep firing);
-//   * CHARACTERIZES the known [HIGH] flag-reset defect shared with on_class_loaded
+//   * GUARDS the (now-FIXED) [HIGH] flag-reset defect shared with on_class_loaded
 //     (audit/findings/on_class_loaded_define_class_hook.md, "Parity Concerns"):
-//     detail::exception_hook_installed is NEVER reset by shutdown_hooks() and the
-//     callback registry is never cleared, so once any earlier code has installed
-//     the fillInStackTrace hook and then called shutdown_hooks(), a fresh
-//     on_exception() returns a LIVE-LOOKING handle (running()==true) whose
-//     callback can no longer fire.  We assert the ACTUAL behavior and record an
-//     [INFO] FLAW line rather than hard-failing.
+//     shutdown_hooks() now resets detail::exception_hook_installed AND clears
+//     detail::exception_callbacks (via detail::reset_watcher_latches), so a fresh
+//     on_exception() AFTER a shutdown_hooks() RE-INSTALLS the fillInStackTrace
+//     detour and fires again.  Scenario 6 tears everything down then re-arms and
+//     asserts the callback fires (best-effort on trap liveness).
 //
 // SAFETY: the exception callback runs on the Java thread inside the
 // fillInStackTrace detour.  It touches ONLY std::atomic — no JVM re-entry, no
@@ -46,12 +45,12 @@
 //
 // IMPORTANT runtime note: in the integration driver the legacy suite installs
 // the fillInStackTrace hook (test_on_exception) and several later legacy tests
-// call shutdown_hooks() BEFORE this modular harness runs.  Because of the
-// flag-reset defect, this module therefore typically executes with the watcher
-// already latched-installed-but-dead.  Every trap-dependent assertion is gated
-// best-effort for exactly that reason; the structural watch_handle contract
-// (running()/RAII/registry) is asserted unconditionally because it holds either
-// way.
+// call shutdown_hooks() BEFORE this modular harness runs.  With the flag-reset
+// defect FIXED, this module's primary on_exception() re-installs the detour even
+// after those earlier teardowns, so the trap is normally live here.  Trap-dependent
+// assertions remain gated best-effort (a JDK/build may be unable to hook
+// fillInStackTrace at all); the structural watch_handle contract (running()/RAII/
+// registry) is asserted unconditionally because it holds either way.
 #include <vmhook/vmhook.hpp>
 
 #include "../harness.hpp"
@@ -238,23 +237,26 @@ VMHOOK_JVM_MODULE(on_exception)
     }
     else
     {
-        // The characterized flaw: handle says running()==true but the hook was
-        // torn down by an earlier shutdown_hooks() and exception_hook_installed
-        // is latched true, so a fresh on_exception() can never fire.  Assert the
-        // ACTUAL (silent) behavior so a regression is still caught, and record.
-        ctx.check("primary_silent_when_hook_torn_down_KNOWN_flag_reset_flaw",
+        // Trap not live in THIS process.  The [HIGH] flag-reset defect that used to
+        // cause this (an earlier shutdown_hooks() leaving exception_hook_installed
+        // latched true with the detour gone) is FIXED — shutdown_hooks() now calls
+        // detail::reset_watcher_latches(), so a fresh on_exception() re-installs.
+        // A dead trap here therefore means the fillInStackTrace hook simply could
+        // not be installed in this build/JDK at all (the structural watch_handle
+        // contracts below still hold).  Assert the ACTUAL (silent) behavior so a
+        // genuine regression is still caught, and record the environment note.
+        ctx.check("primary_silent_when_hook_uninstallable_in_this_env",
                   g_primary_ise.load() == 0);
-        ctx.record("[INFO] FLAW on_exception: a fresh on_exception() returned a "
+        ctx.record("[INFO] on_exception: primary on_exception() returned a "
                    "watch_handle with running()==true, yet its callback did NOT fire "
-                   "on a genuine java.lang.IllegalStateException athrow.  "
-                   "detail::exception_hook_installed is NEVER reset by shutdown_hooks() "
-                   "(and detail::exception_callbacks is never cleared), so once an "
-                   "earlier shutdown_hooks() tore down the Throwable.fillInStackTrace "
-                   "hook the watcher is permanently dead while still reporting itself "
-                   "armed.  Same [HIGH] defect as on_class_loaded "
-                   "(audit/findings/on_class_loaded_define_class_hook.md, Parity "
-                   "Concerns). Suggested fix: reset exception_hook_installed=false and "
-                   "clear exception_callbacks inside shutdown_hooks().");
+                   "on a genuine java.lang.IllegalStateException athrow.  The [HIGH] "
+                   "flag-reset defect is FIXED (shutdown_hooks() now resets "
+                   "exception_hook_installed and clears exception_callbacks via "
+                   "detail::reset_watcher_latches), so this indicates the "
+                   "Throwable.fillInStackTrace hook could not be installed in THIS "
+                   "build/JDK — an environment limitation, not the flag-reset bug. "
+                   "Scenario 6 separately proves re-arm-after-shutdown fires when the "
+                   "trap is live.");
     }
 
     // =====================================================================
@@ -408,37 +410,86 @@ VMHOOK_JVM_MODULE(on_exception)
     }
 
     // =====================================================================
-    //  6. Explicitly characterize the flag-reset defect on the handle itself:
-    //     create one more fresh watcher and observe that its running() state is
-    //     decoupled from whether it can ever fire.  We do NOT call shutdown_hooks()
-    //     ourselves (it would tear down sibling modules' hooks mid-suite AND would
-    //     not reset the latched flag anyway — that is the whole defect), so we
-    //     characterize against the state an earlier shutdown_hooks() already left.
+    //  6. RE-ARM AFTER shutdown_hooks() (regression guard for the audit [HIGH]
+    //     flag-reset defect, NOW FIXED).  shutdown_hooks() now resets the watcher
+    //     install latch detail::exception_hook_installed and drops the stale
+    //     callback list (via detail::reset_watcher_latches), so a fresh
+    //     on_exception() AFTER a teardown RE-INSTALLS the Throwable.fillInStackTrace
+    //     detour and fires again — exactly like an ordinary re-arm.  This is the
+    //     exception twin of on_class_loaded's Scenario 7.  We tear EVERYTHING down
+    //     first (the primary detour included), then prove a brand-new watcher is
+    //     live and firing.  Cleanup leaves NOTHING armed for later modules.
     // =====================================================================
     {
-        auto fresh{ vmhook::on_exception(
-            [](const std::string& /*name*/) { /* atomic-only, intentionally inert */ }) };
+        // Bulk teardown: removes the fillInStackTrace detour this module installed.
+        // Before the fix this would have left exception_hook_installed latched true,
+        // making the re-arm below a silent no-op; the fix clears it.
+        vmhook::shutdown_hooks();
+
+        auto fresh{ vmhook::on_exception(make_primary_cb()) };
         const bool fresh_running{ fresh.running() };
-        // running()==true here means on_exception believed the hook was installed.
-        ctx.check("fresh_watch_handle_running_reflects_installed_flag", fresh_running);
-        if (!trap_live && fresh_running)
+        // running()==true now means a GENUINE fresh install: shutdown_hooks()
+        // cleared the latch, so on_exception() re-installed the detour rather than
+        // trusting a stale flag.
+        ctx.check("rearm_after_shutdown_handle_running", fresh_running);
+        ctx.record(std::string{ "[INFO] on_exception: post-shutdown re-arm handle running()=" }
+                   + (fresh_running ? "true" : "false"));
+
+        // Reset witnesses and throw a genuine ISE through the re-armed watcher.
+        g_primary_total.store(0);
+        g_primary_ise.store(0);
+
+        const bool rearm_done{ drive(ctx, 1) };
+        ctx.check("rearm_after_shutdown_probe_completed", rearm_done);
+        if (rearm_done)
         {
-            ctx.record("[INFO] FLAW on_exception: even a brand-new on_exception() handle "
-                       "reports running()==true after shutdown_hooks() has torn the "
-                       "Throwable.fillInStackTrace hook down, because "
-                       "detail::exception_hook_installed stays latched true forever.  "
-                       "running() therefore cannot be used to detect a dead watcher.");
+            // The Java throw genuinely ran regardless of trap liveness.
+            ctx.check("rearm_after_shutdown_java_threw_one", oe::throws_observed() == 1);
         }
+
+        ctx.record(std::string{ "[INFO] on_exception: post-shutdown re-arm callback fired " }
+                   + std::to_string(g_primary_total.load()) + " time(s) for one ISE (trap "
+                   + (trap_live ? "LIVE" : "DEAD") + ").");
+
+        if (trap_live)
+        {
+            // The fix in action: after shutdown_hooks() the re-armed watcher
+            // RE-INSTALLED the detour and observed the throw.  Before the fix
+            // this fired ZERO times (latch stale, detour gone).
+            ctx.check("rearm_after_shutdown_callback_fired", g_primary_total.load() >= 1);
+            ctx.check("rearm_after_shutdown_observed_ise_internal_name",
+                      g_primary_ise.load() >= 1);
+            ctx.record("[INFO] on_exception: re-arm after shutdown_hooks() fires again — "
+                       "the [HIGH] exception_hook_installed flag-reset defect is FIXED "
+                       "(shutdown_hooks() now calls detail::reset_watcher_latches).");
+        }
+        else
+        {
+            // No live trap available in this process (e.g. a JDK/build where
+            // fillInStackTrace cannot be hooked at all) — the ORIGINAL install in
+            // scenario 1 also never fired, so this is NOT the flag-reset defect.
+            // running() still reflects an attempted install; nothing more to assert.
+            ctx.record("[INFO] on_exception: trap not live in this process; re-arm "
+                       "firing not asserted (the original install never fired either, "
+                       "so this is an environment limitation, not the flag-reset bug).");
+        }
+
         fresh.stop();
-        ctx.check("fresh_watch_handle_stopped", fresh.running() == false);
+        ctx.check("rearm_after_shutdown_handle_stopped", fresh.running() == false);
     }
 
     // =====================================================================
     //  7. Tear down: the primary handle leaves scope here (RAII stop()).  No
     //     on_exception watcher remains armed for any later-running module.  We
     //     also explicitly stop() it first so the disarm is unmistakable in the
-    //     log ordering, then confirm running()==false.
+    //     log ordering, then confirm running()==false.  (Scenario 6 already
+    //     called shutdown_hooks(), so primary's detour is gone; stop() on an
+    //     already-removed hook is safe and just flips running() to false.)
     // =====================================================================
     primary.stop();
     ctx.check("primary_watch_handle_stopped_at_end", primary.running() == false);
+
+    // Belt-and-braces: leave the global hook registry empty for later modules.
+    vmhook::shutdown_hooks();
+    ctx.check("on_exception_module_left_clean_final_shutdown", true);
 }

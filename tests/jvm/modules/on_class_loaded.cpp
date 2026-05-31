@@ -28,15 +28,14 @@
 //   * re-registering a fresh on_class_loaded AFTER all handles dropped arms a
 //     WORKING callback again (the underlying detour stays installed for reuse).
 //
-// It ALSO characterizes the audit's [HIGH] bug
+// It ALSO guards the (now-FIXED) audit [HIGH] bug
 //   "class_load_hook_installed flag is never reset on shutdown_hooks()"
-// (audit/findings/on_class_loaded_define_class_hook.md): after a
-// vmhook::shutdown_hooks() the flag stays true, so a fresh on_class_loaded returns
-// a LIVE-LOOKING handle (running()==true) whose callback can never fire because the
-// underlying detour was torn down.  We PIN the current (buggy) behaviour as a
-// regression target and DO NOT edit vmhook.hpp.  This scenario runs LAST and cleans
-// up so no callback leaks; the detour is already gone (shutdown_hooks removed it),
-// so the module leaves NOTHING armed.
+// (audit/findings/on_class_loaded_define_class_hook.md): shutdown_hooks() now calls
+// detail::reset_watcher_latches(), clearing the install latch + stale callback list,
+// so a fresh on_class_loaded() AFTER a vmhook::shutdown_hooks() re-installs a live
+// defineClass detour and the callback fires again (just like an ordinary re-arm).
+// Scenario 7 asserts that healthy fires-once contract.  It runs LAST and cleans up
+// so no callback leaks, leaving NOTHING armed for the modules that run after it.
 //
 // Harness note: the fixture's `done` flag LATCHES.  Each scenario resets `done`
 // and sets `which` (the load selector) on the rising edge of `go`, runs ONE probe
@@ -324,21 +323,21 @@ VMHOOK_JVM_MODULE(on_class_loaded)
     // watcher dropped -> clean (detour still installed, no callbacks registered).
 
     // =====================================================================
-    // Scenario 7 — CHARACTERIZE audit [HIGH]: class_load_hook_installed is never
-    //   reset on shutdown_hooks(), so re-arm AFTER a shutdown_hooks() is a silent
-    //   no-op.  This runs LAST and is the ONLY scenario that touches the global
-    //   teardown.  We PIN the current behaviour as a regression target and DO NOT
-    //   edit vmhook.hpp.  Cleanup: shutdown_hooks() already removed the detour, and
-    //   we drop the handle so no callback leaks -> module leaves NOTHING armed.
+    // Scenario 7 — RE-ARM AFTER shutdown_hooks() (regression guard for audit
+    //   [HIGH], NOW FIXED).  shutdown_hooks() resets the watcher install latch
+    //   detail::class_load_hook_installed and drops the stale callback list, so a
+    //   fresh on_class_loaded() AFTER a teardown RE-INSTALLS a live defineClass
+    //   detour — the callback fires again exactly like an ordinary re-arm
+    //   (Scenario 6).  This runs LAST and is the ONLY scenario that touches the
+    //   global teardown.  Cleanup: the final handle drop erases the callback, and
+    //   a belt-and-braces shutdown_hooks() below leaves NOTHING armed.
     //
-    //   Expected (buggy) behaviour today:
-    //     - the post-shutdown handle reports running()==true (LOOKS armed), yet
-    //     - the callback NEVER fires for a genuinely fresh load (Probe8),
-    //   because shutdown_hooks() tore down the underlying defineClass detour but
-    //   left class_load_hook_installed==true, so on_class_loaded skips re-install.
-    //   If a future fix resets the flag, BOTH of the two characterization checks
-    //   below flip together (handle still running AND callback now fires) and the
-    //   "*_BUG_*" check names make the change easy to find.
+    //   The fix (vmhook.hpp): shutdown_hooks() now calls
+    //   detail::reset_watcher_latches(), which clears class_load_hook_installed +
+    //   class_load_callbacks (and the exception twin).  Before the fix the latch
+    //   stayed true after teardown, so this re-arm handed back a live-LOOKING
+    //   handle (running()==true) whose callback could never fire because the
+    //   detour was gone.  These checks now assert the healthy fires-once contract.
     // =====================================================================
     {
         // Bulk teardown: removes EVERY installed hook, INCLUDING the class-load
@@ -349,19 +348,20 @@ VMHOOK_JVM_MODULE(on_class_loaded)
         auto watcher{ vmhook::on_class_loaded(
             [](const std::string& name) { primary_callback(name); }) };
 
-        // Document the audit finding inline so the artifact explains the pin.
-        ctx.record("[INFO] on_class_loaded: characterizing audit [HIGH] — "
-                   "class_load_hook_installed is not reset on shutdown_hooks(); "
-                   "re-arm after teardown is a silent no-op (see "
+        // Document the (now-fixed) audit finding inline so the artifact explains
+        // why this scenario tears down then re-arms.
+        ctx.record("[INFO] on_class_loaded: audit [HIGH] FIXED — "
+                   "class_load_hook_installed IS now reset on shutdown_hooks() "
+                   "(via detail::reset_watcher_latches), so re-arm after teardown "
+                   "re-installs a firing detour (see "
                    "audit/findings/on_class_loaded_define_class_hook.md).");
 
-        // The handle LOOKS armed (running() true) because on_class_loaded saw the
-        // stale flag and returned a live handle rather than an inert one.  This
-        // pins the surprising half of the bug: the caller cannot tell the watcher
-        // is dead from the handle alone.
+        // The handle is armed (running() true) because on_class_loaded re-installed
+        // the detour: the install latch was cleared by shutdown_hooks(), so this
+        // is a genuine fresh install, not a stale-flag no-op.
         ctx.record(std::string{ "[INFO] post-shutdown re-arm handle running()=" }
                    + (watcher.running() ? "true" : "false"));
-        ctx.check("rearm_after_shutdown_handle_running_BUG_pinned",
+        ctx.check("rearm_after_shutdown_handle_running",
                   watcher.running());
 
         const bool done{ drive(ctx, 8) };
@@ -370,23 +370,20 @@ VMHOOK_JVM_MODULE(on_class_loaded)
         ctx.check("rearm_after_shutdown_java_loaded_probe8",
                   on_class_loaded_fixture::get_load_ok()
                       && on_class_loaded_fixture::get_load_count() == 1);
-        // ...but the callback does NOT fire: the detour was torn down and never
-        // re-installed.  Pin == the bug is present.  When the bug is fixed this
-        // check FAILS and must be updated to expect g_fire_count == 1.
+        // ...and the callback NOW fires exactly once for it: the detour was torn
+        // down by shutdown_hooks() and correctly RE-INSTALLED by the re-arm.
         ctx.record(std::string{ "[INFO] post-shutdown re-arm callback fire_count=" }
                    + std::to_string(g_fire_count.load()));
-        ctx.check("rearm_after_shutdown_callback_silent_BUG_pinned",
-                  g_fire_count.load() == 0);
-        ctx.check("rearm_after_shutdown_probe8_not_seen_BUG_pinned",
-                  !saw(PROBE8_INTERNAL));
+        ctx.check("rearm_after_shutdown_callback_fired_once",
+                  g_fire_count.load() == 1);
+        ctx.check("rearm_after_shutdown_probe8_seen",
+                  saw(PROBE8_INTERNAL));
 
-        // Cross-check the bug is exactly "detour gone, flag stale": a non-class
-        // sanity — the fixture DID load a new klass, so a healthy watcher WOULD
-        // have fired.  (Already asserted via java_loaded_probe8 above; recorded
-        // here for the artifact.)
-        ctx.record("[INFO] on_class_loaded: if rearm_after_shutdown_callback_silent_BUG_pinned "
-                   "FAILS, the [HIGH] flag-reset bug was fixed — flip the *_BUG_pinned "
-                   "expectations to a healthy (fires-once) contract.");
+        // Healthy-watcher cross-check: the fixture DID load a new klass and the
+        // re-armed watcher observed it — confirming shutdown_hooks() left the
+        // class-load path fully re-installable.
+        ctx.record("[INFO] on_class_loaded: re-arm after shutdown_hooks() fires once "
+                   "for the fresh load — the [HIGH] flag-reset bug is fixed.");
     }
     // watcher dropped here -> on_stop erases the callback from the registry.
 
