@@ -1957,6 +1957,27 @@ namespace vmhook
                     return nullptr;
                 }
             }
+
+            /*
+                @brief Returns the number of entries in the constant pool, or -1
+                       when the length field is not exported by this JDK.
+                @details
+                ConstantPool::_length is a VMStruct-exported int.  Callers use it
+                to bound an entry index before reading base[index]; a return of -1
+                means "unknown, skip the bound check" so behaviour degrades to the
+                pre-existing is_valid_pointer / is_readable_pointer guards rather
+                than rejecting every lookup on a JDK that drops the field.
+            */
+            auto get_length() const noexcept
+                -> std::int32_t
+            {
+                static const vmhook::hotspot::vm_struct_entry_t* const entry{ vmhook::hotspot::iterate_struct_entries("ConstantPool", "_length") };
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this))
+                {
+                    return -1;
+                }
+                return *reinterpret_cast<const std::int32_t*>(reinterpret_cast<const std::uint8_t*>(this) + entry->offset);
+            }
         };
 
         /*
@@ -2022,6 +2043,20 @@ namespace vmhook
                     {
                         return nullptr;
                     }
+                    // Bound the index against ConstantPool::_length (when the JDK
+                    // exports it) so a corrupt/out-of-range _name_index can't read
+                    // past the entry array, and verify the specific slot is mapped
+                    // before dereferencing it - an unmapped element read here would
+                    // be an access violation rather than a recoverable nullptr.
+                    const std::int32_t cp_length{ cp->get_length() };
+                    if (cp_length >= 0 && index >= cp_length)
+                    {
+                        return nullptr;
+                    }
+                    if (!vmhook::hotspot::is_readable_pointer(&base[index]))
+                    {
+                        return nullptr;
+                    }
                     void* const entry_pointer{ base[index] };
                     if (!entry_pointer || !vmhook::hotspot::is_valid_pointer(entry_pointer))
                     {
@@ -2063,6 +2098,20 @@ namespace vmhook
                     }
                     void** const base{ cp->get_base() };
                     if (!base || !vmhook::hotspot::is_valid_pointer(base))
+                    {
+                        return nullptr;
+                    }
+                    // Bound the index against ConstantPool::_length (when the JDK
+                    // exports it) so a corrupt/out-of-range _signature_index can't
+                    // read past the entry array, and verify the specific slot is
+                    // mapped before dereferencing it - an unmapped element read here
+                    // would be an access violation rather than a recoverable nullptr.
+                    const std::int32_t cp_length{ cp->get_length() };
+                    if (cp_length >= 0 && index >= cp_length)
+                    {
+                        return nullptr;
+                    }
+                    if (!vmhook::hotspot::is_readable_pointer(&base[index]))
                     {
                         return nullptr;
                     }
