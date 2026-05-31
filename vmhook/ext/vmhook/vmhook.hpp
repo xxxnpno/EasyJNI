@@ -12497,6 +12497,23 @@ namespace vmhook
                        this->cached_effective_signature)
                     : this->signature_text };
 
+            // FAIL-SAFE: if neither the bound signature nor any hierarchy-walked
+            // overload matches the C++ argument pack, dispatching would write a
+            // mismatched value into a JNI argument slot — a primitive into a
+            // reference slot stores a bogus oop the JVM later dereferences (a
+            // fatal AV).  Refuse the dispatch instead of crashing.  Valid calls
+            // (the fast path where the bound signature matches, or a walk that
+            // selected a matching overload) always satisfy this check, so only a
+            // genuine no-overload-matches mis-call is rejected.
+            if (!signature_matches_arguments<std::remove_cvref_t<args_t>...>(effective_signature))
+            {
+                VMHOOK_LOG("{} method_proxy::call_jni('{}{}'): no overload matches the C++ argument "
+                           "types (effective signature '{}') — refusing dispatch to avoid a wrong-slot "
+                           "write / JVM crash.",
+                           vmhook::error_tag, this->name(), this->signature_text, effective_signature);
+                return value_t{ std::monostate{} };
+            }
+
             // Return-type char is parsed once from effective_signature
             // and cached on the proxy.  Skips the rfind() on every
             // call.  The L/[ branch below still needs `rparen` to
@@ -13095,6 +13112,21 @@ namespace vmhook
             vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
             const std::string selected_signature{ selected_method ? selected_method->get_signature() : this->signature_text };
 
+            // FAIL-SAFE (same as call_jni): refuse to dispatch when no overload
+            // matches the C++ argument pack — packing a mismatched value into the
+            // call-stub parameters[] (which the interpreter reads as typed locals)
+            // would store a primitive where a reference is expected (a bogus oop
+            // the GC/interpreter dereferences -> JVM AV).  Only a genuine
+            // no-overload-matches mis-call is rejected here.
+            if (!signature_matches_arguments<std::remove_cvref_t<args_t>...>(selected_signature))
+            {
+                VMHOOK_LOG("{} method_proxy::call('{}{}'): no overload matches the C++ argument types "
+                           "(selected signature '{}') — refusing dispatch to avoid a wrong-slot write / "
+                           "JVM crash.",
+                           vmhook::error_tag, this->name(), this->signature_text, selected_signature);
+                return value_t{ std::monostate{} };
+            }
+
             if (!vmhook::hotspot::ensure_current_java_thread())
             {
                 VMHOOK_LOG("{} method_proxy::call('{}{}'): no current JavaThread.", vmhook::error_tag, this->name(), selected_signature);
@@ -13649,7 +13681,42 @@ namespace vmhook
                 return this->method;
             }
 
-            vmhook::hotspot::klass* const resolved_klass{ this->object ? klass_from_object_header(this->object) : nullptr };
+            // Instance: klass from the receiver's object header.  STATIC
+            // (object == nullptr): the declaring klass comes from the Method's
+            // ConstantPool _pool_holder.  Without this, a static_method(name)->
+            // call(typedArg) could NOT re-pick the matching overload — it
+            // dispatched whatever get_method() latched first by _methods-array
+            // (Symbol-address) order.  When that overload's parameter kind
+            // mismatched the C++ argument (e.g. a primitive blasted into a
+            // reference slot, or vice-versa), the JVM stored a bogus oop / read a
+            // wild reference and crashed (a real JVM-tearing AV, reproduced on
+            // JDK 8).  Deriving the static klass here lets the hierarchy walk
+            // below select the correct overload and eliminates the wrong-slot
+            // dispatch.
+            vmhook::hotspot::klass* resolved_klass{
+                this->object ? klass_from_object_header(this->object) : nullptr };
+            if (!resolved_klass && !this->object && this->method)
+            {
+                if (auto* const cm{ this->method->get_const_method() };
+                    cm && vmhook::hotspot::is_valid_pointer(cm))
+                {
+                    if (auto* const cp{ cm->get_constants() };
+                        cp && vmhook::hotspot::is_valid_pointer(cp))
+                    {
+                        static const auto* const pool_holder_entry{
+                            vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
+                        if (pool_holder_entry)
+                        {
+                            auto* const holder{ *reinterpret_cast<vmhook::hotspot::klass**>(
+                                reinterpret_cast<std::uint8_t*>(cp) + pool_holder_entry->offset) };
+                            if (holder && vmhook::hotspot::is_valid_pointer(holder))
+                            {
+                                resolved_klass = holder;
+                            }
+                        }
+                    }
+                }
+            }
             if (!resolved_klass)
             {
                 return this->method;

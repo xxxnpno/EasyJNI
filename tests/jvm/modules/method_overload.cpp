@@ -386,12 +386,21 @@ namespace
         // follows (arg type matches the slot, no reference-slot blasting) is safe
         // on every path and remains the hard assertion that the static methods
         // exist + dispatch on this JDK.
-        g_s_int.store(k_skipped_unsafe);
-        g_s_long.store(k_skipped_unsafe);
-        g_s_double.store(k_skipped_unsafe);
-        g_s_float.store(k_skipped_unsafe);
-        g_s_bool.store(k_skipped_unsafe);
-        g_s_string.store(k_skipped_unsafe);
+        // FIXED (vmhook.hpp): resolve_compatible_method() now derives a STATIC
+        // method's declaring klass from the Method's ConstantPool _pool_holder and
+        // walks the hierarchy, so these name-only static calls resolve to the
+        // arg-MATCHING overload (not the first-by-_methods-order one); and both
+        // call paths now REFUSE to dispatch on a total type-mismatch (fail-safe —
+        // a refused call returns monostate, never the wrong-slot JVM AV).  So the
+        // calls are safe to make and must resolve correctly to RET_<type> + SBIAS
+        // (asserted in the else branch below).  k_skipped_unsafe is retained only
+        // as the sentinel the (now-unreached) skip branch keys on.
+        g_s_int.store(overload_fixture::static_method("spick")->call(static_cast<std::int32_t>(1)));
+        g_s_long.store(overload_fixture::static_method("spick")->call(static_cast<std::int64_t>(2)));
+        g_s_double.store(overload_fixture::static_method("spick")->call(3.14));
+        g_s_float.store(overload_fixture::static_method("spick")->call(2.5f));
+        g_s_bool.store(overload_fixture::static_method("spick")->call(true));
+        g_s_string.store(overload_fixture::static_method("spick")->call(std::string{ "s" }));
 
         // explicit-signature static path: bypasses resolution -> MUST be exact.
         g_s_sig_int.store(overload_fixture::static_method("spick", "(I)I")->call(static_cast<std::int32_t>(1)));
