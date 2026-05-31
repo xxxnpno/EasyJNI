@@ -1,0 +1,216 @@
+package vmhook.fixtures;
+
+import vmhook.Harness;
+
+/**
+ * Fixture for the "method_call_return_void" feature: exercises
+ * vmhook::method_proxy::call() invoking VOID-returning Java methods, and the
+ * value_t::is_void() introspection path that distinguishes "the method returned
+ * void / the call failed" from a primitive zero or an empty string.
+ *
+ * A void method has no return value the native side can inspect, so EVERY void
+ * method here records its invocation (and, where applicable, the exact arguments
+ * it received) into observable static fields.  The native module then proves two
+ * independent things per call:
+ *
+ *   1. the returned value_t.is_void() is true (the discard contract), AND
+ *   2. the Java body actually ran with the right arguments (the side effect the
+ *      native side reads back through these static fields).
+ *
+ * Coverage shape (mirrors the audit finding's scenario list):
+ *   - void INSTANCE method      : voidBumpInstance() -> bumps voidInstanceHits,
+ *   - void STATIC method        : voidBumpStatic()   -> bumps voidStaticHits
+ *                                 (exercises CallStaticVoidMethodA / the static
+ *                                 call_stub path where the receiver slot is not
+ *                                 consumed),
+ *   - void method with PRIMITIVE args : voidPrimArgs(int,long,boolean,double)
+ *                                 records each argument verbatim, so the native
+ *                                 side proves the args were delivered alongside
+ *                                 the void dispatch (mixed slot widths: I, J=2
+ *                                 slots, Z, D=2 slots),
+ *   - void method with a STRING arg   : voidStringArg(String) records the String,
+ *   - void method with an OBJECT arg  : voidObjectArg(Object) records non-null +
+ *                                 the object's identityHashCode, so the native
+ *                                 side proves a reference arg reached the body,
+ *   - NON-CORRUPTION             : after a void call the native side immediately
+ *                                 does a value-returning call (retInt /
+ *                                 echoIntAfterVoid) and asserts it is still
+ *                                 correct — a void dispatch must not poison
+ *                                 subsequent calls on the same detour thread,
+ *   - CONTRAST                   : retInt() is an int returner whose value_t
+ *                                 is_void() must be FALSE (a primitive zero is
+ *                                 NOT void).
+ *
+ * How the native module drives it: it hooks {@link #trigger(int)} (the only
+ * context where vmhook::hotspot::current_java_thread is set, which call()
+ * requires).  The probe's run() calls trigger() through a real bytecode
+ * dispatch; the detour performs every call() below and records observations.
+ *
+ * Java 8 syntax only (no var / records / switch-expressions / lambdas).
+ */
+public final class MethodCallVoid
+{
+    /** Native sets this true to request the action; clears it after. */
+    public static volatile boolean go;
+
+    /** The action sets this true when it has run; native polls it. */
+    public static volatile boolean done;
+
+    // ── side-effect counters proving a void body actually executed ──────────
+
+    /** Bumped by the instance void method. */
+    public static volatile int voidInstanceHits;
+
+    /** Bumped by the static void method. */
+    public static volatile int voidStaticHits;
+
+    // ── recorded primitive arguments (prove args delivered to a void body) ──
+
+    /** Set true once voidPrimArgs has run at least once. */
+    public static volatile boolean primArgsCalled;
+
+    /** The four arguments the LAST voidPrimArgs(...) invocation received. */
+    public static volatile int     primArgInt;
+    public static volatile long    primArgLong;
+    public static volatile boolean primArgBool;
+    public static volatile double  primArgDouble;
+
+    // ── recorded String argument ────────────────────────────────────────────
+
+    /** Set true once voidStringArg has run. */
+    public static volatile boolean stringArgCalled;
+
+    /** The String the LAST voidStringArg(String) invocation received (may be
+     *  null if the native side passed a null reference). */
+    public static volatile String  stringArg;
+
+    /** Length of the received String, or -1 if it was null. */
+    public static volatile int     stringArgLen;
+
+    // ── recorded Object argument ────────────────────────────────────────────
+
+    /** Set true once voidObjectArg has run. */
+    public static volatile boolean objectArgCalled;
+
+    /** True iff the Object the LAST voidObjectArg(Object) invocation received
+     *  was non-null. */
+    public static volatile boolean objectArgNonNull;
+
+    /** identityHashCode of the Object the LAST voidObjectArg(Object) received,
+     *  or 0 if it was null. */
+    public static volatile int     objectArgIdentity;
+
+    // ── identity publication so the object-arg check is exact ───────────────
+
+    /** identityHashCode of SINGLETON (the receiver the native module wraps), so
+     *  the native side can pass SINGLETON as the Object arg and prove it is the
+     *  very object the body received. */
+    public static volatile int     selfIdentity;
+
+    // ── non-corruption breadcrumb ───────────────────────────────────────────
+
+    /** The argument the LAST echoIntAfterVoid(int) received — used to prove a
+     *  value-returning call after a void call still delivers its argument. */
+    public static volatile int     lastEchoArg;
+
+    // ── the method the native module hooks to obtain a live thread ──────────
+
+    /** Hookable instance method.  The native detour on this method performs
+     *  every void call() the test asserts on. */
+    public int trigger(final int delta)
+    {
+        return delta + 1;
+    }
+
+    // ── void INSTANCE method (side effect only) ─────────────────────────────
+    public void voidBumpInstance()
+    {
+        voidInstanceHits++;
+    }
+
+    // ── void STATIC method (side effect only) ───────────────────────────────
+    public static void voidBumpStatic()
+    {
+        voidStaticHits++;
+    }
+
+    // ── void method with PRIMITIVE args (record every arg verbatim) ─────────
+    // Mixed slot widths on purpose: int (1 slot), long (2 slots), boolean
+    // (1 slot), double (2 slots).  Recording each proves the whole argument
+    // block was marshalled correctly even though nothing is returned.
+    public void voidPrimArgs(final int i, final long j, final boolean z, final double d)
+    {
+        primArgInt    = i;
+        primArgLong   = j;
+        primArgBool   = z;
+        primArgDouble = d;
+        primArgsCalled = true;
+    }
+
+    // ── void method with a STRING arg ───────────────────────────────────────
+    public void voidStringArg(final String s)
+    {
+        stringArg       = s;
+        stringArgLen    = (s == null) ? -1 : s.length();
+        stringArgCalled = true;
+    }
+
+    // ── void method with an OBJECT arg ──────────────────────────────────────
+    public void voidObjectArg(final Object o)
+    {
+        objectArgNonNull  = (o != null);
+        objectArgIdentity = (o == null) ? 0 : System.identityHashCode(o);
+        objectArgCalled   = true;
+    }
+
+    // ── CONTRAST: an int returner whose value_t.is_void() must be FALSE ──────
+    public int retInt()
+    {
+        return 1337;
+    }
+
+    // ── NON-CORRUPTION: a value-returning call performed right after a void
+    //    call; records its argument and echoes it back so the native side can
+    //    prove the void dispatch did not corrupt this subsequent call. ────────
+    public int echoIntAfterVoid(final int v)
+    {
+        lastEchoArg = v;
+        return v;
+    }
+
+    static
+    {
+        Harness.register(new Harness.Probe()
+        {
+            @Override
+            public boolean pending()
+            {
+                return MethodCallVoid.go && !MethodCallVoid.done;
+            }
+
+            @Override
+            public void run()
+            {
+                // Publish the receiver's identity so the native side can pass it
+                // as the Object arg and prove byte-for-byte that the body got the
+                // exact object.  Use the SAME instance the native module wraps:
+                // the hook fires on trigger() with self == SINGLETON.
+                MethodCallVoid.selfIdentity = System.identityHashCode(SINGLETON);
+
+                // Driving trigger() through normal bytecode dispatch fires the
+                // native interpreter hook; that detour performs every
+                // method_proxy::call() the test asserts on.
+                SINGLETON.trigger(7);
+
+                MethodCallVoid.done = true;
+            }
+        });
+    }
+
+    /**
+     * The single instance the native module wraps and drives.  Created eagerly
+     * so the native side reaches the non-static void methods on a stable OOP and
+     * so the published identity matches the receiver the detour sees as `self`.
+     */
+    public static final MethodCallVoid SINGLETON = new MethodCallVoid();
+}
