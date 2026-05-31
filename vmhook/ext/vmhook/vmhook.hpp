@@ -7852,23 +7852,20 @@ namespace vmhook
         auto store_oop = [&](void* const oop)
             -> bool
         {
-            void* const previous_value{ locals[-index] };
-            const std::uintptr_t previous_bits{ reinterpret_cast<std::uintptr_t>(previous_value) };
-
-            if (!oop)
-            {
-                locals[-index] = nullptr;
-                return true;
-            }
-
-            if (previous_bits > 0xFFFFFFFFull)
-            {
-                locals[-index] = oop;
-                return true;
-            }
-
-            const std::uint32_t compressed{ vmhook::hotspot::encode_oop_pointer(oop) };
-            locals[-index] = reinterpret_cast<void*>(static_cast<std::uintptr_t>(compressed));
+            // Interpreter local-variable slots always hold a full 64-bit
+            // uncompressed oop, regardless of whether the heap uses compressed
+            // oops (+UseCompressedOops, the default).  Compression applies to
+            // oops stored *inside* objects on the heap, not to the GC roots in
+            // an interpreter frame's local array.
+            //
+            // The previous code tried to infer the slot width from the bits
+            // already present (compress when previous_bits <= 0xFFFFFFFF).  That
+            // misfires whenever the slot legitimately held a wide value whose
+            // high half was zero — most importantly a null slot (all zero) — and
+            // wrote a narrow/compressed pointer into a wide slot, corrupting the
+            // local.  Always store the wide pointer; storing nullptr wide is the
+            // correct representation of a null local too.
+            locals[-index] = oop;
             return true;
         };
 
